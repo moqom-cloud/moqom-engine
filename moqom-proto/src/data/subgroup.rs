@@ -22,7 +22,7 @@ use crate::control::properties::Properties;
 use crate::data::flags::{SubgroupIdMode, SubgroupType};
 use crate::data::object::TerminalStatus;
 use crate::error::DecodeError;
-use crate::model::{GroupId, ObjectId, ObjectStatus, SubgroupId, TrackAlias};
+use crate::model::{GroupId, ObjectSeq, ObjectStatus, SubgroupId, TrackAlias};
 use crate::varint::VarInt;
 
 /// Refusals when writing a subgroup stream.
@@ -44,6 +44,19 @@ pub enum SubgroupError {
     NotIncreasing {
         /// The last ID written.
         previous: u64,
+        /// The ID that was offered.
+        next: u64,
+    },
+
+    /// The step between consecutive Object IDs is too large to encode.
+    ///
+    /// Both IDs are legal; the gap is not, because the delta is a `vi64`. On
+    /// the first object the "gap" is the absolute ID, so this is also what
+    /// stops a stream starting above the varint maximum.
+    #[error("object ID gap from {previous:?} to {next} exceeds one varint")]
+    GapTooLarge {
+        /// The last ID written, or `None` if this was the first object.
+        previous: Option<u64>,
         /// The ID that was offered.
         next: u64,
     },
@@ -224,7 +237,10 @@ pub enum SubgroupContent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubgroupObject {
     /// Absolute Object ID, already resolved from the wire's delta.
-    pub object: ObjectId,
+    ///
+    /// Wider than [`crate::model::ObjectId`] because accumulation can carry it
+    /// past the varint maximum; see [`ObjectSeq`].
+    pub object: ObjectSeq,
     /// Payload or terminal marker.
     pub content: SubgroupContent,
 }
@@ -232,9 +248,9 @@ pub struct SubgroupObject {
 impl SubgroupObject {
     /// A normal object with a payload and no properties.
     #[must_use]
-    pub fn new(object: ObjectId, payload: impl Into<Bytes>) -> Self {
+    pub fn new(object: impl Into<ObjectSeq>, payload: impl Into<Bytes>) -> Self {
         Self {
-            object,
+            object: object.into(),
             content: SubgroupContent::Normal {
                 payload: payload.into(),
                 properties: Properties::new(),
@@ -253,54 +269,56 @@ impl SubgroupObject {
 /// Shared delta state between the reader and the writer.
 #[derive(Debug, Clone, Copy, Default)]
 struct DeltaState {
-    previous: Option<ObjectId>,
-    first_object_id: Option<ObjectId>,
+    previous: Option<ObjectSeq>,
+    first_object_id: Option<ObjectSeq>,
 }
 
 impl DeltaState {
     /// Resolve a wire delta into an absolute Object ID.
     ///
-    /// The draft caps this at 2^64-1, but the field is a `vi64`, so an ID above
-    /// the varint maximum could be computed and then never re-encoded. The
-    /// tighter bound is the useful one: it keeps every ID this crate produces
-    /// representable, which is what a relay forwarding the object depends on.
-    fn resolve(&self, delta: u64) -> Result<ObjectId, DecodeError> {
-        let raw = match self.previous {
-            None => delta,
+    /// The accumulated value may exceed the varint maximum — see [`ObjectSeq`],
+    /// which exists for exactly this. Only 2^64-1 is a real ceiling, and only
+    /// because the draft says so.
+    fn resolve(&self, delta: u64) -> Result<ObjectSeq, DecodeError> {
+        match self.previous {
+            None => Ok(ObjectSeq::new(delta)),
             Some(previous) => previous
-                .get()
                 .checked_add(delta)
                 .and_then(|v| v.checked_add(1))
-                .ok_or(DecodeError::Invalid("object ID delta overflowed"))?,
-        };
-        VarInt::new(raw)
-            .map(ObjectId::new)
-            .map_err(|_| DecodeError::Invalid("object ID exceeds the varint maximum"))
+                .ok_or(DecodeError::Invalid("object ID passed 2^64-1")),
+        }
     }
 
     /// The wire delta for an absolute Object ID.
     ///
-    /// The subtraction fails exactly when the ID did not increase, which the
-    /// encoding has no way to express.
-    fn delta_for(&self, object: ObjectId) -> Result<VarInt, SubgroupError> {
-        let not_increasing = || SubgroupError::NotIncreasing {
-            previous: self.previous.map_or(0, ObjectId::get),
-            next: object.get(),
-        };
-
+    /// Two ways this fails, and they are different problems:
+    ///
+    /// - The ID did not increase, which the encoding cannot express at all.
+    /// - The gap since the previous object exceeds what one varint holds. The
+    ///   IDs are legal; the *step* between them is not encodable. For the first
+    ///   object this also caps the starting ID, since its delta is the absolute
+    ///   value — which is why a stream can only reach the wide range by
+    ///   accumulating, never by starting there.
+    fn delta_for(&self, object: ObjectSeq) -> Result<VarInt, SubgroupError> {
         let raw = match self.previous {
             None => object.get(),
             Some(previous) => object
                 .get()
                 .checked_sub(previous.get())
                 .and_then(|d| d.checked_sub(1))
-                .ok_or_else(not_increasing)?,
+                .ok_or(SubgroupError::NotIncreasing {
+                    previous: previous.get(),
+                    next: object.get(),
+                })?,
         };
 
-        VarInt::new(raw).map_err(|_| not_increasing())
+        VarInt::new(raw).map_err(|_| SubgroupError::GapTooLarge {
+            previous: self.previous.map(ObjectSeq::get),
+            next: object.get(),
+        })
     }
 
-    fn advance(&mut self, object: ObjectId) {
+    fn advance(&mut self, object: ObjectSeq) {
         if self.previous.is_none() {
             self.first_object_id = Some(object);
         }
@@ -338,9 +356,12 @@ impl SubgroupReader {
     #[must_use]
     pub fn subgroup(&self) -> Option<SubgroupId> {
         match self.source {
+            // Always narrowable: the first object's delta *is* its absolute ID,
+            // so it arrived as one varint and still fits in one.
             SubgroupSource::FirstObjectId => self
                 .state
                 .first_object_id
+                .and_then(ObjectSeq::to_object_id)
                 .map(|id| SubgroupId::new(id.as_varint())),
             other => other.resolved(),
         }
@@ -589,12 +610,12 @@ mod tests {
         for properties_present in [false, true] {
             let h = header(properties_present, SubgroupSource::Zero);
             let objects = vec![
-                SubgroupObject::new(ObjectId::from(4u32), &b"first"[..]),
-                SubgroupObject::new(ObjectId::from(5u32), &b"second"[..]),
+                SubgroupObject::new(ObjectSeq::from(4u32), &b"first"[..]),
+                SubgroupObject::new(ObjectSeq::from(5u32), &b"second"[..]),
                 // A gap, which the delta must carry.
-                SubgroupObject::new(ObjectId::from(40u32), Bytes::new()),
+                SubgroupObject::new(ObjectSeq::from(40u32), Bytes::new()),
                 SubgroupObject {
-                    object: ObjectId::from(41u32),
+                    object: ObjectSeq::from(41u32),
                     content: SubgroupContent::Normal {
                         payload: Bytes::from_static(b"props"),
                         properties: if properties_present {
@@ -605,7 +626,7 @@ mod tests {
                     },
                 },
                 SubgroupObject {
-                    object: ObjectId::from(99u32),
+                    object: ObjectSeq::from(99u32),
                     content: SubgroupContent::Terminal(TerminalStatus::EndOfGroup),
                 },
             ];
@@ -643,7 +664,7 @@ mod tests {
             writer
                 .write(
                     &mut buf,
-                    &SubgroupObject::new(ObjectId::from(id), &b"x"[..]),
+                    &SubgroupObject::new(ObjectSeq::from(id), &b"x"[..]),
                 )
                 .unwrap();
         }
@@ -659,7 +680,7 @@ mod tests {
         writer
             .write(
                 &mut buf,
-                &SubgroupObject::new(ObjectId::from(12u32), &b"a"[..]),
+                &SubgroupObject::new(ObjectSeq::from(12u32), &b"a"[..]),
             )
             .unwrap();
 
@@ -681,7 +702,7 @@ mod tests {
         writer
             .write(
                 &mut buf,
-                &SubgroupObject::new(ObjectId::from(5u32), &b"a"[..]),
+                &SubgroupObject::new(ObjectSeq::from(5u32), &b"a"[..]),
             )
             .unwrap();
 
@@ -689,7 +710,7 @@ mod tests {
             let err = writer
                 .write(
                     &mut buf,
-                    &SubgroupObject::new(ObjectId::from(id), &b"b"[..]),
+                    &SubgroupObject::new(ObjectSeq::from(id), &b"b"[..]),
                 )
                 .unwrap_err();
             assert!(matches!(
@@ -706,7 +727,7 @@ mod tests {
         let h = header(false, SubgroupSource::Zero);
         let mut writer = SubgroupWriter::new(&h);
         let object = SubgroupObject {
-            object: ObjectId::ZERO,
+            object: ObjectSeq::ZERO,
             content: SubgroupContent::Normal {
                 payload: Bytes::from_static(b"x"),
                 properties: props(),
@@ -733,7 +754,7 @@ mod tests {
             .write(
                 &mut buf,
                 &SubgroupObject {
-                    object: ObjectId::ZERO,
+                    object: ObjectSeq::ZERO,
                     content: SubgroupContent::Terminal(TerminalStatus::EndOfTrack),
                 },
             )
@@ -752,13 +773,13 @@ mod tests {
         writer
             .write(
                 &mut buf,
-                &SubgroupObject::new(ObjectId::from(1u32), &b"hello"[..]),
+                &SubgroupObject::new(ObjectSeq::from(1u32), &b"hello"[..]),
             )
             .unwrap();
         writer
             .write(
                 &mut buf,
-                &SubgroupObject::new(ObjectId::from(2u32), &b"world"[..]),
+                &SubgroupObject::new(ObjectSeq::from(2u32), &b"world"[..]),
             )
             .unwrap();
 
@@ -781,37 +802,140 @@ mod tests {
         let mut cursor = buf.as_slice();
         assert_eq!(
             reader.read(&mut cursor).unwrap().object,
-            ObjectId::from(1u32)
+            ObjectSeq::from(1u32)
         );
         assert_eq!(
             reader.read(&mut cursor).unwrap().object,
-            ObjectId::from(2u32)
+            ObjectSeq::from(2u32)
         );
     }
 
-    /// The draft caps Object IDs at 2^64-1, but the field is a vi64. An ID
-    /// above the varint maximum would be computed and then be unencodable, so
-    /// it is rejected at the tighter bound.
+    /// Object IDs accumulate past the varint maximum, and that is legal: the
+    /// absolute value never goes on the wire, only the deltas do. An earlier
+    /// version capped this at the varint maximum and so rejected a conformant
+    /// peer. The only ceiling is 2^64-1.
     #[test]
-    fn object_ids_past_the_varint_ceiling_are_rejected() {
+    fn object_ids_accumulate_past_the_varint_ceiling() {
         let h = header(false, SubgroupSource::Zero);
         let mut reader = SubgroupReader::new(&h);
 
+        // Start as high as one varint allows, then step past it four times.
+        let mut buf = Vec::new();
+        VarInt::MAX.encode(&mut buf);
+        buf.extend_from_slice(&[0x01, b'a']);
+        for _ in 0..4 {
+            buf.extend_from_slice(&[0x00, 0x01, b'b']);
+        }
+
+        let mut cursor = buf.as_slice();
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            seen.push(reader.read(&mut cursor).unwrap().object);
+        }
+        assert!(cursor.is_empty());
+
+        assert_eq!(seen[0].get(), crate::varint::MAX);
+        assert_eq!(seen[4].get(), crate::varint::MAX + 4);
+        // Past the varint ceiling, so it cannot be named in a control message —
+        // but it is still a perfectly deliverable object.
+        assert!(seen[4].to_object_id().is_none());
+
+        // And it all re-encodes, because only the deltas are ever written.
+        let mut out = Vec::new();
+        let mut writer = SubgroupWriter::new(&h);
+        for object in &seen {
+            writer
+                .write(&mut out, &SubgroupObject::new(*object, &b"a"[..]))
+                .unwrap();
+        }
+        let mut reader = SubgroupReader::new(&h);
+        let mut cursor = out.as_slice();
+        for object in &seen {
+            assert_eq!(reader.read(&mut cursor).unwrap().object, *object);
+        }
+    }
+
+    /// The one real ceiling: overflowing 2^64-1 is a protocol violation.
+    #[test]
+    fn object_ids_past_2_pow_64_are_rejected() {
+        let h = header(false, SubgroupSource::Zero);
+        let mut reader = SubgroupReader::new(&h);
+
+        // Climb with maximal deltas until the next one would overflow.
         let mut buf = Vec::new();
         VarInt::MAX.encode(&mut buf);
         buf.extend_from_slice(&[0x01, b'a']);
         let mut cursor = buf.as_slice();
-        assert_eq!(
-            reader.read(&mut cursor).unwrap().object.get(),
-            crate::varint::MAX
-        );
+        reader.read(&mut cursor).unwrap();
 
-        // The next object would be MAX + delta + 1, which cannot be encoded.
+        let mut last = crate::varint::MAX;
+        loop {
+            let mut buf = Vec::new();
+            VarInt::MAX.encode(&mut buf);
+            buf.extend_from_slice(&[0x01, b'b']);
+            let mut cursor = buf.as_slice();
+            match reader.read(&mut cursor) {
+                Ok(read) => {
+                    assert!(read.object.get() > last);
+                    last = read.object.get();
+                }
+                Err(e) => {
+                    assert!(e.is_fatal(), "overflow must be fatal, got {e}");
+                    break;
+                }
+            }
+        }
+    }
+
+    /// A stream cannot *start* above the varint maximum: the first object's
+    /// delta is its absolute ID. The wide range is reachable only by
+    /// accumulating, and that asymmetry is what makes the scheme sound.
+    #[test]
+    fn a_stream_cannot_start_above_the_varint_maximum() {
+        let h = header(false, SubgroupSource::Zero);
+        let mut writer = SubgroupWriter::new(&h);
+        let too_high = ObjectSeq::new(crate::varint::MAX + 1);
+        assert_eq!(
+            writer
+                .write(&mut Vec::new(), &SubgroupObject::new(too_high, &b"a"[..]))
+                .unwrap_err(),
+            SubgroupError::GapTooLarge {
+                previous: None,
+                next: crate::varint::MAX + 1
+            }
+        );
+    }
+
+    /// A gap wider than one varint is unencodable even though both IDs are
+    /// legal, which is a different failure from going backwards.
+    #[test]
+    fn an_unencodable_gap_is_distinct_from_going_backwards() {
+        let h = header(false, SubgroupSource::Zero);
         let mut buf = Vec::new();
-        VarInt::ZERO.encode(&mut buf);
-        buf.extend_from_slice(&[0x01, b'b']);
-        let mut cursor = buf.as_slice();
-        assert!(reader.read(&mut cursor).unwrap_err().is_fatal());
+        let mut writer = SubgroupWriter::new(&h);
+        writer
+            .write(&mut buf, &SubgroupObject::new(1u32, &b"a"[..]))
+            .unwrap();
+
+        let far = ObjectSeq::new(crate::varint::MAX + 8);
+        assert!(matches!(
+            writer
+                .write(&mut buf, &SubgroupObject::new(far, &b"b"[..]))
+                .unwrap_err(),
+            SubgroupError::GapTooLarge {
+                previous: Some(1),
+                ..
+            }
+        ));
+        assert!(matches!(
+            writer
+                .write(&mut buf, &SubgroupObject::new(0u32, &b"b"[..]))
+                .unwrap_err(),
+            SubgroupError::NotIncreasing {
+                previous: 1,
+                next: 0
+            }
+        ));
     }
 
     #[test]

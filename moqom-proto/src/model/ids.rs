@@ -98,6 +98,87 @@ varint_id! {
     TrackAlias
 }
 
+/// An absolute Object ID accumulated from a stream's deltas.
+///
+/// Subgroup and fetch streams do not put absolute Object IDs on the wire. They
+/// carry deltas and the receiver accumulates, and that is what sets the range:
+/// the draft caps the accumulated value at 2^64-1 (§11.4.2, §11.4.4.1), which
+/// is four times wider than a `vi64` can hold. It is legal precisely *because*
+/// the wide value is never itself encoded — only the differences between
+/// consecutive values are, and those stay small in any real stream.
+///
+/// [`ObjectId`] is the narrower type, for the places that do encode an Object
+/// ID absolutely: datagrams, [`Location`], and the first object on a stream.
+/// Those are bounded by the varint maximum, so converting to it is fallible.
+/// That conversion is the honest boundary between "this object exists" and
+/// "this object can be named in a control message" — and the reason the two
+/// types are separate rather than one type with a range check bolted on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct ObjectSeq(u64);
+
+impl ObjectSeq {
+    /// Zero.
+    pub const ZERO: Self = Self(0);
+
+    /// The largest value the draft permits.
+    pub const MAX: Self = Self(u64::MAX);
+
+    /// Wrap a raw value. Every `u64` is a valid Object ID.
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// The raw value.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    /// Advance by `delta`, or `None` past 2^64-1.
+    ///
+    /// Overflow here is a `PROTOCOL_VIOLATION` rather than something to
+    /// saturate: a peer that wraps the object counter has lost the ordering the
+    /// whole subscription depends on.
+    #[must_use]
+    pub const fn checked_add(self, delta: u64) -> Option<Self> {
+        match self.0.checked_add(delta) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+
+    /// Narrow to an [`ObjectId`], or `None` above the varint maximum.
+    ///
+    /// Fails only for objects whose ID exceeded what a single varint can hold,
+    /// which is unreachable without a peer deliberately starting near the
+    /// ceiling. When it does fail, the object is still perfectly deliverable on
+    /// its own stream — it just cannot be referenced by a control message, so
+    /// callers should treat this as "not addressable" rather than "invalid".
+    #[must_use]
+    pub fn to_object_id(self) -> Option<ObjectId> {
+        VarInt::new(self.0).ok().map(ObjectId::new)
+    }
+}
+
+impl From<ObjectId> for ObjectSeq {
+    fn from(id: ObjectId) -> Self {
+        Self(id.get())
+    }
+}
+
+impl From<u32> for ObjectSeq {
+    fn from(v: u32) -> Self {
+        Self(u64::from(v))
+    }
+}
+
+impl std::fmt::Display for ObjectSeq {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 /// A specific object in a group within a track, per draft-19 §1.4.2.
 ///
 /// Field order matters: the derived ordering is exactly the comparison the

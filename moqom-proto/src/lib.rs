@@ -41,7 +41,7 @@ pub use control::{
 };
 pub use error::{BoundsExceeded, DecodeError};
 pub use model::{
-    FullTrackName, GroupId, Location, NameError, ObjectId, ObjectStatus, SubgroupId, TrackAlias,
-    TrackNamespace,
+    FullTrackName, GroupId, Location, NameError, ObjectId, ObjectSeq, ObjectStatus, SubgroupId,
+    TrackAlias, TrackNamespace,
 };
 pub use varint::VarInt;

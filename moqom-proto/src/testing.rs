@@ -616,7 +616,7 @@ pub fn data_plane_corpus() -> Vec<Vec<u8>> {
         DatagramContent, NonEmptyPayload, ObjectDatagram, SubgroupContent, SubgroupHeader,
         SubgroupObject, SubgroupSource, SubgroupWriter, TerminalStatus,
     };
-    use crate::model::{GroupId, ObjectId, SubgroupId, TrackAlias};
+    use crate::model::{GroupId, ObjectId, ObjectSeq, SubgroupId, TrackAlias};
     use crate::varint::VarInt;
 
     let mut props = Properties::new();
@@ -689,14 +689,14 @@ pub fn data_plane_corpus() -> Vec<Vec<u8>> {
                 // A gap, so at least one delta is non-zero.
                 SubgroupObject::new(ObjectId::from(50u32), bytes(b"")),
                 SubgroupObject {
-                    object: ObjectId::from(51u32),
+                    object: ObjectSeq::from(51u32),
                     content: SubgroupContent::Normal {
                         payload: bytes(b"four"),
                         properties: object_properties,
                     },
                 },
                 SubgroupObject {
-                    object: ObjectId::from(52u32),
+                    object: ObjectSeq::from(52u32),
                     content: SubgroupContent::Terminal(TerminalStatus::EndOfGroup),
                 },
             ];
