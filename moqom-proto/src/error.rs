@@ -35,6 +35,32 @@ impl DecodeError {
     pub const fn is_fatal(&self) -> bool {
         matches!(self, Self::Invalid(_))
     }
+
+    /// Reinterpret a short read as malformed.
+    ///
+    /// A [`Short`](Self::Short) means *wait for more bytes*, which is only
+    /// meaningful when more bytes might arrive. Message bodies are delimited by
+    /// the frame layer, so a body that runs out mid-field is not going to be
+    /// completed later — it is a peer that lied about its own length, and
+    /// waiting on it would hang the request stream forever.
+    ///
+    /// Apply this at the boundary where a complete body is handed to a body
+    /// decoder:
+    ///
+    /// ```
+    /// # use moqom_proto::{DecodeError, control::{ControlFrame, messages::Subscribe}};
+    /// # fn f(frame: ControlFrame) -> Result<Subscribe, DecodeError> {
+    /// let mut body = frame.body;
+    /// Subscribe::decode(&mut body).map_err(DecodeError::in_complete_message)
+    /// # }
+    /// ```
+    #[must_use]
+    pub const fn in_complete_message(self) -> Self {
+        match self {
+            Self::Short { .. } => Self::Invalid("message body is shorter than its fields require"),
+            other @ Self::Invalid(_) => other,
+        }
+    }
 }
 
 /// A value too large for the 62-bit variable-length integer encoding.

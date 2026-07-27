@@ -87,6 +87,17 @@ varint_id! {
     ObjectId
 }
 
+varint_id! {
+    /// Identifies a track on the data plane, per draft-19 §11.1.
+    ///
+    /// Subgroup headers and datagrams carry this instead of the full track
+    /// name, which would otherwise repeat a tuple of byte strings on every
+    /// object. The publisher assigns it in `SUBSCRIBE_OK` or `PUBLISH`, and it
+    /// is scoped to the session — the same track has different aliases on
+    /// different connections, and on the two sides of a relay.
+    TrackAlias
+}
+
 /// A specific object in a group within a track, per draft-19 §1.4.2.
 ///
 /// Field order matters: the derived ordering is exactly the comparison the

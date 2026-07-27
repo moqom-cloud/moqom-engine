@@ -255,6 +255,68 @@ impl Parameters {
         }
     }
 
+    /// Total encoded size including the leading count.
+    #[must_use]
+    pub fn encoded_len_counted(&self) -> usize {
+        VarInt::new(self.0.len() as u64).map_or(8, VarInt::size) + self.encoded_len()
+    }
+
+    /// Append the sequence prefixed by a parameter count.
+    ///
+    /// This is the form used by request and response messages, where a byte
+    /// length would not do: several of them place Track Properties immediately
+    /// after the parameters, and only a count says where one ends and the other
+    /// begins. SETUP uses [`Self::encode`] instead, since its options run to the
+    /// end of the message.
+    ///
+    /// # Panics
+    /// Cannot panic: a parameter count is bounded by the 64 KiB message limit.
+    pub fn encode_counted<B: BufMut>(&self, buf: &mut B) {
+        VarInt::new(self.0.len() as u64)
+            .expect("parameter count within varint range")
+            .encode(buf);
+        self.encode(buf);
+    }
+
+    /// Decode a count-prefixed sequence.
+    ///
+    /// A count the buffer cannot possibly satisfy is reported as
+    /// [`DecodeError::Short`], not as malformed, because this decoder cannot
+    /// tell a truncated read from a lying peer. The caller can: a body handed
+    /// over by the frame layer is complete, so it converts with
+    /// [`DecodeError::in_complete_message`]. Either way no allocation happens
+    /// until the count is known to be satisfiable.
+    ///
+    /// # Errors
+    /// - [`DecodeError::Short`] if incomplete.
+    /// - [`DecodeError::Invalid`] if a parameter is malformed.
+    pub fn decode_counted<B: Buf>(buf: &mut B) -> Result<Self, DecodeError> {
+        let count = VarInt::decode(buf)?.get();
+
+        // The smallest parameter is two bytes: a one-byte delta plus either a
+        // one-byte varint or a one-byte zero length. Checking that before
+        // reserving keeps a two-byte header from requesting a huge allocation.
+        let minimum_bytes = count.saturating_mul(2);
+        if minimum_bytes > buf.remaining() as u64 {
+            return Err(DecodeError::Short {
+                needed: usize::try_from(minimum_bytes - buf.remaining() as u64)
+                    .unwrap_or(usize::MAX),
+            });
+        }
+        let count =
+            usize::try_from(count).map_err(|_| DecodeError::Invalid("count exceeds usize"))?;
+
+        let mut params = Vec::with_capacity(count);
+        let mut previous = 0u64;
+        for _ in 0..count {
+            let param = Parameter::decode_after(buf, previous)?;
+            previous = param.type_value;
+            params.push(param);
+        }
+
+        Ok(Self(params))
+    }
+
     /// Decode exactly `byte_len` bytes worth of parameters.
     ///
     /// The length is required rather than inferred: the sequence has no
@@ -514,6 +576,75 @@ mod tests {
             Parameter::varint(4, VarInt::ZERO).unwrap(),
         ]);
         assert!(!unique.has_duplicates());
+    }
+
+    fn round_trip_counted(params: &Parameters) {
+        let mut buf = Vec::new();
+        params.encode_counted(&mut buf);
+        assert_eq!(buf.len(), params.encoded_len_counted());
+
+        let mut cursor = buf.as_slice();
+        assert_eq!(&Parameters::decode_counted(&mut cursor).unwrap(), params);
+        assert!(cursor.is_empty());
+    }
+
+    #[test]
+    fn counted_form_round_trips() {
+        round_trip_counted(&Parameters::new());
+        round_trip_counted(&Parameters::from_vec(vec![
+            Parameter::varint(0, VarInt::new(5).unwrap()).unwrap(),
+            Parameter::bytes(3, &b"token"[..]).unwrap(),
+            Parameter::varint(400, VarInt::new(9).unwrap()).unwrap(),
+        ]));
+    }
+
+    /// The count is what separates parameters from the Track Properties that
+    /// follow them, so decoding must stop exactly on the boundary.
+    #[test]
+    fn counted_decode_leaves_trailing_fields_alone() {
+        let params =
+            Parameters::from_vec(vec![Parameter::varint(2, VarInt::new(1).unwrap()).unwrap()]);
+        let mut buf = Vec::new();
+        params.encode_counted(&mut buf);
+        buf.extend_from_slice(b"properties");
+
+        let mut cursor = buf.as_slice();
+        assert_eq!(Parameters::decode_counted(&mut cursor).unwrap(), params);
+        assert_eq!(cursor, b"properties");
+    }
+
+    /// A large count with no bytes behind it must not cause a large allocation.
+    /// Reported as short here, because only the caller knows whether the body
+    /// was complete; a complete body makes it fatal.
+    #[test]
+    fn an_impossible_count_is_rejected_before_allocating() {
+        for count in [1_000_000u64, crate::varint::MAX] {
+            let mut buf = Vec::new();
+            VarInt::new(count).unwrap().encode(&mut buf);
+
+            let mut cursor = buf.as_slice();
+            let err = Parameters::decode_counted(&mut cursor).unwrap_err();
+            assert!(
+                matches!(err, DecodeError::Short { .. }),
+                "count {count}: {err:?}"
+            );
+            assert!(err.in_complete_message().is_fatal());
+        }
+    }
+
+    #[test]
+    fn a_truncated_counted_sequence_is_short() {
+        let params = Parameters::from_vec(vec![
+            Parameter::bytes(1, &b"aaaa"[..]).unwrap(),
+            Parameter::bytes(3, &b"bbbb"[..]).unwrap(),
+        ]);
+        let mut buf = Vec::new();
+        params.encode_counted(&mut buf);
+        buf.truncate(buf.len() - 2);
+
+        let mut cursor = buf.as_slice();
+        let err = Parameters::decode_counted(&mut cursor).unwrap_err();
+        assert!(!err.is_fatal(), "truncation is recoverable, got {err:?}");
     }
 
     #[test]

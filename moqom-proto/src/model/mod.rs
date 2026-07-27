@@ -25,6 +25,6 @@ pub mod ids;
 pub mod name;
 pub mod object;
 
-pub use ids::{GroupId, Location, ObjectId, SubgroupId};
+pub use ids::{GroupId, Location, ObjectId, SubgroupId, TrackAlias};
 pub use name::{FullTrackName, NameError, TrackNamespace};
 pub use object::ObjectStatus;

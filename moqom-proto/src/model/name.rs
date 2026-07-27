@@ -246,7 +246,11 @@ impl TrackNamespace {
 }
 
 /// A namespace paired with a track name, uniquely identifying a track.
-#[derive(Clone, PartialEq, Eq, Hash)]
+///
+/// The default is the empty namespace with an empty name. That is not a
+/// placeholder: draft-19's Redirect structure uses exactly that encoding to
+/// mean "reuse the original request's track".
+#[derive(Clone, Default, PartialEq, Eq, Hash)]
 pub struct FullTrackName {
     namespace: TrackNamespace,
     name: Bytes,

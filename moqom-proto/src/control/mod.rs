@@ -23,12 +23,21 @@
 
 pub mod frame;
 pub mod message_type;
+pub mod messages;
 pub mod params;
+pub mod properties;
+pub mod reason;
 pub mod request_id;
 pub mod setup;
 
 pub use frame::{BodyTooLong, ControlFrame, MAX_BODY_LEN};
 pub use message_type::{MessageType, StreamKind};
+pub use messages::{
+    Goaway, GoawayError, Redirect, RequestError, RequestErrorCode, RequestOk, Subscribe,
+    SubscribeOk,
+};
 pub use params::{MAX_VALUE_LEN, ParamError, ParamValue, Parameter, Parameters};
+pub use properties::Properties;
+pub use reason::ReasonPhrase;
 pub use request_id::{RequestId, RequestIdGenerator, Role};
 pub use setup::{Setup, SetupError, SetupOptions, Transport};
