@@ -12,12 +12,71 @@
 //! time — so the choice is the peer's, made during the handshake, and the relay
 //! finds out after the fact rather than being configured for one or the other.
 //!
+//! # How the two paths converge
+//!
+//! The obvious design is a trait with a QUIC implementation and a WebTransport
+//! one, and it is the wrong one. WebTransport streams carry a session-ID
+//! preamble that raw QUIC streams do not, so the two are not interchangeable at
+//! the stream level, and a trait would push that difference up into every
+//! caller — or hide it behind `dyn` dispatch on the hot path.
+//!
+//! `web_transport_quinn::Session::raw` removes the problem. It wraps a plain
+//! `quinn::Connection` as a `Session` with no session ID, which means no
+//! preamble is written and the streams are byte-for-byte raw QUIC. Upstream
+//! calls it a hack. It is the right one: both protocols become the same
+//! concrete type, the relay above never branches on which is in use, and the
+//! only place the distinction survives is the accept path in this crate.
+//!
+//! [`Session`] is that type. Nothing above this crate should learn how a peer
+//! connected — if something needs to, that is a signal the abstraction leaked
+//! rather than a reason to expose [`Protocol`].
+//!
 //! # Status
 //!
 //! Scaffolding. The types below fix the shape of the boundary; the
 //! implementations land next.
 
 #![forbid(unsafe_code)]
+
+/// A MOQT session, however the peer reached us.
+///
+/// One concrete type for both protocols — see the module docs for why this is
+/// not a trait.
+pub type Session = web_transport_quinn::Session;
+
+/// How a peer connected.
+///
+/// Determined by ALPN during the handshake, so it is only knowable once the
+/// handshake completes. Exposed for logging and metrics; behaviour above this
+/// crate should not depend on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Protocol {
+    /// Raw MOQT over QUIC. No HTTP layer, no stream preamble.
+    Moq,
+    /// WebTransport over HTTP/3, which is all a browser can offer.
+    WebTransport,
+}
+
+impl Protocol {
+    /// Identify a protocol from the ALPN the handshake settled on.
+    #[must_use]
+    pub fn from_alpn(alpn: &[u8]) -> Option<Self> {
+        match alpn {
+            alpn::MOQ => Some(Self::Moq),
+            alpn::H3 => Some(Self::WebTransport),
+            _ => None,
+        }
+    }
+
+    /// The ALPN identifier.
+    #[must_use]
+    pub const fn alpn(self) -> &'static [u8] {
+        match self {
+            Self::Moq => alpn::MOQ,
+            Self::WebTransport => alpn::H3,
+        }
+    }
+}
 
 /// The negotiated ALPN protocols.
 ///
@@ -53,5 +112,18 @@ mod tests {
     #[test]
     fn quinn_is_linked() {
         let _ = quinn::VarInt::from_u32(0);
+    }
+
+    /// Every ALPN we offer must map to a protocol, and back. A mismatch here
+    /// would mean advertising something the accept path then refuses to
+    /// dispatch — a handshake that succeeds and a session that never starts.
+    #[test]
+    fn every_offered_alpn_round_trips() {
+        for alpn in super::alpn::ALL {
+            let protocol = super::Protocol::from_alpn(alpn)
+                .unwrap_or_else(|| panic!("unmapped ALPN {alpn:?}"));
+            assert_eq!(protocol.alpn(), *alpn);
+        }
+        assert_eq!(super::Protocol::from_alpn(b"h2"), None);
     }
 }

@@ -15,6 +15,7 @@ description = "QUIC and WebTransport session establishment for MOQT"
 moqom-proto = { path = "../moqom-proto" }
 bytes = { workspace = true }
 quinn = { workspace = true }
+web-transport-quinn = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
