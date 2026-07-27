@@ -378,6 +378,30 @@ impl RequestError {
     }
 }
 
+impl crate::control::frame::MessageBody for RequestOk {
+    const MESSAGE_TYPE: crate::control::MessageType = crate::control::MessageType::RequestOk;
+
+    fn encoded_len(&self) -> usize {
+        Self::encoded_len(self)
+    }
+
+    fn encode<B: BufMut>(&self, buf: &mut B) {
+        Self::encode(self, buf);
+    }
+}
+
+impl crate::control::frame::MessageBody for RequestError {
+    const MESSAGE_TYPE: crate::control::MessageType = crate::control::MessageType::RequestError;
+
+    fn encoded_len(&self) -> usize {
+        Self::encoded_len(self)
+    }
+
+    fn encode<B: BufMut>(&self, buf: &mut B) {
+        Self::encode(self, buf);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

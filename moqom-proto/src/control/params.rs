@@ -38,6 +38,19 @@ pub enum ParamError {
         /// Actual length.
         len: usize,
     },
+    /// A type exceeded the varint maximum.
+    ///
+    /// Types are only ever written as deltas, so nothing caps them at the
+    /// varint bound directly. But the first type in a sequence is a delta from
+    /// zero, so a constructed type above [`crate::varint::MAX`] could not be
+    /// encoded if it landed first. Rejecting it here is what keeps every
+    /// [`Parameters`] built through this API encodable — see the invariant
+    /// documented on that type.
+    #[error("type {type_value} exceeds the varint maximum")]
+    TypeTooLarge {
+        /// The offending type.
+        type_value: u64,
+    },
 }
 
 /// A parameter value. Which variant is legal is fixed by the type's parity.
@@ -69,6 +82,7 @@ impl Parameter {
                 required: "byte",
             });
         }
+        Self::check_type(type_value)?;
         Ok(Self {
             type_value,
             value: ParamValue::VarInt(value),
@@ -88,6 +102,7 @@ impl Parameter {
                 required: "varint",
             });
         }
+        Self::check_type(type_value)?;
         let value = value.into();
         if value.len() > MAX_VALUE_LEN {
             return Err(ParamError::ValueTooLong { len: value.len() });
@@ -96,6 +111,13 @@ impl Parameter {
             type_value,
             value: ParamValue::Bytes(value),
         })
+    }
+
+    fn check_type(type_value: u64) -> Result<(), ParamError> {
+        if type_value > crate::varint::MAX {
+            return Err(ParamError::TypeTooLarge { type_value });
+        }
+        Ok(())
     }
 
     /// The parameter type.
@@ -128,9 +150,27 @@ impl Parameter {
         }
     }
 
+    /// The delta this parameter encodes as, given its predecessor's type.
+    ///
+    /// Both the sizing and the writing path go through here so they cannot
+    /// disagree. They previously did: one returned a guess of 8 for an
+    /// unrepresentable delta while the other panicked, which would have written
+    /// a frame whose declared length did not match its contents.
+    ///
+    /// # Panics
+    /// If the [`Parameters`] ordering invariant is broken, or if the delta
+    /// exceeds varint range. Neither is reachable through the public API; see
+    /// the invariant on [`Parameters`].
+    fn delta_from(&self, previous_type: u64) -> VarInt {
+        let delta = self
+            .type_value
+            .checked_sub(previous_type)
+            .expect("parameters are held in ascending type order");
+        VarInt::new(delta).expect("parameter type deltas are varint-representable")
+    }
+
     fn encoded_len_after(&self, previous_type: u64) -> usize {
-        let delta = VarInt::new(self.type_value - previous_type).map_or(8, VarInt::size);
-        delta
+        self.delta_from(previous_type).size()
             + match &self.value {
                 ParamValue::VarInt(v) => v.size(),
                 ParamValue::Bytes(b) => encoded_bytes_len(b.as_ref()),
@@ -138,10 +178,7 @@ impl Parameter {
     }
 
     fn encode_after<B: BufMut>(&self, buf: &mut B, previous_type: u64) {
-        let delta = self.type_value - previous_type;
-        VarInt::new(delta)
-            .expect("delta within varint range")
-            .encode(buf);
+        self.delta_from(previous_type).encode(buf);
         match &self.value {
             ParamValue::VarInt(v) => v.encode(buf),
             ParamValue::Bytes(b) => encode_bytes(buf, b.as_ref()),
@@ -156,6 +193,22 @@ impl Parameter {
                 "parameter type delta overflows 64 bits",
             ))?;
 
+        // Deliberately stricter than draft-19, which permits types up to
+        // 2^64-1 by accumulating deltas. We cap them at the varint maximum.
+        //
+        // A type above 2^62 is encodable only in the position it arrived in:
+        // insert a smaller type ahead of one and the resulting delta no longer
+        // fits a varint. That is a live hazard for relays, which decode
+        // parameters they do not understand, add their own, and forward. The
+        // alternatives were a fallible API on every insertion, or a panic
+        // reachable from hostile input. A clean protocol error at a threshold
+        // no registered code point comes within 2^62 of is the better trade.
+        if type_value > crate::varint::MAX {
+            return Err(DecodeError::Invalid(
+                "parameter type exceeds the varint maximum",
+            ));
+        }
+
         let value = if type_value.is_multiple_of(2) {
             ParamValue::VarInt(VarInt::decode(buf)?)
         } else {
@@ -168,9 +221,26 @@ impl Parameter {
 
 /// An ordered sequence of parameters.
 ///
-/// Parameters are held sorted by type so that delta encoding is always
-/// representable. Order carries no meaning in MOQT, so sorting loses nothing;
-/// the sort is stable, which preserves the relative order of repeated types.
+/// # Invariant
+///
+/// Held sorted by type, with every type at most [`crate::varint::MAX`]. Those
+/// two facts together are what make encoding infallible: sorting means no delta
+/// is negative, and the bound means no delta is too large to write, including
+/// the first one, which is measured from zero.
+///
+/// Both are enforced at the only two entry points. The constructors on
+/// [`Parameter`] reject an out-of-range type, and every insertion here places
+/// the parameter in sorted position. The vector is private, so there is no
+/// third way in.
+///
+/// Decoding upholds it too: types are read as unsigned deltas so they can only
+/// ascend, and the decoder rejects any that accumulate past the bound. That
+/// last check is a deliberate tightening of the draft, explained where it is
+/// applied, and it is what lets a relay decode parameters it does not
+/// understand, insert its own, and re-encode without a fallible path.
+///
+/// Order carries no meaning in MOQT, so sorting loses nothing; the sort is
+/// stable, which preserves the relative order of repeated types.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Parameters(Vec<Parameter>);
 
@@ -464,6 +534,49 @@ mod tests {
         ));
     }
 
+    /// Types above the varint bound are only encodable in the position they
+    /// arrived in, so they are refused at both entry points rather than
+    /// allowed in and panicked on later.
+    #[test]
+    fn types_above_the_varint_bound_are_refused() {
+        let max = crate::varint::MAX; // odd, so it takes a byte value
+        assert!(Parameter::bytes(max, &b"x"[..]).is_ok());
+        assert!(matches!(
+            Parameter::varint(max + 1, VarInt::ZERO),
+            Err(ParamError::TypeTooLarge { .. })
+        ));
+
+        // On the wire the same limit is reached by accumulating deltas, since
+        // no single delta can express it.
+        let mut buf = Vec::new();
+        VarInt::MAX.encode(&mut buf);
+        encode_bytes(&mut buf, b"x");
+        VarInt::new(1).unwrap().encode(&mut buf); // pushes the type past MAX
+        VarInt::ZERO.encode(&mut buf);
+
+        let mut cursor = buf.as_slice();
+        let err = Parameters::decode(&mut cursor, buf.len()).unwrap_err();
+        assert!(err.is_fatal());
+    }
+
+    /// A relay decodes parameters it does not understand, adds its own, and
+    /// forwards. That used to be able to panic when a hostile peer sent a type
+    /// near the top of the range.
+    #[test]
+    fn inserting_into_a_decoded_set_cannot_panic() {
+        let hostile = Parameters::from_vec(vec![
+            Parameter::bytes(crate::varint::MAX, &b"far"[..]).unwrap(),
+        ]);
+        let mut buf = Vec::new();
+        hostile.encode(&mut buf);
+
+        let mut cursor = buf.as_slice();
+        let mut decoded = Parameters::decode(&mut cursor, buf.len()).unwrap();
+        decoded.push(Parameter::varint(0, VarInt::ZERO).unwrap());
+
+        round_trip(&decoded);
+    }
+
     #[test]
     fn oversized_values_are_rejected() {
         let too_long = vec![0u8; MAX_VALUE_LEN + 1];
@@ -645,6 +758,81 @@ mod tests {
         let mut cursor = buf.as_slice();
         let err = Parameters::decode_counted(&mut cursor).unwrap_err();
         assert!(!err.is_fatal(), "truncation is recoverable, got {err:?}");
+    }
+
+    mod properties {
+        use proptest::prelude::*;
+
+        use super::*;
+
+        /// Parameters built the way callers build them: arbitrary types across
+        /// the full range, with the value shape forced to match parity.
+        fn any_parameter() -> impl Strategy<Value = Parameter> {
+            (
+                0..=crate::varint::MAX,
+                prop::collection::vec(any::<u8>(), 0..32),
+            )
+                .prop_map(|(type_value, bytes)| {
+                    if type_value.is_multiple_of(2) {
+                        let v = VarInt::new(u64::from(bytes.len() as u32)).unwrap();
+                        Parameter::varint(type_value, v).unwrap()
+                    } else {
+                        Parameter::bytes(type_value, bytes).unwrap()
+                    }
+                })
+        }
+
+        fn any_parameters() -> impl Strategy<Value = Parameters> {
+            prop::collection::vec(any_parameter(), 0..12).prop_map(Parameters::from_vec)
+        }
+
+        proptest! {
+            /// `encoded_len` fills in the frame's length field while `encode`
+            /// writes the bytes. If they can ever disagree, the frame declares
+            /// a length that does not match its contents and the peer's control
+            /// stream desynchronises — so this is the single most important
+            /// property in the module.
+            #[test]
+            fn sizing_always_matches_writing(params in any_parameters()) {
+                let mut buf = Vec::new();
+                params.encode(&mut buf);
+                prop_assert_eq!(buf.len(), params.encoded_len());
+
+                let mut counted = Vec::new();
+                params.encode_counted(&mut counted);
+                prop_assert_eq!(counted.len(), params.encoded_len_counted());
+            }
+
+            #[test]
+            fn round_trips_in_both_framings(params in any_parameters()) {
+                let mut buf = Vec::new();
+                params.encode(&mut buf);
+                let mut cursor = buf.as_slice();
+                prop_assert_eq!(Parameters::decode(&mut cursor, buf.len()).unwrap(), params.clone());
+
+                let mut buf = Vec::new();
+                params.encode_counted(&mut buf);
+                let mut cursor = buf.as_slice();
+                prop_assert_eq!(Parameters::decode_counted(&mut cursor).unwrap(), params);
+            }
+
+            /// Whatever a peer sends, decoding must either fail or produce a
+            /// set that satisfies the invariant — otherwise re-encoding it,
+            /// which every relay does, could panic.
+            #[test]
+            fn decoded_sets_are_always_re_encodable(bytes in prop::collection::vec(any::<u8>(), 0..256)) {
+                let mut cursor = bytes.as_slice();
+                if let Ok(params) = Parameters::decode(&mut cursor, bytes.len()) {
+                    let types: Vec<u64> = params.as_slice().iter().map(Parameter::type_value).collect();
+                    prop_assert!(types.windows(2).all(|w| w[0] <= w[1]), "not ascending");
+                    prop_assert!(types.iter().all(|&t| t <= crate::varint::MAX), "type out of range");
+
+                    let mut buf = Vec::new();
+                    params.encode(&mut buf);
+                    prop_assert_eq!(buf.len(), params.encoded_len());
+                }
+            }
+        }
     }
 
     #[test]

@@ -122,6 +122,18 @@ impl Goaway {
     }
 }
 
+impl crate::control::frame::MessageBody for Goaway {
+    const MESSAGE_TYPE: crate::control::MessageType = crate::control::MessageType::Goaway;
+
+    fn encoded_len(&self) -> usize {
+        Self::encoded_len(self)
+    }
+
+    fn encode<B: BufMut>(&self, buf: &mut B) {
+        Self::encode(self, buf);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

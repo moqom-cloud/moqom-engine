@@ -30,7 +30,7 @@ pub mod reason;
 pub mod request_id;
 pub mod setup;
 
-pub use frame::{BodyTooLong, ControlFrame, MAX_BODY_LEN};
+pub use frame::{BodyTooLong, ControlFrame, MAX_BODY_LEN, MessageBody, write_message};
 pub use message_type::{MessageType, StreamKind};
 pub use messages::{
     Goaway, GoawayError, Redirect, RequestError, RequestErrorCode, RequestOk, Subscribe,
