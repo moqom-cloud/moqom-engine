@@ -313,6 +313,95 @@ impl_codec!(crate::control::Redirect, "Redirect", false,
     size: |s| s.encoded_len(),
     decode: |i| Self::decode(i));
 
+// The payload is defined as the remainder of the datagram, so this consumes to
+// end by construction rather than by choice.
+impl_codec!(crate::data::ObjectDatagram, "ObjectDatagram", true,
+    encode: |s, buf| s.encode(buf),
+    size: |s| s.encoded_len(),
+    decode: |i| Self::decode(i));
+
+impl_codec!(crate::data::SubgroupHeader, "SubgroupHeader", false,
+    encode: |s, buf| s.encode(buf),
+    size: |s| s.encoded_len(),
+    decode: |i| Self::decode(i));
+
+/// Hold a whole subgroup stream to the contract, header and objects together.
+///
+/// Objects on a subgroup stream cannot be checked by [`assert_decoder_contract`]
+/// because they are not independently decodable: Object IDs are deltas against
+/// the previous object and field presence comes from the header. That state is
+/// exactly where the interesting bugs live, so it gets its own check.
+///
+/// # Panics
+/// If the reader fails to make progress, if a decoded stream cannot be written
+/// back, or if doing so does not reproduce the same objects.
+pub fn assert_subgroup_stream_contract(bytes: &[u8]) {
+    use crate::data::{SubgroupHeader, SubgroupReader, SubgroupWriter};
+
+    let mut cursor = bytes;
+    let Ok(header) = SubgroupHeader::decode(&mut cursor) else {
+        return;
+    };
+
+    let mut reader = SubgroupReader::new(&header);
+    let mut objects = Vec::new();
+    let mut remaining = cursor.len();
+
+    while let Ok(object) = reader.read(&mut cursor) {
+        assert!(
+            cursor.len() < remaining,
+            "SubgroupReader made no progress, which would spin a relay forever"
+        );
+        remaining = cursor.len();
+        objects.push(object);
+
+        // A malicious header plus a long buffer should not be able to make this
+        // unbounded; the cap keeps the fuzzer honest about time rather than
+        // asserting anything about the protocol.
+        if objects.len() > 4096 {
+            return;
+        }
+    }
+
+    // Whatever was read must be writable again, and must read back the same.
+    // This is where a dropped property or a mishandled delta shows up.
+    let mut reencoded = Vec::new();
+    header.encode(&mut reencoded);
+    let mut writer = SubgroupWriter::new(&header);
+    for object in &objects {
+        let Ok(size) = writer.encoded_len(object) else {
+            panic!("SubgroupWriter refused an object the reader produced: {object:?}");
+        };
+        let before = reencoded.len();
+        writer
+            .write(&mut reencoded, object)
+            .expect("sizing already succeeded");
+        assert_eq!(
+            reencoded.len() - before,
+            size,
+            "SubgroupWriter sizing disagrees with writing"
+        );
+    }
+
+    let mut cursor = reencoded.as_slice();
+    let again = SubgroupHeader::decode(&mut cursor).expect("re-encoded header must decode");
+    assert_eq!(
+        again, header,
+        "subgroup header round trip changed the value"
+    );
+
+    let mut reader = SubgroupReader::new(&again);
+    for object in &objects {
+        let decoded = reader
+            .read(&mut cursor)
+            .expect("re-encoded object must decode");
+        assert_eq!(
+            &decoded, object,
+            "subgroup object round trip changed the value"
+        );
+    }
+}
+
 /// Run the decoder contract over every wire type in the crate.
 ///
 /// One call site for all of them, so a new type is one line here and cannot be
@@ -346,6 +435,9 @@ pub fn assert_all_decoder_contracts(bytes: &[u8]) {
     assert_decoder_contract::<RequestOk>(bytes);
     assert_decoder_contract::<RequestError>(bytes);
     assert_decoder_contract::<Redirect>(bytes);
+    assert_decoder_contract::<crate::data::ObjectDatagram>(bytes);
+    assert_decoder_contract::<crate::data::SubgroupHeader>(bytes);
+    assert_subgroup_stream_contract(bytes);
 }
 
 /// Valid encodings of every wire type, for seeding mutation.
@@ -501,6 +593,120 @@ pub fn seed_corpus() -> Vec<Vec<u8>> {
         corpus.push(enc(
             &ControlFrame::new(ty, bytes(b"\x00\x01\x02\x03")).unwrap()
         ));
+    }
+
+    corpus.extend(data_plane_corpus());
+    corpus
+}
+
+/// Datagrams and whole subgroup streams.
+///
+/// Streams are seeded as a header plus several objects rather than headers
+/// alone: the delta state only exists once there is more than one object, and
+/// that state is the part worth exercising.
+///
+/// # Panics
+/// If a representative object cannot be written, which would mean the writer
+/// rejects something it is documented to accept.
+#[must_use]
+pub fn data_plane_corpus() -> Vec<Vec<u8>> {
+    use crate::control::params::Parameter;
+    use crate::control::properties::Properties;
+    use crate::data::{
+        DatagramContent, NonEmptyPayload, ObjectDatagram, SubgroupContent, SubgroupHeader,
+        SubgroupObject, SubgroupSource, SubgroupWriter, TerminalStatus,
+    };
+    use crate::model::{GroupId, ObjectId, SubgroupId, TrackAlias};
+    use crate::varint::VarInt;
+
+    let mut props = Properties::new();
+    props.push(Parameter::varint(0x10, VarInt::from_u32(3)).unwrap());
+    props.push(Parameter::bytes(0x4001, bytes(b"codec-config")).unwrap());
+
+    let mut corpus = Vec::new();
+
+    let contents = [
+        DatagramContent::payload(&b"a-video-frame"[..]),
+        DatagramContent::payload(bytes(b"")),
+        DatagramContent::Payload {
+            payload: NonEmptyPayload::new(&b"with-props"[..]).unwrap(),
+            properties: props.clone(),
+            end_of_group: true,
+        },
+        DatagramContent::Empty {
+            properties: props.clone(),
+        },
+        DatagramContent::Terminal(TerminalStatus::EndOfGroup),
+        DatagramContent::Terminal(TerminalStatus::EndOfTrack),
+    ];
+    for content in contents {
+        for (object, priority) in [
+            (ObjectId::ZERO, None),
+            (ObjectId::from(1_000u32), Some(200u8)),
+        ] {
+            let mut buf = Vec::new();
+            ObjectDatagram {
+                track_alias: TrackAlias::from(9u32),
+                group: GroupId::from(2u32),
+                object,
+                priority,
+                content: content.clone(),
+            }
+            .encode(&mut buf);
+            corpus.push(buf);
+        }
+    }
+
+    let sources = [
+        SubgroupSource::Zero,
+        SubgroupSource::FirstObjectId,
+        SubgroupSource::Explicit(SubgroupId::from(4u32)),
+    ];
+    for subgroup in sources {
+        for properties_present in [false, true] {
+            let header = SubgroupHeader {
+                track_alias: TrackAlias::from(9u32),
+                group: GroupId::from(2u32),
+                subgroup,
+                priority: Some(128),
+                properties_present,
+                end_of_group: true,
+                first_object: true,
+            };
+
+            let mut buf = Vec::new();
+            header.encode(&mut buf);
+            let mut writer = SubgroupWriter::new(&header);
+
+            let object_properties = if properties_present {
+                props.clone()
+            } else {
+                Properties::new()
+            };
+            let objects = [
+                SubgroupObject::new(ObjectId::ZERO, &b"one"[..]),
+                SubgroupObject::new(ObjectId::from(1u32), &b"two"[..]),
+                // A gap, so at least one delta is non-zero.
+                SubgroupObject::new(ObjectId::from(50u32), bytes(b"")),
+                SubgroupObject {
+                    object: ObjectId::from(51u32),
+                    content: SubgroupContent::Normal {
+                        payload: bytes(b"four"),
+                        properties: object_properties,
+                    },
+                },
+                SubgroupObject {
+                    object: ObjectId::from(52u32),
+                    content: SubgroupContent::Terminal(TerminalStatus::EndOfGroup),
+                },
+            ];
+            for object in &objects {
+                writer
+                    .write(&mut buf, object)
+                    .expect("corpus objects are well formed");
+            }
+            corpus.push(buf);
+        }
     }
 
     corpus
@@ -735,9 +941,11 @@ mod tests {
         #[test]
         fn mutation_actually_reaches_the_interesting_decoders() {
             use crate::control::{ControlFrame, RequestError, Subscribe, SubscribeOk};
+            use crate::data::{ObjectDatagram, SubgroupHeader, SubgroupReader};
 
             let corpus = seed_corpus();
             let (mut subscribe, mut subscribe_ok, mut request_error, mut frame) = (0, 0, 0, 0);
+            let (mut datagram, mut subgroup_objects) = (0, 0);
 
             for seed in 0..20_000u64 {
                 let base = &corpus[(seed as usize) % corpus.len()];
@@ -755,11 +963,25 @@ mod tests {
                 if ControlFrame::decode(&mut input.as_slice()).is_ok() {
                     frame += 1;
                 }
+                if ObjectDatagram::decode(&mut input.as_slice()).is_ok() {
+                    datagram += 1;
+                }
+
+                // Count objects, not headers: a header that parses proves
+                // nothing about the delta state, which is the part that breaks.
+                let mut cursor = input.as_slice();
+                if let Ok(header) = SubgroupHeader::decode(&mut cursor) {
+                    let mut reader = SubgroupReader::new(&header);
+                    while reader.read(&mut cursor).is_ok() {
+                        subgroup_objects += 1;
+                    }
+                }
             }
 
             let report = format!(
                 "Subscribe={subscribe} SubscribeOk={subscribe_ok} \
-                         RequestError={request_error} ControlFrame={frame}"
+                 RequestError={request_error} ControlFrame={frame} \
+                 ObjectDatagram={datagram} SubgroupObjects={subgroup_objects}"
             );
             assert!(subscribe >= 100, "too few Subscribe decodes: {report}");
             assert!(subscribe_ok >= 100, "too few SubscribeOk decodes: {report}");
@@ -768,6 +990,11 @@ mod tests {
                 "too few RequestError decodes: {report}"
             );
             assert!(frame >= 100, "too few ControlFrame decodes: {report}");
+            assert!(datagram >= 100, "too few ObjectDatagram decodes: {report}");
+            assert!(
+                subgroup_objects >= 100,
+                "too few subgroup objects read: {report}"
+            );
         }
     }
 }

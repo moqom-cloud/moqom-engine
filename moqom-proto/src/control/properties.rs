@@ -132,6 +132,50 @@ impl Properties {
         Ok(Self(Parameters::decode(buf, byte_len)?))
     }
 
+    /// Encoded size including the length prefix Object Properties carry.
+    #[must_use]
+    pub fn encoded_len_prefixed(&self) -> usize {
+        let body = self.encoded_len();
+        crate::varint::VarInt::try_from(body as u64)
+            .map_or(8, crate::varint::VarInt::size)
+            .saturating_add(body)
+    }
+
+    /// Append the properties with the `vi64` length prefix, as Object
+    /// Properties are framed on the data plane (draft-19 §11.2.1.2).
+    ///
+    /// # Panics
+    /// If the encoded body exceeds the varint maximum, which cannot happen for
+    /// a set built through the public API.
+    pub fn encode_prefixed<B: BufMut>(&self, buf: &mut B) {
+        let body = self.encoded_len();
+        let len = crate::varint::VarInt::try_from(body as u64)
+            .expect("property sets built through the API always fit a varint");
+        len.encode(buf);
+        self.encode(buf);
+    }
+
+    /// Decode length-prefixed Object Properties.
+    ///
+    /// The prefix is peer-supplied, so it is checked against what is actually
+    /// buffered before being used as a length. Trusting it would let a peer
+    /// name a region larger than the datagram it arrived in.
+    ///
+    /// # Errors
+    /// [`DecodeError::Short`] if fewer bytes are buffered than the prefix
+    /// claims, or [`DecodeError::Invalid`] if the prefix cannot be a length.
+    pub fn decode_prefixed<B: Buf>(buf: &mut B) -> Result<Self, DecodeError> {
+        let len = crate::varint::VarInt::decode(buf)?.get();
+        let len = usize::try_from(len)
+            .map_err(|_| DecodeError::Invalid("property length exceeds addressable memory"))?;
+        if buf.remaining() < len {
+            return Err(DecodeError::Short {
+                needed: len - buf.remaining(),
+            });
+        }
+        Self::decode(buf, len)
+    }
+
     /// Decode properties filling the remainder of a message body.
     ///
     /// Track Properties are defined as "the remaining length of the message",
