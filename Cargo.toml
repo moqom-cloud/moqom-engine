@@ -1,0 +1,48 @@
+[workspace]
+resolver = "3"
+members = ["moqom-proto"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.97"
+authors = ["MOQOM"]
+repository = "https://github.com/moqom-cloud/moqom"
+# License intentionally unset: the relay and control plane are headed for a
+# source-available licence and the SDKs for Apache-2.0. Setting a permissive
+# licence at the root now would grant rights we cannot claw back. See
+# LICENSING.md and the `licensing` todo.
+publish = false
+
+[workspace.dependencies]
+bytes = "1"
+thiserror = "2"
+
+# Dev
+proptest = "1"
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# A wire codec is mostly deliberate numeric conversions with locally proven
+# bounds; the lint fires on nearly every line and hides the real findings.
+cast_possible_truncation = "allow"
+module_name_repetitions = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+# Release speed with symbols, for profiling the relay and latency harness.
+[profile.profiling]
+inherits = "release"
+debug = true
+panic = "unwind"
+
+# Fuzzing and property tests are unusably slow on an unoptimised codec.
+[profile.test]
+opt-level = 1
