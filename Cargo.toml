@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["moqom-proto", "moqom-transport"]
+members = ["moqom-proto", "moqom-relay", "moqom-transport"]
 # cargo-fuzz needs nightly and links libFuzzer, so it cannot build under the
 # pinned stable toolchain the rest of the workspace uses. Excluded rather than
 # gated: the same contract it enforces also runs on stable via the property
@@ -29,10 +29,14 @@ rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", 
 url = "2"
 tokio = { version = "1", default-features = false }
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "env-filter"] }
+aws-lc-rs = "1"
+base64 = "0.22"
+rcgen = "0.14"
+rustls-pemfile = "2"
 
 # Dev
 proptest = "1"
-rcgen = "0.14"
 
 [workspace.lints.rust]
 missing_docs = "warn"

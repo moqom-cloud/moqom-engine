@@ -1,0 +1,42 @@
+[package]
+name = "moqom-relay"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+# BUSL-1.1: the relay is the service half of the licence split. See LICENSING.md.
+license = "BUSL-1.1"
+description = "A MOQT relay: session state, subscription matching, and fan-out"
+
+[dependencies]
+moqom-proto = { path = "../moqom-proto" }
+moqom-transport = { path = "../moqom-transport" }
+bytes = { workspace = true }
+quinn = { workspace = true }
+rustls = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time", "io-util", "signal"] }
+tracing = { workspace = true }
+web-transport-quinn = { workspace = true }
+
+# Binary only. A relay in production is given a certificate; these are what let
+# it generate one for a test harness or a laptop, and print the hash to pin.
+aws-lc-rs = { workspace = true }
+base64 = { workspace = true }
+rcgen = { workspace = true }
+rustls-pemfile = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+rcgen = { workspace = true }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
+url = { workspace = true }
+
+[[bin]]
+name = "moqom-relay"
+path = "src/bin/relay.rs"

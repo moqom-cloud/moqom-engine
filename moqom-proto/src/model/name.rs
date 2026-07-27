@@ -348,6 +348,52 @@ impl std::fmt::Debug for FullTrackName {
     }
 }
 
+/// Render bytes for [`Display`](std::fmt::Display): unquoted when UTF-8, hex
+/// otherwise.
+///
+/// Separate from [`render`] because the two have different jobs. `Debug` quotes
+/// and escapes, so a field containing a separator cannot be mistaken for two
+/// fields; `Display` is for log lines and error messages read by people, where
+/// quotes around every field are noise.
+fn render_plain(bytes: &[u8], f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return f.write_str(s);
+    }
+    write!(f, "0x")?;
+    for b in bytes {
+        write!(f, "{b:02x}")?;
+    }
+    Ok(())
+}
+
+/// Slash-separated fields, which is how namespaces are written by hand.
+///
+/// Not a wire format and not reversible: a field may itself contain a slash, and
+/// this does not escape it. Anything that needs to recover the fields must use
+/// [`TrackNamespace::fields`] — the point of the tuple encoding is that the wire
+/// never has to parse a separator, and rendering one here does not change that.
+impl std::fmt::Display for TrackNamespace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (i, field) in self.fields.iter().enumerate() {
+            if i > 0 {
+                f.write_str("/")?;
+            }
+            render_plain(field, f)?;
+        }
+        Ok(())
+    }
+}
+
+/// The namespace, then the track name, separated the same way.
+impl std::fmt::Display for FullTrackName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if !self.namespace.is_empty() {
+            write!(f, "{}/", self.namespace)?;
+        }
+        render_plain(&self.name, f)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
