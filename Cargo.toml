@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["moqom-proto"]
+members = ["moqom-proto", "moqom-transport"]
 # cargo-fuzz needs nightly and links libFuzzer, so it cannot build under the
 # pinned stable toolchain the rest of the workspace uses. Excluded rather than
 # gated: the same contract it enforces also runs on stable via the property
@@ -22,6 +22,10 @@ publish = false
 [workspace.dependencies]
 bytes = "1"
 thiserror = "2"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
+quinn-proto = { version = "0.11", default-features = false }
+tokio = { version = "1", default-features = false }
+tracing = "0.1"
 
 # Dev
 proptest = "1"
@@ -52,3 +56,12 @@ panic = "unwind"
 # Fuzzing and property tests are unusably slow on an unoptimised codec.
 [profile.test]
 opt-level = 1
+
+# The transport is the one dependency where waiting on an upstream release is
+# unacceptable, so it is vendored -- see vendor/quinn/VENDORED.md. The tree is
+# byte-identical to the tag it records, and vendor/verify-quinn.sh proves both
+# that and that this patch is actually in effect.
+[patch.crates-io]
+quinn = { path = "../vendor/quinn/quinn" }
+quinn-proto = { path = "../vendor/quinn/quinn-proto" }
+quinn-udp = { path = "../vendor/quinn/quinn-udp" }

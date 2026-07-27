@@ -1,0 +1,22 @@
+[package]
+name = "moqom-transport"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+# Apache-2.0: the transport is on the SDK side of the licence split, because a
+# client has to link it. See LICENSING.md.
+license = "Apache-2.0"
+description = "QUIC and WebTransport session establishment for MOQT"
+
+[dependencies]
+moqom-proto = { path = "../moqom-proto" }
+bytes = { workspace = true }
+quinn = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true
