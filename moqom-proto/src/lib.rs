@@ -12,6 +12,7 @@
 //!   contract, which is worth reading before writing a decoder.
 //! - [`error`] — the short-read versus malformed distinction that decides
 //!   whether a session survives.
+//! - [`model`] — the object data model: tracks, groups, subgroups, objects.
 //!
 //! # On a second dialect
 //!
@@ -25,8 +26,12 @@
 
 pub mod coding;
 pub mod error;
+pub mod model;
 pub mod varint;
 
 pub use coding::{Decode, Encode};
 pub use error::{BoundsExceeded, DecodeError};
+pub use model::{
+    FullTrackName, GroupId, Location, NameError, ObjectId, ObjectStatus, SubgroupId, TrackNamespace,
+};
 pub use varint::VarInt;
