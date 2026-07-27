@@ -1,0 +1,33 @@
+[package]
+name = "moqom-proto-fuzz"
+version = "0.0.0"
+description = "Coverage-guided fuzz targets for the moqom-proto codec"
+license = "Apache-2.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+moqom-proto = { path = "../moqom-proto", features = ["testing"] }
+
+# Fuzzing an unoptimised codec wastes most of the CPU budget on the decoder
+# rather than on exploring inputs.
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "decoders"
+path = "fuzz_targets/decoders.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "control_frame"
+path = "fuzz_targets/control_frame.rs"
+test = false
+doc = false
+bench = false

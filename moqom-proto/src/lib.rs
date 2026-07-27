@@ -29,6 +29,8 @@ pub mod coding;
 pub mod control;
 pub mod error;
 pub mod model;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 pub mod varint;
 
 pub use coding::{Decode, Encode};

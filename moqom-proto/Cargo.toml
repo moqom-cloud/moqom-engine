@@ -9,12 +9,22 @@ authors.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+# Exposes the codec conformance harness so out-of-tree consumers — chiefly the
+# fuzz targets, which are a separate crate — can hold new wire types to the same
+# contract the in-tree tests use.
+testing = []
+
 [dependencies]
 bytes.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+
+[[example]]
+name = "seed-corpus"
+required-features = ["testing"]
 
 [lints]
 workspace = true

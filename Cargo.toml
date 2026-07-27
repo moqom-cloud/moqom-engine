@@ -1,6 +1,12 @@
 [workspace]
 resolver = "3"
 members = ["moqom-proto"]
+# cargo-fuzz needs nightly and links libFuzzer, so it cannot build under the
+# pinned stable toolchain the rest of the workspace uses. Excluded rather than
+# gated: the same contract it enforces also runs on stable via the property
+# tests in moqom-proto::testing, so a stable build loses coverage of hostile
+# input depth, not of the invariants themselves.
+exclude = ["fuzz"]
 
 [workspace.package]
 edition = "2024"
