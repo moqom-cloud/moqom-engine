@@ -1,0 +1,530 @@
+//! Key-Value-Pair parameters, per draft-19 §1.4.3.
+//!
+//! Two properties of this encoding are easy to get wrong and produce a codec
+//! that interoperates with itself and nothing else:
+//!
+//! 1. **Types are delta-encoded.** The wire carries `Type - previous_type`,
+//!    starting from zero. Types are therefore non-decreasing within a sequence,
+//!    and a parameter's meaning depends on everything before it.
+//! 2. **Parity selects the value format.** An even Type is followed by a bare
+//!    varint. An odd Type is followed by a length and that many bytes. There is
+//!    no discriminator on the wire — the type number *is* the discriminator.
+
+use bytes::{Buf, BufMut, Bytes};
+
+use crate::coding::{decode_bytes, encode_bytes, encoded_bytes_len};
+use crate::error::DecodeError;
+use crate::varint::VarInt;
+
+/// Largest permitted byte value: `2^16 - 1`.
+pub const MAX_VALUE_LEN: usize = (1 << 16) - 1;
+
+/// A parameter could not be constructed.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ParamError {
+    /// A varint value was given an odd type, or bytes were given an even type.
+    #[error("type {type_value} is {actual}, which requires a {required} value")]
+    ParityMismatch {
+        /// The offending type number.
+        type_value: u64,
+        /// "even" or "odd".
+        actual: &'static str,
+        /// The value kind that parity demands.
+        required: &'static str,
+    },
+    /// A byte value exceeded [`MAX_VALUE_LEN`].
+    #[error("value is {len} bytes, exceeding the {MAX_VALUE_LEN} byte maximum")]
+    ValueTooLong {
+        /// Actual length.
+        len: usize,
+    },
+}
+
+/// A parameter value. Which variant is legal is fixed by the type's parity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParamValue {
+    /// A varint, carried by even-numbered types.
+    VarInt(VarInt),
+    /// A length-prefixed byte string, carried by odd-numbered types.
+    Bytes(Bytes),
+}
+
+/// A single key-value parameter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Parameter {
+    type_value: u64,
+    value: ParamValue,
+}
+
+impl Parameter {
+    /// Build a varint parameter.
+    ///
+    /// # Errors
+    /// [`ParamError::ParityMismatch`] if `type_value` is odd.
+    pub fn varint(type_value: u64, value: VarInt) -> Result<Self, ParamError> {
+        if !type_value.is_multiple_of(2) {
+            return Err(ParamError::ParityMismatch {
+                type_value,
+                actual: "odd",
+                required: "byte",
+            });
+        }
+        Ok(Self {
+            type_value,
+            value: ParamValue::VarInt(value),
+        })
+    }
+
+    /// Build a byte-string parameter.
+    ///
+    /// # Errors
+    /// [`ParamError::ParityMismatch`] if `type_value` is even, or
+    /// [`ParamError::ValueTooLong`] beyond [`MAX_VALUE_LEN`].
+    pub fn bytes(type_value: u64, value: impl Into<Bytes>) -> Result<Self, ParamError> {
+        if type_value.is_multiple_of(2) {
+            return Err(ParamError::ParityMismatch {
+                type_value,
+                actual: "even",
+                required: "varint",
+            });
+        }
+        let value = value.into();
+        if value.len() > MAX_VALUE_LEN {
+            return Err(ParamError::ValueTooLong { len: value.len() });
+        }
+        Ok(Self {
+            type_value,
+            value: ParamValue::Bytes(value),
+        })
+    }
+
+    /// The parameter type.
+    #[must_use]
+    pub const fn type_value(&self) -> u64 {
+        self.type_value
+    }
+
+    /// The parameter value.
+    #[must_use]
+    pub const fn value(&self) -> &ParamValue {
+        &self.value
+    }
+
+    /// The value as a varint, if this is a varint parameter.
+    #[must_use]
+    pub const fn as_varint(&self) -> Option<VarInt> {
+        match self.value {
+            ParamValue::VarInt(v) => Some(v),
+            ParamValue::Bytes(_) => None,
+        }
+    }
+
+    /// The value as bytes, if this is a byte parameter.
+    #[must_use]
+    pub const fn as_bytes(&self) -> Option<&Bytes> {
+        match &self.value {
+            ParamValue::Bytes(b) => Some(b),
+            ParamValue::VarInt(_) => None,
+        }
+    }
+
+    fn encoded_len_after(&self, previous_type: u64) -> usize {
+        let delta = VarInt::new(self.type_value - previous_type).map_or(8, VarInt::size);
+        delta
+            + match &self.value {
+                ParamValue::VarInt(v) => v.size(),
+                ParamValue::Bytes(b) => encoded_bytes_len(b.as_ref()),
+            }
+    }
+
+    fn encode_after<B: BufMut>(&self, buf: &mut B, previous_type: u64) {
+        let delta = self.type_value - previous_type;
+        VarInt::new(delta)
+            .expect("delta within varint range")
+            .encode(buf);
+        match &self.value {
+            ParamValue::VarInt(v) => v.encode(buf),
+            ParamValue::Bytes(b) => encode_bytes(buf, b.as_ref()),
+        }
+    }
+
+    fn decode_after<B: Buf>(buf: &mut B, previous_type: u64) -> Result<Self, DecodeError> {
+        let delta = VarInt::decode(buf)?.get();
+        let type_value = previous_type
+            .checked_add(delta)
+            .ok_or(DecodeError::Invalid(
+                "parameter type delta overflows 64 bits",
+            ))?;
+
+        let value = if type_value.is_multiple_of(2) {
+            ParamValue::VarInt(VarInt::decode(buf)?)
+        } else {
+            ParamValue::Bytes(Bytes::from(decode_bytes(buf, MAX_VALUE_LEN)?))
+        };
+
+        Ok(Self { type_value, value })
+    }
+}
+
+/// An ordered sequence of parameters.
+///
+/// Parameters are held sorted by type so that delta encoding is always
+/// representable. Order carries no meaning in MOQT, so sorting loses nothing;
+/// the sort is stable, which preserves the relative order of repeated types.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Parameters(Vec<Parameter>);
+
+impl Parameters {
+    /// An empty parameter list.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    /// Build from a list, sorting into encodable order.
+    #[must_use]
+    pub fn from_vec(mut params: Vec<Parameter>) -> Self {
+        params.sort_by_key(Parameter::type_value);
+        Self(params)
+    }
+
+    /// Add a parameter, keeping the list sorted.
+    pub fn push(&mut self, param: Parameter) {
+        let at = self.0.partition_point(|p| p.type_value <= param.type_value);
+        self.0.insert(at, param);
+    }
+
+    /// The parameters, in ascending type order.
+    #[must_use]
+    pub fn as_slice(&self) -> &[Parameter] {
+        &self.0
+    }
+
+    /// Number of parameters.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether the list is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The first parameter with the given type.
+    #[must_use]
+    pub fn get(&self, type_value: u64) -> Option<&Parameter> {
+        self.0.iter().find(|p| p.type_value == type_value)
+    }
+
+    /// Whether any type appears more than once.
+    ///
+    /// Most parameters are defined as at-most-once, but not all, so this is
+    /// offered as a check for message decoders to apply rather than enforced
+    /// here.
+    #[must_use]
+    pub fn has_duplicates(&self) -> bool {
+        self.0
+            .windows(2)
+            .any(|w| w[0].type_value == w[1].type_value)
+    }
+
+    /// Total encoded size in bytes.
+    #[must_use]
+    pub fn encoded_len(&self) -> usize {
+        let mut previous = 0u64;
+        let mut total = 0;
+        for param in &self.0 {
+            total += param.encoded_len_after(previous);
+            previous = param.type_value;
+        }
+        total
+    }
+
+    /// Append the encoded sequence to `buf`.
+    ///
+    /// Emits no length prefix. Every use site in draft-19 already bounds the
+    /// sequence by some enclosing length, and adding a second one here would
+    /// put an extra field on the wire.
+    pub fn encode<B: BufMut>(&self, buf: &mut B) {
+        let mut previous = 0u64;
+        for param in &self.0 {
+            param.encode_after(buf, previous);
+            previous = param.type_value;
+        }
+    }
+
+    /// Decode exactly `byte_len` bytes worth of parameters.
+    ///
+    /// The length is required rather than inferred: the sequence has no
+    /// terminator and no count, so only the enclosing message knows where it
+    /// ends.
+    ///
+    /// # Errors
+    /// - [`DecodeError::Short`] if fewer than `byte_len` bytes are available.
+    /// - [`DecodeError::Invalid`] if a parameter straddles the end of the
+    ///   region, if a type delta overflows, or if a value is oversized.
+    pub fn decode<B: Buf>(buf: &mut B, byte_len: usize) -> Result<Self, DecodeError> {
+        if buf.remaining() < byte_len {
+            return Err(DecodeError::Short {
+                needed: byte_len - buf.remaining(),
+            });
+        }
+
+        let start = buf.remaining();
+        let mut params = Vec::new();
+        let mut previous = 0u64;
+
+        while start - buf.remaining() < byte_len {
+            let param = Parameter::decode_after(buf, previous)?;
+            previous = param.type_value;
+            params.push(param);
+        }
+
+        // A parameter that reads past the region did not belong to it. The
+        // bytes it consumed came from whatever follows, so the message is
+        // malformed rather than merely truncated.
+        if start - buf.remaining() != byte_len {
+            return Err(DecodeError::Invalid(
+                "parameter overruns its enclosing length",
+            ));
+        }
+
+        Ok(Self(params))
+    }
+}
+
+impl FromIterator<Parameter> for Parameters {
+    fn from_iter<I: IntoIterator<Item = Parameter>>(iter: I) -> Self {
+        Self::from_vec(iter.into_iter().collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn round_trip(params: &Parameters) {
+        let mut buf = Vec::new();
+        params.encode(&mut buf);
+        assert_eq!(
+            buf.len(),
+            params.encoded_len(),
+            "encoded_len disagrees with encode"
+        );
+
+        let mut cursor = buf.as_slice();
+        let decoded = Parameters::decode(&mut cursor, buf.len()).unwrap();
+        assert_eq!(&decoded, params);
+        assert!(cursor.is_empty());
+    }
+
+    #[test]
+    fn empty_encodes_to_nothing() {
+        let params = Parameters::new();
+        assert_eq!(params.encoded_len(), 0);
+        round_trip(&params);
+    }
+
+    #[test]
+    fn varint_and_byte_parameters_round_trip() {
+        let params = Parameters::from_vec(vec![
+            Parameter::varint(0, VarInt::new(42).unwrap()).unwrap(),
+            Parameter::bytes(1, &b"hello"[..]).unwrap(),
+            Parameter::varint(100, VarInt::new(1_000_000).unwrap()).unwrap(),
+            Parameter::bytes(1001, &b""[..]).unwrap(),
+        ]);
+        round_trip(&params);
+    }
+
+    /// The saving that motivates delta encoding: a run of nearby high-numbered
+    /// types costs one byte each instead of the four an absolute type would.
+    #[test]
+    fn deltas_are_written_not_absolute_types() {
+        let params = Parameters::from_vec(vec![
+            Parameter::varint(1000, VarInt::ZERO).unwrap(),
+            Parameter::varint(1002, VarInt::ZERO).unwrap(),
+            Parameter::varint(1004, VarInt::ZERO).unwrap(),
+        ]);
+        let mut buf = Vec::new();
+        params.encode(&mut buf);
+
+        // 1000 needs two bytes; the deltas of 2 need one each.
+        assert_eq!(buf.len(), (2 + 1) + (1 + 1) + (1 + 1));
+        assert_eq!(buf[2 + 1], 2, "second type is written as a delta of 2");
+        round_trip(&params);
+    }
+
+    #[test]
+    fn unsorted_input_is_ordered_so_deltas_stay_representable() {
+        let params = Parameters::from_vec(vec![
+            Parameter::varint(50, VarInt::ZERO).unwrap(),
+            Parameter::varint(10, VarInt::ZERO).unwrap(),
+            Parameter::varint(30, VarInt::ZERO).unwrap(),
+        ]);
+        let types: Vec<_> = params
+            .as_slice()
+            .iter()
+            .map(Parameter::type_value)
+            .collect();
+        assert_eq!(types, vec![10, 30, 50]);
+        round_trip(&params);
+    }
+
+    #[test]
+    fn push_maintains_order() {
+        let mut params = Parameters::new();
+        params.push(Parameter::varint(20, VarInt::ZERO).unwrap());
+        params.push(Parameter::varint(4, VarInt::ZERO).unwrap());
+        params.push(Parameter::varint(12, VarInt::ZERO).unwrap());
+
+        let types: Vec<_> = params
+            .as_slice()
+            .iter()
+            .map(Parameter::type_value)
+            .collect();
+        assert_eq!(types, vec![4, 12, 20]);
+        round_trip(&params);
+    }
+
+    /// Parity is the only signal for how to read a value, so a mismatch would
+    /// silently desynchronise the whole rest of the sequence.
+    #[test]
+    fn parity_mismatches_are_rejected_at_construction() {
+        assert!(matches!(
+            Parameter::varint(1, VarInt::ZERO),
+            Err(ParamError::ParityMismatch { type_value: 1, .. })
+        ));
+        assert!(matches!(
+            Parameter::bytes(2, &b"x"[..]),
+            Err(ParamError::ParityMismatch { type_value: 2, .. })
+        ));
+    }
+
+    #[test]
+    fn oversized_values_are_rejected() {
+        let too_long = vec![0u8; MAX_VALUE_LEN + 1];
+        assert!(matches!(
+            Parameter::bytes(1, too_long),
+            Err(ParamError::ValueTooLong { len }) if len == MAX_VALUE_LEN + 1
+        ));
+        assert!(Parameter::bytes(1, vec![0u8; MAX_VALUE_LEN]).is_ok());
+    }
+
+    #[test]
+    fn max_length_value_round_trips() {
+        let params = Parameters::from_vec(vec![
+            Parameter::bytes(1, vec![0xAB; MAX_VALUE_LEN]).unwrap(),
+        ]);
+        round_trip(&params);
+    }
+
+    /// A type is only reachable by accumulating deltas, and each delta is
+    /// capped at the varint maximum of `2^62 - 1`, so it takes five of them to
+    /// push a type past `u64::MAX`.
+    #[test]
+    fn a_delta_that_overflows_64_bits_is_invalid() {
+        let mut buf = Vec::new();
+        let mut type_value = 0u64;
+
+        for _ in 0..4 {
+            VarInt::MAX.encode(&mut buf);
+            type_value += crate::varint::MAX;
+            if type_value.is_multiple_of(2) {
+                VarInt::ZERO.encode(&mut buf);
+            } else {
+                encode_bytes(&mut buf, &[]);
+            }
+        }
+        VarInt::MAX.encode(&mut buf);
+
+        let mut cursor = buf.as_slice();
+        let err = Parameters::decode(&mut cursor, buf.len()).unwrap_err();
+        assert!(
+            err.is_fatal(),
+            "overflow is a protocol violation, not truncation"
+        );
+    }
+
+    #[test]
+    fn truncation_is_short_not_invalid() {
+        let params = Parameters::from_vec(vec![Parameter::bytes(1, &b"abcdef"[..]).unwrap()]);
+        let mut buf = Vec::new();
+        params.encode(&mut buf);
+
+        for cut in 1..buf.len() {
+            let mut cursor = &buf[..cut];
+            let err = Parameters::decode(&mut cursor, buf.len()).unwrap_err();
+            assert!(!err.is_fatal(), "cut at {cut} should be recoverable");
+        }
+    }
+
+    /// A parameter reading past its region has consumed bytes belonging to the
+    /// next field, which is corruption rather than a short read.
+    #[test]
+    fn a_parameter_overrunning_its_region_is_invalid() {
+        let params = Parameters::from_vec(vec![Parameter::bytes(1, &b"abcdef"[..]).unwrap()]);
+        let mut buf = Vec::new();
+        params.encode(&mut buf);
+        buf.extend_from_slice(b"trailing bytes");
+
+        let mut cursor = buf.as_slice();
+        let err = Parameters::decode(&mut cursor, 3).unwrap_err();
+        assert!(err.is_fatal());
+    }
+
+    #[test]
+    fn decode_stops_at_the_region_boundary() {
+        let params =
+            Parameters::from_vec(vec![Parameter::varint(0, VarInt::new(7).unwrap()).unwrap()]);
+        let mut buf = Vec::new();
+        params.encode(&mut buf);
+        let region = buf.len();
+        buf.extend_from_slice(b"\xff\xff\xff\xff");
+
+        let mut cursor = buf.as_slice();
+        let decoded = Parameters::decode(&mut cursor, region).unwrap();
+        assert_eq!(decoded, params);
+        assert_eq!(cursor.len(), 4, "trailing bytes are left for the caller");
+    }
+
+    #[test]
+    fn accessors_respect_parity() {
+        let v = Parameter::varint(0, VarInt::new(9).unwrap()).unwrap();
+        assert_eq!(v.as_varint().unwrap().get(), 9);
+        assert!(v.as_bytes().is_none());
+
+        let b = Parameter::bytes(1, &b"xy"[..]).unwrap();
+        assert_eq!(b.as_bytes().unwrap().as_ref(), b"xy");
+        assert!(b.as_varint().is_none());
+    }
+
+    #[test]
+    fn duplicate_detection_finds_repeated_types() {
+        let params = Parameters::from_vec(vec![
+            Parameter::varint(2, VarInt::ZERO).unwrap(),
+            Parameter::varint(2, VarInt::new(1).unwrap()).unwrap(),
+        ]);
+        assert!(params.has_duplicates());
+        round_trip(&params); // a repeat is a delta of zero, which is legal
+
+        let unique = Parameters::from_vec(vec![
+            Parameter::varint(2, VarInt::ZERO).unwrap(),
+            Parameter::varint(4, VarInt::ZERO).unwrap(),
+        ]);
+        assert!(!unique.has_duplicates());
+    }
+
+    #[test]
+    fn get_finds_by_type() {
+        let params = Parameters::from_vec(vec![
+            Parameter::varint(0, VarInt::new(1).unwrap()).unwrap(),
+            Parameter::bytes(3, &b"v"[..]).unwrap(),
+        ]);
+        assert_eq!(params.get(3).unwrap().as_bytes().unwrap().as_ref(), b"v");
+        assert!(params.get(5).is_none());
+        assert_eq!(params.len(), 2);
+        assert!(!params.is_empty());
+    }
+}

@@ -13,23 +13,29 @@
 //! - [`error`] — the short-read versus malformed distinction that decides
 //!   whether a session survives.
 //! - [`model`] — the object data model: tracks, groups, subgroups, objects.
+//! - [`control`] — the control message envelope, type registry, request
+//!   identity, and parameter encoding.
 //!
 //! # On a second dialect
 //!
 //! Cloudflare's relay speaks `moqt-16`, and interoperating later means encoding
 //! the same semantics with different request identity and a different setup
-//! handshake. The seam for that belongs at the message layer, not here — a
-//! varint is a varint in every dialect — so it is deliberately absent until
-//! there is a second implementation to abstract over.
+//! handshake. The seam for that lives in [`control`], where the two dialects
+//! actually differ; below it a varint is a varint, so nothing is abstracted.
 
 #![forbid(unsafe_code)]
 
 pub mod coding;
+pub mod control;
 pub mod error;
 pub mod model;
 pub mod varint;
 
 pub use coding::{Decode, Encode};
+pub use control::{
+    ControlFrame, MessageType, ParamValue, Parameter, Parameters, RequestId, RequestIdGenerator,
+    Role,
+};
 pub use error::{BoundsExceeded, DecodeError};
 pub use model::{
     FullTrackName, GroupId, Location, NameError, ObjectId, ObjectStatus, SubgroupId, TrackNamespace,

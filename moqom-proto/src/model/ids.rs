@@ -92,7 +92,7 @@ varint_id! {
 /// Field order matters: the derived ordering is exactly the comparison the
 /// specification defines, `A.Group < B.Group || (A.Group == B.Group &&
 /// A.Object < B.Object)`. Reordering the fields would silently change protocol
-/// semantics, so [`tests::ordering_matches_spec`] pins it.
+/// semantics, so the `ordering_matches_spec` test pins it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct Location {
     /// Group identifier.
