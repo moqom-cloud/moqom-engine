@@ -40,6 +40,10 @@
 /// not a trait.
 pub type Session = web_transport_quinn::Session;
 
+pub mod server;
+
+pub use server::{AcceptError, Accepting, Negotiated, Server};
+
 /// Protocol identifiers offered during the handshake.
 ///
 /// Draft-15 moved version negotiation out of `SETUP` and into these entirely

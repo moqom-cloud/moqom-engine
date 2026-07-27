@@ -25,11 +25,14 @@ thiserror = "2"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
 quinn-proto = { version = "0.11", default-features = false }
 web-transport-quinn = { version = "0.11", default-features = false, features = ["aws-lc-rs"] }
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
+url = "2"
 tokio = { version = "1", default-features = false }
 tracing = "0.1"
 
 # Dev
 proptest = "1"
+rcgen = "0.14"
 
 [workspace.lints.rust]
 missing_docs = "warn"

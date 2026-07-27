@@ -15,9 +15,15 @@ description = "QUIC and WebTransport session establishment for MOQT"
 moqom-proto = { path = "../moqom-proto" }
 bytes = { workspace = true }
 quinn = { workspace = true }
+rustls = { workspace = true }
+url = { workspace = true }
 web-transport-quinn = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+rcgen = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros", "time"] }
