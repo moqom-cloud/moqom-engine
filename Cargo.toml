@@ -7,10 +7,10 @@ edition = "2024"
 rust-version = "1.97"
 authors = ["MOQOM"]
 repository = "https://github.com/moqom-cloud/moqom"
-# License intentionally unset: the relay and control plane are headed for a
-# source-available licence and the SDKs for Apache-2.0. Setting a permissive
-# licence at the root now would grant rights we cannot claw back. See
-# LICENSING.md and the `licensing` todo.
+# No workspace-level `license`: this workspace spans both licence halves.
+# Apache-2.0 for the protocol, client, and SDK crates; BUSL-1.1 for the relay,
+# control plane, and moqom-cc. Each crate sets its own, and LICENSING.md is the
+# authoritative map. A crate with no `license` field is a bug.
 publish = false
 
 [workspace.dependencies]
