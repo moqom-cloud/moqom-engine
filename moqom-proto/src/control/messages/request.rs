@@ -30,49 +30,68 @@ pub const MAX_CONNECT_URI_LEN: usize = 8192;
 /// not a malformed message, and rejecting one would break exactly the
 /// forward-compatibility the range exists to provide.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct RequestErrorCode(pub u64);
+pub struct RequestErrorCode(pub VarInt);
 
 impl RequestErrorCode {
+    /// Construct from a raw code.
+    ///
+    /// # Errors
+    /// [`crate::error::BoundsExceeded`] above the varint maximum. Holding a
+    /// `VarInt` rather than a `u64` is what keeps encoding infallible; an
+    /// earlier version stored a `u64` and panicked in `encode`.
+    pub const fn new(code: u64) -> Result<Self, crate::error::BoundsExceeded> {
+        match VarInt::new(code) {
+            Ok(v) => Ok(Self(v)),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The raw code.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+
     /// An implementation-specific or generic failure.
-    pub const INTERNAL_ERROR: Self = Self(0x0);
+    pub const INTERNAL_ERROR: Self = Self(VarInt::from_u32(0x0));
     /// Not authorized for this action on this track. May become retryable if
     /// the token is not yet valid.
-    pub const UNAUTHORIZED: Self = Self(0x1);
+    pub const UNAUTHORIZED: Self = Self(VarInt::from_u32(0x1));
     /// An implementation-specific timeout elapsed.
-    pub const TIMEOUT: Self = Self(0x2);
+    pub const TIMEOUT: Self = Self(VarInt::from_u32(0x2));
     /// This request type is not supported.
-    pub const NOT_SUPPORTED: Self = Self(0x3);
+    pub const NOT_SUPPORTED: Self = Self(VarInt::from_u32(0x3));
     /// Auth token failed to deserialize during registration.
-    pub const MALFORMED_AUTH_TOKEN: Self = Self(0x4);
+    pub const MALFORMED_AUTH_TOKEN: Self = Self(VarInt::from_u32(0x4));
     /// Auth token has expired.
-    pub const EXPIRED_AUTH_TOKEN: Self = Self(0x5);
+    pub const EXPIRED_AUTH_TOKEN: Self = Self(VarInt::from_u32(0x5));
     /// A GOAWAY was received, so new requests are being refused.
-    pub const GOING_AWAY: Self = Self(0x6);
+    pub const GOING_AWAY: Self = Self(VarInt::from_u32(0x6));
     /// Overloaded. Pair with a Retry Interval.
-    pub const EXCESSIVE_LOAD: Self = Self(0x9);
+    pub const EXCESSIVE_LOAD: Self = Self(VarInt::from_u32(0x9));
     /// Track or namespace is not available here.
-    pub const DOES_NOT_EXIST: Self = Self(0x10);
+    pub const DOES_NOT_EXIST: Self = Self(VarInt::from_u32(0x10));
     /// The requested filter or location range cannot be satisfied.
-    pub const INVALID_RANGE: Self = Self(0x11);
+    pub const INVALID_RANGE: Self = Self(VarInt::from_u32(0x11));
     /// A relay publisher found the track malformed.
-    pub const MALFORMED_TRACK: Self = Self(0x12);
+    pub const MALFORMED_TRACK: Self = Self(VarInt::from_u32(0x12));
     /// The subscriber does not want this track or namespace.
-    pub const UNINTERESTED: Self = Self(0x20);
+    pub const UNINTERESTED: Self = Self(VarInt::from_u32(0x20));
     /// The prefix overlaps another subscription of the same type.
-    pub const PREFIX_OVERLAP: Self = Self(0x30);
+    pub const PREFIX_OVERLAP: Self = Self(VarInt::from_u32(0x30));
     /// The prefix matches more publishers than the relay will enumerate.
-    pub const NAMESPACE_TOO_LARGE: Self = Self(0x31);
+    pub const NAMESPACE_TOO_LARGE: Self = Self(VarInt::from_u32(0x31));
     /// A joining FETCH referenced a request that is not an established
     /// subscription.
-    pub const INVALID_JOINING_REQUEST_ID: Self = Self(0x32);
+    pub const INVALID_JOINING_REQUEST_ID: Self = Self(VarInt::from_u32(0x32));
     /// A mandatory track property was not understood.
-    pub const UNSUPPORTED_EXTENSION: Self = Self(0x33);
+    pub const UNSUPPORTED_EXTENSION: Self = Self(VarInt::from_u32(0x33));
     /// Try elsewhere. The only code for which a Redirect is present.
-    pub const REDIRECT: Self = Self(0x34);
+    pub const REDIRECT: Self = Self(VarInt::from_u32(0x34));
     /// Too many conflicting filters to aggregate a `SUBSCRIBE_TRACKS`.
-    pub const CONFLICTING_FILTERS: Self = Self(0x35);
+    pub const CONFLICTING_FILTERS: Self = Self(VarInt::from_u32(0x35));
     /// A filter parameter is invalid.
-    pub const INVALID_FILTER: Self = Self(0x36);
+    pub const INVALID_FILTER: Self = Self(VarInt::from_u32(0x36));
 
     /// The registered name, if this build knows the code.
     #[must_use]
@@ -106,7 +125,7 @@ impl std::fmt::Display for RequestErrorCode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.name() {
             Some(name) => f.write_str(name),
-            None => write!(f, "unknown({:#x})", self.0),
+            None => write!(f, "unknown({:#x})", self.0.get()),
         }
     }
 }
@@ -323,7 +342,7 @@ impl RequestError {
     /// Encoded size of the message body.
     #[must_use]
     pub fn encoded_len(&self) -> usize {
-        VarInt::new(self.code.0).map_or(8, VarInt::size)
+        self.code.0.size()
             + self.retry_interval.size()
             + self.reason.encoded_len()
             + self.redirect.as_ref().map_or(0, Redirect::encoded_len)
@@ -335,9 +354,7 @@ impl RequestError {
     /// Panics if `code` is outside varint range, which no registered or greased
     /// code is.
     pub fn encode<B: BufMut>(&self, buf: &mut B) {
-        VarInt::new(self.code.0)
-            .expect("error code within varint range")
-            .encode(buf);
+        self.code.0.encode(buf);
         self.retry_interval.encode(buf);
         self.reason.encode(buf);
         if let Some(redirect) = &self.redirect {
@@ -355,7 +372,7 @@ impl RequestError {
     /// [`DecodeError::Short`] if incomplete; [`DecodeError::Invalid`] if
     /// malformed or if bytes remain after the message.
     pub fn decode<B: Buf>(buf: &mut B) -> Result<Self, DecodeError> {
-        let code = RequestErrorCode(VarInt::decode(buf)?.get());
+        let code = RequestErrorCode(VarInt::decode(buf)?);
         let retry_interval = VarInt::decode(buf)?;
         let reason = ReasonPhrase::decode(buf)?;
 
@@ -422,21 +439,21 @@ mod tests {
 
     #[test]
     fn error_codes_match_the_registry() {
-        assert_eq!(RequestErrorCode::INTERNAL_ERROR.0, 0x0);
-        assert_eq!(RequestErrorCode::GOING_AWAY.0, 0x6);
-        assert_eq!(RequestErrorCode::EXCESSIVE_LOAD.0, 0x9);
-        assert_eq!(RequestErrorCode::DOES_NOT_EXIST.0, 0x10);
-        assert_eq!(RequestErrorCode::UNINTERESTED.0, 0x20);
-        assert_eq!(RequestErrorCode::PREFIX_OVERLAP.0, 0x30);
-        assert_eq!(RequestErrorCode::REDIRECT.0, 0x34);
-        assert_eq!(RequestErrorCode::INVALID_FILTER.0, 0x36);
+        assert_eq!(RequestErrorCode::INTERNAL_ERROR.get(), 0x0);
+        assert_eq!(RequestErrorCode::GOING_AWAY.get(), 0x6);
+        assert_eq!(RequestErrorCode::EXCESSIVE_LOAD.get(), 0x9);
+        assert_eq!(RequestErrorCode::DOES_NOT_EXIST.get(), 0x10);
+        assert_eq!(RequestErrorCode::UNINTERESTED.get(), 0x20);
+        assert_eq!(RequestErrorCode::PREFIX_OVERLAP.get(), 0x30);
+        assert_eq!(RequestErrorCode::REDIRECT.get(), 0x34);
+        assert_eq!(RequestErrorCode::INVALID_FILTER.get(), 0x36);
     }
 
     /// The registry is extensible and reserves a greasing range, so a code this
     /// build has never heard of must survive rather than fail the session.
     #[test]
     fn unknown_codes_are_preserved() {
-        let unknown = RequestErrorCode(0x9D);
+        let unknown = RequestErrorCode::new(0x9D).unwrap();
         assert_eq!(unknown.name(), None);
         assert_eq!(unknown.to_string(), "unknown(0x9d)");
 

@@ -33,8 +33,10 @@ pub mod setup;
 pub use frame::{BodyTooLong, ControlFrame, MAX_BODY_LEN, MessageBody, write_message};
 pub use message_type::{MessageType, StreamKind};
 pub use messages::{
-    Goaway, GoawayError, Redirect, RequestError, RequestErrorCode, RequestOk, Subscribe,
-    SubscribeOk,
+    Fetch, FetchKind, FetchOk, Goaway, GoawayError, Namespace, NamespaceDone, Publish, PublishDone,
+    PublishDoneStatus, PublishNamespace, PublishSkipped, Redirect, RequestError, RequestErrorCode,
+    RequestOk, RequestUpdate, StreamCount, Subscribe, SubscribeNamespace, SubscribeOk,
+    SubscribeTracks, TrackStatus,
 };
 pub use params::{MAX_VALUE_LEN, ParamError, ParamValue, Parameter, Parameters};
 pub use properties::Properties;

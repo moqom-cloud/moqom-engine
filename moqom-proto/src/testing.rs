@@ -308,6 +308,66 @@ impl_codec!(crate::control::RequestError, "RequestError", true,
     size: |s| s.encoded_len(),
     decode: |i| Self::decode(i));
 
+impl_codec!(crate::control::TrackStatus, "TrackStatus", false,
+    encode: |s, buf| s.encode(buf),
+    size: |s| s.encoded_len(),
+    decode: |i| Self::decode(i));
+
+impl_codec!(crate::control::Publish, "Publish", true,
+    encode: |s, buf| s.encode(buf),
+    size: |s| s.encoded_len(),
+    decode: |i| Self::decode(i));
+
+impl_codec!(crate::control::PublishDone, "PublishDone", false,
+    encode: |s, buf| s.encode(buf),
+    size: |s| s.encoded_len(),
+    decode: |i| Self::decode(i));
+
+impl_codec!(crate::control::PublishSkipped, "PublishSkipped", false,
+    encode: |s, buf| s.encode(buf),
+    size: |s| s.encoded_len(),
+    decode: |i| Self::decode(i));
+
+impl_codec!(crate::control::RequestUpdate, "RequestUpdate", false,
+    encode: |s, buf| s.encode(buf),
+    size: |s| s.encoded_len(),
+    decode: |i| Self::decode(i));
+
+impl_codec!(crate::control::Fetch, "Fetch", false,
+    encode: |s, buf| s.encode(buf),
+    size: |s| s.encoded_len(),
+    decode: |i| Self::decode(i));
+
+impl_codec!(crate::control::FetchOk, "FetchOk", true,
+    encode: |s, buf| s.encode(buf),
+    size: |s| s.encoded_len(),
+    decode: |i| Self::decode(i));
+
+impl_codec!(crate::control::PublishNamespace, "PublishNamespace", false,
+    encode: |s, buf| s.encode(buf),
+    size: |s| s.encoded_len(),
+    decode: |i| Self::decode(i));
+
+impl_codec!(crate::control::SubscribeNamespace, "SubscribeNamespace", false,
+    encode: |s, buf| s.encode(buf),
+    size: |s| s.encoded_len(),
+    decode: |i| Self::decode(i));
+
+impl_codec!(crate::control::SubscribeTracks, "SubscribeTracks", false,
+    encode: |s, buf| s.encode(buf),
+    size: |s| s.encoded_len(),
+    decode: |i| Self::decode(i));
+
+impl_codec!(crate::control::Namespace, "Namespace", false,
+    encode: |s, buf| s.encode(buf),
+    size: |s| s.encoded_len(),
+    decode: |i| Self::decode(i));
+
+impl_codec!(crate::control::NamespaceDone, "NamespaceDone", false,
+    encode: |s, buf| s.encode(buf),
+    size: |s| s.encoded_len(),
+    decode: |i| Self::decode(i));
+
 impl_codec!(crate::control::Redirect, "Redirect", false,
     encode: |s, buf| s.encode(buf),
     size: |s| s.encoded_len(),
@@ -412,8 +472,10 @@ pub fn assert_subgroup_stream_contract(bytes: &[u8]) {
 /// On any contract violation.
 pub fn assert_all_decoder_contracts(bytes: &[u8]) {
     use crate::control::{
-        ControlFrame, Goaway, Properties, ReasonPhrase, Redirect, RequestError, RequestOk, Setup,
-        Subscribe, SubscribeOk,
+        ControlFrame, Fetch, FetchOk, Goaway, Namespace, NamespaceDone, Properties, Publish,
+        PublishDone, PublishNamespace, PublishSkipped, ReasonPhrase, Redirect, RequestError,
+        RequestOk, RequestUpdate, Setup, Subscribe, SubscribeNamespace, SubscribeOk,
+        SubscribeTracks, TrackStatus,
     };
     use crate::model::{FullTrackName, Location, ObjectStatus, TrackNamespace};
     use crate::varint::VarInt;
@@ -435,6 +497,18 @@ pub fn assert_all_decoder_contracts(bytes: &[u8]) {
     assert_decoder_contract::<RequestOk>(bytes);
     assert_decoder_contract::<RequestError>(bytes);
     assert_decoder_contract::<Redirect>(bytes);
+    assert_decoder_contract::<TrackStatus>(bytes);
+    assert_decoder_contract::<Publish>(bytes);
+    assert_decoder_contract::<PublishDone>(bytes);
+    assert_decoder_contract::<PublishSkipped>(bytes);
+    assert_decoder_contract::<RequestUpdate>(bytes);
+    assert_decoder_contract::<Fetch>(bytes);
+    assert_decoder_contract::<FetchOk>(bytes);
+    assert_decoder_contract::<PublishNamespace>(bytes);
+    assert_decoder_contract::<SubscribeNamespace>(bytes);
+    assert_decoder_contract::<SubscribeTracks>(bytes);
+    assert_decoder_contract::<Namespace>(bytes);
+    assert_decoder_contract::<NamespaceDone>(bytes);
     assert_decoder_contract::<crate::data::ObjectDatagram>(bytes);
     assert_decoder_contract::<crate::data::SubgroupHeader>(bytes);
     assert_subgroup_stream_contract(bytes);
@@ -595,7 +669,133 @@ pub fn seed_corpus() -> Vec<Vec<u8>> {
         ));
     }
 
+    corpus.extend(request_stream_corpus());
     corpus.extend(data_plane_corpus());
+    corpus
+}
+
+/// Valid encodings of the messages that live on request streams.
+///
+/// Split out of [`seed_corpus`] only to keep that function readable; every
+/// entry here is reachable from it.
+///
+/// # Panics
+/// If any representative value fails to build.
+#[must_use]
+#[allow(clippy::too_many_lines)] // a checklist of message types
+fn request_stream_corpus() -> Vec<Vec<u8>> {
+    use crate::control::params::Parameter;
+    use crate::control::properties::Properties;
+    use crate::control::{
+        Fetch, FetchKind, FetchOk, Namespace, NamespaceDone, Publish, PublishDone,
+        PublishDoneStatus, PublishNamespace, PublishSkipped, ReasonPhrase, RequestId,
+        RequestUpdate, StreamCount, SubscribeNamespace, SubscribeTracks, TrackStatus,
+    };
+    use crate::model::{FullTrackName, GroupId, Location, ObjectId, TrackAlias, TrackNamespace};
+    use crate::varint::VarInt;
+
+    let bytes = |b: &[u8]| bytes::Bytes::copy_from_slice(b);
+    let ns = |parts: &[&[u8]]| TrackNamespace::from_parts(parts.iter().copied()).unwrap();
+    let track = || FullTrackName::new(ns(&[b"moqom", b"room-42"]), bytes(b"video/hd")).unwrap();
+    let loc = |g: u32, o: u32| Location::new(GroupId::from(g), ObjectId::from(o));
+
+    let mut params = Parameters::new();
+    params.push(Parameter::varint(0x10, VarInt::from_u32(1)).unwrap());
+    params.push(Parameter::bytes(0x03, bytes(b"cat-token")).unwrap());
+
+    let mut props = Properties::new();
+    props.push(Parameter::varint(0x08, VarInt::from_u32(90_000)).unwrap());
+
+    let mut corpus = Vec::new();
+    let mut enc = |f: &dyn Fn(&mut Vec<u8>)| {
+        let mut buf = Vec::new();
+        f(&mut buf);
+        corpus.push(buf);
+    };
+
+    let id = RequestId::new(4).unwrap();
+
+    let mut track_status = TrackStatus::new(id, track());
+    track_status.parameters = params.clone();
+    enc(&|b| track_status.encode(b));
+    enc(&|b| TrackStatus::new(RequestId::new(0).unwrap(), track()).encode(b));
+
+    let mut publish = Publish::new(id, track(), TrackAlias::from(9u32));
+    publish.parameters = params.clone();
+    publish.properties = props.clone();
+    enc(&|b| publish.encode(b));
+    enc(&|b| Publish::new(id, track(), TrackAlias::ZERO).encode(b));
+
+    for status in [
+        PublishDoneStatus::TRACK_ENDED,
+        PublishDoneStatus::TOO_FAR_BEHIND,
+        PublishDoneStatus::MALFORMED_TRACK,
+    ] {
+        for count in [
+            StreamCount::Exact(0),
+            StreamCount::Exact(17),
+            StreamCount::Unknown,
+        ] {
+            let mut done = PublishDone::new(status, count);
+            done.reason = ReasonPhrase::truncating("upstream went away");
+            enc(&|b| done.encode(b));
+        }
+    }
+
+    let mut update = RequestUpdate::new(id);
+    update.parameters = params.clone();
+    enc(&|b| update.encode(b));
+    enc(&|b| RequestUpdate::new(id).encode(b));
+
+    for kind in [
+        FetchKind::Standalone {
+            track: track(),
+            start: loc(10, 0),
+            end: loc(20, 0),
+        },
+        FetchKind::RelativeJoining {
+            request_id: id,
+            preceding_groups: VarInt::from_u32(3),
+        },
+        FetchKind::AbsoluteJoining {
+            request_id: id,
+            start_group: VarInt::from_u32(900),
+        },
+    ] {
+        let mut fetch = Fetch::new(id, kind);
+        fetch.parameters = params.clone();
+        enc(&|b| fetch.encode(b));
+    }
+
+    for end_of_track in [false, true] {
+        let mut ok = FetchOk::new(loc(20, 5));
+        ok.end_of_track = end_of_track;
+        ok.parameters = params.clone();
+        ok.properties = props.clone();
+        enc(&|b| ok.encode(b));
+    }
+    enc(&|b| FetchOk::new(Location::ZERO).encode(b));
+
+    for namespace in [ns(&[b"moqom"]), TrackNamespace::empty()] {
+        let mut pn = PublishNamespace::new(id, namespace.clone());
+        pn.parameters = params.clone();
+        enc(&|b| pn.encode(b));
+
+        let mut sn = SubscribeNamespace::new(id, namespace.clone());
+        sn.parameters = params.clone();
+        enc(&|b| sn.encode(b));
+
+        let mut st = SubscribeTracks::new(id, namespace.clone());
+        st.parameters = params.clone();
+        enc(&|b| st.encode(b));
+
+        enc(&|b| Namespace::new(namespace.clone()).encode(b));
+        enc(&|b| NamespaceDone::new(namespace.clone()).encode(b));
+    }
+
+    enc(&|b| PublishSkipped::new(track()).encode(b));
+    enc(&|b| PublishSkipped::default().encode(b));
+
     corpus
 }
 
@@ -940,12 +1140,15 @@ mod tests {
         /// cannot silently rot back into a suite that tests nothing.
         #[test]
         fn mutation_actually_reaches_the_interesting_decoders() {
-            use crate::control::{ControlFrame, RequestError, Subscribe, SubscribeOk};
+            use crate::control::{
+                ControlFrame, Fetch, Publish, RequestError, Subscribe, SubscribeOk,
+            };
             use crate::data::{ObjectDatagram, SubgroupHeader, SubgroupReader};
 
             let corpus = seed_corpus();
             let (mut subscribe, mut subscribe_ok, mut request_error, mut frame) = (0, 0, 0, 0);
             let (mut datagram, mut subgroup_objects) = (0, 0);
+            let (mut publish, mut fetch) = (0, 0);
 
             for seed in 0..20_000u64 {
                 let base = &corpus[(seed as usize) % corpus.len()];
@@ -966,6 +1169,12 @@ mod tests {
                 if ObjectDatagram::decode(&mut input.as_slice()).is_ok() {
                     datagram += 1;
                 }
+                if Publish::decode(&mut input.as_slice()).is_ok() {
+                    publish += 1;
+                }
+                if Fetch::decode(&mut input.as_slice()).is_ok() {
+                    fetch += 1;
+                }
 
                 // Count objects, not headers: a header that parses proves
                 // nothing about the delta state, which is the part that breaks.
@@ -981,9 +1190,12 @@ mod tests {
             let report = format!(
                 "Subscribe={subscribe} SubscribeOk={subscribe_ok} \
                  RequestError={request_error} ControlFrame={frame} \
-                 ObjectDatagram={datagram} SubgroupObjects={subgroup_objects}"
+                 ObjectDatagram={datagram} SubgroupObjects={subgroup_objects} \
+                 Publish={publish} Fetch={fetch}"
             );
             assert!(subscribe >= 100, "too few Subscribe decodes: {report}");
+            assert!(publish >= 100, "too few Publish decodes: {report}");
+            assert!(fetch >= 100, "too few Fetch decodes: {report}");
             assert!(subscribe_ok >= 100, "too few SubscribeOk decodes: {report}");
             assert!(
                 request_error >= 100,

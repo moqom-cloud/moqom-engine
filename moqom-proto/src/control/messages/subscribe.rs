@@ -151,6 +151,81 @@ impl crate::control::frame::MessageBody for SubscribeOk {
     }
 }
 
+/// Ask what state a track is in without subscribing to it, per draft-19 §10.14.
+///
+/// Byte-for-byte the same body as [`Subscribe`], and the receiver handles it
+/// the same way, except that it creates no subscription state and sends no
+/// objects. The answer is a `REQUEST_OK` carrying the Largest Object and Track
+/// Properties the publisher would have put in a `SUBSCRIBE_OK`.
+///
+/// It is a separate type rather than a flag on [`Subscribe`] because it must
+/// not carry delivery parameters such as `SUBSCRIBER_PRIORITY` — there is no
+/// delivery to prioritise — and because the two differ in what may follow:
+/// there is no `PUBLISH_DONE` for a track status, and no `REQUEST_UPDATE`
+/// either. Sharing one type would make those distinctions runtime conditions
+/// instead of the compile-time ones they should be.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackStatus {
+    /// Identifies this request. See [`RequestId`].
+    pub request_id: RequestId,
+    /// The track being asked about.
+    pub track: FullTrackName,
+    /// Request parameters. Delivery parameters do not belong here.
+    pub parameters: Parameters,
+}
+
+impl TrackStatus {
+    /// A query with no parameters.
+    #[must_use]
+    pub fn new(request_id: RequestId, track: FullTrackName) -> Self {
+        Self {
+            request_id,
+            track,
+            parameters: Parameters::new(),
+        }
+    }
+
+    /// Encoded size of the message body.
+    #[must_use]
+    pub fn encoded_len(&self) -> usize {
+        self.request_id.encoded_len()
+            + self.track.encoded_len()
+            + self.parameters.encoded_len_counted()
+    }
+
+    /// Append the message body to `buf`.
+    pub fn encode<B: BufMut>(&self, buf: &mut B) {
+        self.request_id.encode(buf);
+        self.track.encode(buf);
+        self.parameters.encode_counted(buf);
+    }
+
+    /// Read a message body.
+    ///
+    /// # Errors
+    /// [`DecodeError::Short`] if incomplete; [`DecodeError::Invalid`] if any
+    /// field violates its constraints.
+    pub fn decode<B: Buf>(buf: &mut B) -> Result<Self, DecodeError> {
+        Ok(Self {
+            request_id: RequestId::decode(buf)?,
+            track: FullTrackName::decode(buf)?,
+            parameters: Parameters::decode_counted(buf)?,
+        })
+    }
+}
+
+impl crate::control::frame::MessageBody for TrackStatus {
+    const MESSAGE_TYPE: crate::control::MessageType = crate::control::MessageType::TrackStatus;
+
+    fn encoded_len(&self) -> usize {
+        Self::encoded_len(self)
+    }
+
+    fn encode<B: BufMut>(&self, buf: &mut B) {
+        Self::encode(self, buf);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
