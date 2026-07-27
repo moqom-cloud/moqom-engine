@@ -25,8 +25,10 @@ pub mod frame;
 pub mod message_type;
 pub mod params;
 pub mod request_id;
+pub mod setup;
 
 pub use frame::{BodyTooLong, ControlFrame, MAX_BODY_LEN};
 pub use message_type::{MessageType, StreamKind};
 pub use params::{MAX_VALUE_LEN, ParamError, ParamValue, Parameter, Parameters};
 pub use request_id::{RequestId, RequestIdGenerator, Role};
+pub use setup::{Setup, SetupError, SetupOptions, Transport};
