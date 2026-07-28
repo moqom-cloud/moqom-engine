@@ -59,4 +59,4 @@ fi
 echo "vendored $tag ($commit)"
 echo "  quinn $quinn_v, quinn-proto $proto_v, quinn-udp $udp_v"
 echo
-echo "next: cd rs && cargo test --all-features"
+echo "next: cargo test --all-features"

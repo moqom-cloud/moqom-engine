@@ -12,11 +12,13 @@ exclude = ["fuzz"]
 edition = "2024"
 rust-version = "1.97"
 authors = ["MOQOM"]
-repository = "https://github.com/moqom-cloud/moqom"
+repository = "https://github.com/moqom-cloud/moqom-engine"
 # No workspace-level `license`: this workspace spans both licence halves.
-# Apache-2.0 for the protocol, client, and SDK crates; BUSL-1.1 for the relay,
-# control plane, and moqom-cc. Each crate sets its own, and LICENSING.md is the
-# authoritative map. A crate with no `license` field is a bug.
+# Apache-2.0 for the protocol and transport crates, which are what anyone
+# building on MOQT links; BUSL-1.1 for the relay and moqom-cc, which are the
+# product. Each crate sets its own, and LICENSING.md is the authoritative map. A
+# crate with no `license` field is a bug -- there is no safe default when a
+# single workspace spans both.
 publish = false
 
 [workspace.dependencies]
@@ -76,6 +78,6 @@ opt-level = 1
 # byte-identical to the tag it records, and vendor/verify-quinn.sh proves both
 # that and that this patch is actually in effect.
 [patch.crates-io]
-quinn = { path = "../vendor/quinn/quinn" }
-quinn-proto = { path = "../vendor/quinn/quinn-proto" }
-quinn-udp = { path = "../vendor/quinn/quinn-udp" }
+quinn = { path = "vendor/quinn/quinn" }
+quinn-proto = { path = "vendor/quinn/quinn-proto" }
+quinn-udp = { path = "vendor/quinn/quinn-udp" }

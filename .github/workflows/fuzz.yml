@@ -1,0 +1,74 @@
+name: Fuzz
+
+# Deep runs, off the PR critical path. The smoke run in ci.yml catches
+# regressions; this one goes looking for things nobody has found yet.
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: Minutes per target
+        required: false
+        default: "30"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: Fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [decoders, control_frame]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install nightly
+        run: rustup toolchain install nightly --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      # Carry the corpus between runs so each night resumes from the coverage
+      # the last one reached instead of starting cold. Without this a scheduled
+      # fuzzer re-explores the same shallow inputs forever.
+      - name: Restore corpus
+        uses: actions/cache/restore@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+
+      - name: Seed corpus
+        run: cargo run --example seed-corpus --features testing -- fuzz/corpus/${{ matrix.target }}
+
+      - name: Run
+        run: |
+          cargo +nightly fuzz run ${{ matrix.target }} -- \
+            -max_total_time=$(( ${{ github.event.inputs.minutes || 30 }} * 60 ))
+
+      - name: Minimize corpus
+        if: success()
+        run: cargo +nightly fuzz cmin ${{ matrix.target }}
+
+      - name: Save corpus
+        if: success()
+        uses: actions/cache/save@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+
+      # A crash is only half the value. The other half is transcribing the input
+      # into REGRESSION_CORPUS in moqom-proto::testing so it runs on stable
+      # forever, rather than living in an artifact nobody opens again.
+      - name: Upload crashes
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/

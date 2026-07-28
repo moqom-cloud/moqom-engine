@@ -1,0 +1,6 @@
+[toolchain]
+# Pinned rather than "stable" so CI, local builds, and cross-compiled
+# mobile artifacts are byte-comparable. Bump deliberately.
+channel = "1.97.1"
+components = ["rustfmt", "clippy", "rust-src"]
+profile = "default"

@@ -1,0 +1,129 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  rust:
+    name: Rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # No toolchain action: rust-toolchain.toml pins the version, and letting
+      # rustup honour it keeps CI and local builds on exactly one compiler.
+      - name: Show toolchain
+        run: rustc --version && cargo --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: cargo test --all-features
+
+      - name: Docs
+        run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  # A short fuzz run on every change, sized to catch a regression that the
+  # property tests miss without holding up a PR. The deep runs happen on the
+  # schedule in fuzz.yml; this is a smoke test, and it is only meaningful
+  # because the corpus is seeded first.
+  fuzz-smoke:
+    name: Fuzz (smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install nightly
+        run: rustup toolchain install nightly --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Seed corpus
+        run: |
+          cargo run --example seed-corpus --features testing -- fuzz/corpus/decoders
+          cargo run --example seed-corpus --features testing -- fuzz/corpus/control_frame
+
+      - name: Fuzz decoders
+        run: cargo +nightly fuzz run decoders -- -max_total_time=60
+
+      - name: Fuzz control frame stream
+        run: cargo +nightly fuzz run control_frame -- -max_total_time=60
+
+      - name: Upload crashes
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts/
+
+  # Vendoring quinn is only worth anything if it stays unmodified and is
+  # actually the copy that gets linked. Both claims decay silently, so both are
+  # checked rather than trusted.
+  vendor:
+    name: Vendored quinn
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Verify
+        run: ./vendor/verify-quinn.sh
+
+  # The token fixture is minted by the Go control plane in the platform
+  # repository and verified here. Checking it in one direction only would let
+  # the two drift: this job re-mints it over there and fails if the bytes this
+  # repository verifies are no longer the bytes that repository produces.
+  tokens:
+    name: Token fixture
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: moqom-engine
+
+      - uses: actions/checkout@v7
+        with:
+          repository: moqom-cloud/moqom
+          path: moqom
+          token: ${{ secrets.PLATFORM_REPO_TOKEN }}
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: moqom/go/go.mod
+          cache: false
+
+      - name: Re-mint the fixture
+        working-directory: moqom/go
+        env:
+          MOQOM_WRITE_FIXTURES: "1"
+          MOQOM_ENGINE_ROOT: ${{ github.workspace }}/moqom-engine
+        run: go test ./internal/token/
+
+      - name: Fail if it changed
+        working-directory: moqom-engine
+        run: |
+          if ! git diff --quiet -- moqom-relay/tests/testdata/tokens.json; then
+            echo "::error::The control plane now mints different tokens than this fixture records."
+            echo "Regenerate with MOQOM_WRITE_FIXTURES=1 and commit the result."
+            git diff -- moqom-relay/tests/testdata/tokens.json
+            exit 1
+          fi

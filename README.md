@@ -1,0 +1,171 @@
+# MOQOM Engine
+
+The media path of the **Media Over QUIC Orchestration Mesh**: the protocol
+codec, the transport, and the relay. Pure Rust, and everything here sits between
+a publisher and a subscriber.
+
+Targets [`draft-ietf-moq-transport-19`](https://datatracker.ietf.org/doc/draft-ietf-moq-transport/).
+The implementation is our own rather than a fork, because owning the wire format
+is what makes the congestion controller, the object-to-transport mapping, and
+end-to-end encryption our decisions instead of someone else's.
+
+| Crate | License | What |
+| --- | --- | --- |
+| `moqom-proto` | Apache-2.0 | The draft-19 object model, all eighteen control messages, and the data plane |
+| `moqom-transport` | Apache-2.0 | QUIC and WebTransport sessions on one UDP port |
+| `moqom-relay` | BUSL-1.1 | The relay: announcement, subscription, fan-out, retention |
+| `fuzz` | Apache-2.0 | Coverage-guided harnesses for the decoders |
+
+Two licences in one workspace is deliberate and [LICENSING.md](LICENSING.md)
+explains the trade. The short version: the relay depends on the codec by path,
+and while the draft is still moving they change in the same commit.
+
+## Status
+
+Media moves. `moqom-proto` covers the object model, every control message in
+draft-19, and the whole data plane: object datagrams, subgroup streams, and
+fetch streams with the gap markers a partial cache needs. `moqom-transport`
+accepts sessions over both QUIC and WebTransport on one UDP port, and
+`moqom-relay` speaks MOQT over them: setup, namespace announcement and
+withdrawal, prefix watching, subscription, and subgroup fan-out with alias
+rewriting.
+
+History is retained and fetchable, which is what makes a reconnection
+survivable. A client that dropped its connection asks for the range it missed; a
+client joining a live track asks for the group already in progress rather than
+waiting out a keyframe interval of black. Retention is bounded by group count
+and by byte budget, evicting whole groups because half a group is undecodable,
+and can be turned off entirely for operators who must not store media. Caching
+is a tee off the forward path rather than a stage in it — forwarding still never
+parses an object, so end-to-end encryption and retention stay compatible.
+
+The relay can be watched. An admin surface on its own port — off unless
+`MOQOM_RELAY_ADMIN_ADDR` says otherwise — exposes Prometheus metrics for
+sessions, subscriptions, fetches, fan-out and bytes, plus JSON snapshots of live
+sessions and occupied rooms, and separate liveness and readiness so draining
+stops new connections without killing the ones in flight. Round-trip time,
+congestion window and loss are sampled from the QUIC connection itself rather
+than estimated a second time. Metric labels are fixed and low-cardinality;
+anything per-room or per-participant lives in the JSON, because a label whose
+values grow with traffic is how a metrics backend becomes an outage.
+
+**What the relay is not yet:** authorising anything (tokens are parsed and
+ignored), deduplicating upstream subscriptions, or scheduling under congestion.
+The admin surface is also unauthenticated, which is why it binds separately and
+defaults off. `moqom-relay/src/lib.rs` lists the gaps and says which matter; none
+of it is ready to face the internet.
+
+## Development
+
+Requires the toolchain pinned in `rust-toolchain.toml`, which rustup installs
+automatically.
+
+```sh
+cargo test --all-features
+cargo clippy --all-targets --all-features -- -D warnings
+cargo fmt --all --check
+```
+
+`quinn` is vendored under `vendor/` and patched in at the workspace root, so a
+build here links our copy rather than the registry's. Both halves of that claim
+decay silently, so both are checked rather than trusted:
+
+```sh
+./vendor/verify-quinn.sh    # unmodified, and actually the copy being linked
+```
+
+## Testing the codec
+
+A wire codec fails in a small number of ways, and they recur for every message
+type. `encoded_len` disagreeing with `encode` corrupts the enclosing frame's
+length field rather than failing locally. A peer-supplied count drives an
+allocation before anything bounds it. A decoder reads past its own region and
+desynchronises everything after it. A field is silently dropped on decode, which
+a round-trip test can never see because it only ever replays values the encoder
+produced.
+
+Eighteen control messages and two data-plane mappings share the same handful of
+failure modes, so the contract is stated once, in `moqom-proto/src/testing.rs`,
+and enforced uniformly. Adding a wire type means implementing `Codec` and adding
+one line to `assert_all_decoder_contracts`; it then inherits every check, and an
+omission is visible in one place instead of being a hazard you had to remember.
+
+One measurement shaped the design. Against 20,000 uniformly random inputs, the
+`SUBSCRIBE` decoder succeeded **zero** times and the frame decoder once — so the
+idempotence check, the only one that can catch a dropped field, was never
+running. Random bytes are close to worthless against a structured format. The
+suite instead mutates valid encodings from `seed_corpus()`, which lifts those
+counts into the thousands, and
+`mutation_actually_reaches_the_interesting_decoders` asserts a floor so it
+cannot quietly regress to testing nothing.
+
+Fuzzing runs the same assertions with coverage guidance:
+
+```sh
+cargo run --example seed-corpus --features testing -- fuzz/corpus/decoders
+cargo +nightly fuzz run decoders
+```
+
+Seeding is not optional, for the same reason. CI runs a 60-second smoke pass per
+target on every change and deeper scheduled runs in `fuzz.yml`. Crashes get
+transcribed into `REGRESSION_CORPUS`, so they run on stable forever rather than
+living in an artifact nobody opens again.
+
+**What none of this catches: misreading the draft.** A rule misread the same way
+in both the encoder and the decoder is self-consistent, and every check here
+passes. Only differential testing against an independent implementation closes
+that gap. The first of it exists:
+[`MoqomKit`](https://github.com/moqom-cloud/moqom-swift)'s codec was written
+separately from this one, and its interop suite runs a Swift publisher and a
+Swift subscriber through `moqom-relay` over a real socket. Two implementations
+that agree is a weaker claim than two written from the draft by different
+people, so interop against `moq-rs` and `moxygen` remains a milestone rather
+than a nice-to-have.
+
+## Cross-repository seams
+
+Two things here are checked against code that lives elsewhere.
+
+**Token verification.** `moqom-relay/tests/testdata/tokens.json` is minted by
+the Go control plane and verified here. It is committed rather than generated on
+demand so that `cargo test` needs no Go toolchain — which is the whole point,
+since it means the check runs on every build instead of only where a harness is
+set up. Regenerate it from the platform repository with `MOQOM_WRITE_FIXTURES=1
+go test ./internal/token/`.
+
+**The protocol.** `MoqomKit` carries a second implementation of the same draft,
+and its interop tests run against a relay built from this repository. A change
+to the wire format here that is not mirrored there will fail over there, not
+here.
+
+## Design notes
+
+Two documents are worth reading before changing protocol code:
+
+- `moqom-proto/src/coding.rs` — the streaming-decode contract. Only
+  `VarInt::decode` leaves the buffer intact on a short read; assuming that of
+  other decoders will corrupt a session.
+- `moqom-proto/src/error.rs` — why "incomplete" and "malformed" are different
+  types. One means wait, the other means close the connection.
+
+## The rest of MOQOM
+
+| Repository | License | What |
+| --- | --- | --- |
+| [`moqom`](https://github.com/moqom-cloud/moqom) | Mixed | The platform: control plane, the gRPC contract, deployment, and the plan |
+| [`moqom-swift`](https://github.com/moqom-cloud/moqom-swift) | Apache-2.0 | `MoqomKit`, the Apple-platform client SDK |
+| [`moqom-go`](https://github.com/moqom-cloud/moqom-go) | Apache-2.0 | Server-side SDK for backends |
+| [`moqom-rust`](https://github.com/moqom-cloud/moqom-rust) | Apache-2.0 | Server-side SDK for backends |
+
+The backend SDKs are deliberately not here. Neither speaks MOQT: administering a
+room and carrying media are different jobs, and making every backend link a QUIC
+stack to change somebody's grants would be a poor trade. Since the
+`[patch.crates-io]` at this workspace root applies to everything inside it,
+"not in this workspace" is what enforces that rather than good intentions.
+
+## Contributing
+
+Contributions require signing the [CLA](https://github.com/moqom-cloud/moqom/blob/main/.github/CLA.md).
+MOQOM is dual-licensed and the CLA permits relicensing — Section 4 spells out
+exactly what that means, because it is the term most worth reading before you
+agree to it.

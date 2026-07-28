@@ -52,7 +52,7 @@ fi
 # warning nobody reads while quietly linking the registry crate instead.
 echo
 echo "checking that the build actually uses it"
-metadata="$(cd "$here/../rs" && cargo metadata --format-version 1 --quiet)"
+metadata="$(cd "$here/.." && cargo metadata --format-version 1 --quiet)"
 for crate in quinn quinn-proto quinn-udp; do
   path="$(printf '%s' "$metadata" | python3 -c "
 import json, sys
@@ -69,7 +69,7 @@ for pkg in json.load(sys.stdin)['packages']:
     echo "  $crate: vendored"
   else
     echo "  $crate: resolved to $path, NOT the vendored copy" >&2
-    echo "The [patch.crates-io] entry in rs/Cargo.toml is not taking effect." >&2
+    echo "The [patch.crates-io] entry in Cargo.toml is not taking effect." >&2
     exit 1
   fi
 done
