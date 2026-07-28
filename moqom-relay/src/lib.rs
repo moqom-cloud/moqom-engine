@@ -59,6 +59,7 @@
 
 pub mod admin;
 pub mod cache;
+pub mod clock;
 pub mod fabric;
 pub mod identity;
 pub mod metrics;

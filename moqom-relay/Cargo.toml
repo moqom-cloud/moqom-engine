@@ -36,6 +36,12 @@ rcgen = { workspace = true }
 rustls-pemfile = { workspace = true }
 tracing-subscriber = { workspace = true }
 
+# Reading the kernel's clock discipline through adjtimex, which std does not
+# expose. Linux only: nothing else is a deployment target, and off Linux the
+# relay reports that it cannot tell rather than guessing.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
+
 [lints]
 workspace = true
 

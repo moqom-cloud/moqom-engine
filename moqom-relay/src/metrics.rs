@@ -906,6 +906,43 @@ impl Metrics {
             inner.congestion_events.load(ORDER),
         );
 
+        // Clock health. Worth alarming on `clock_synchronised == 0` directly:
+        // a relay with a bad clock has no symptom on the media path and no
+        // symptom in any other metric here, and the damage is only discovered
+        // when someone tries to assemble a timeline out of what it recorded.
+        plain(
+            &mut out,
+            "gauge",
+            "moqom_relay_clock_synchronised",
+            "1 when a time daemon is disciplining the host clock, 0 otherwise.",
+            u64::from(gauges.clock_synchronised),
+        );
+        plain(
+            &mut out,
+            "gauge",
+            "moqom_relay_clock_max_error_nanoseconds",
+            "The kernel's own bound on how wrong the host clock might be.",
+            u64::try_from(gauges.clock_error.as_nanos()).unwrap_or(u64::MAX),
+        );
+        plain(
+            &mut out,
+            "gauge",
+            "moqom_relay_clock_leap_pending",
+            "1 when a leap second lands at the end of the current UTC day.",
+            u64::from(gauges.clock_leap_pending),
+        );
+        // The consequence of the gauge above, counted. `clock_synchronised`
+        // says the host is unwell; this says how much evidence was produced
+        // while it was, which is what determines whether a recording can still
+        // be assembled afterwards.
+        plain(
+            &mut out,
+            "counter",
+            "moqom_relay_clock_fallback_stamps_total",
+            "Timecodes stamped from local time because the host clock was not trusted.",
+            gauges.clock_fallbacks,
+        );
+
         counter(
             &mut out,
             "moqom_relay_cache_lookups_total",
@@ -990,6 +1027,28 @@ pub struct Gauges {
     pub cache_hits: u64,
     /// Fetch lookups that did not.
     pub cache_misses: u64,
+
+    /// Whether the host clock is currently disciplined by a time daemon.
+    ///
+    /// The one gauge here worth paging on. A relay whose clock is adrift keeps
+    /// serving media perfectly — nothing on the media path depends on the wall
+    /// clock — while every record it writes becomes unorderable against the
+    /// rest of the fleet. There is no user-visible symptom until somebody tries
+    /// to assemble a timeline weeks later, so it has to be watched directly.
+    pub clock_synchronised: bool,
+
+    /// The kernel's own bound on how wrong the host clock might be.
+    pub clock_error: Duration,
+
+    /// Whether a leap second lands at the end of the current UTC day.
+    pub clock_leap_pending: bool,
+
+    /// How many timecodes have been stamped from local time.
+    ///
+    /// Monotonic, so a rate over it shows when the relay was producing records
+    /// that cannot be placed against another machine's — which is the part an
+    /// operator has to act on, rather than the instantaneous health above.
+    pub clock_fallbacks: u64,
 }
 
 /// An array of counters, all starting at zero.
@@ -1204,12 +1263,44 @@ mod tests {
             cache_bytes: 1_048_576,
             cache_hits: 40,
             cache_misses: 2,
+            clock_synchronised: true,
+            clock_error: Duration::from_micros(2_500),
+            clock_leap_pending: false,
+            clock_fallbacks: 0,
         });
         assert!(exposed.contains("moqom_relay_namespaces 5"));
         assert!(exposed.contains("moqom_relay_rooms 2"));
         assert!(exposed.contains("moqom_relay_participants 4"));
         assert!(exposed.contains("moqom_relay_cache_bytes 1048576"));
         assert!(exposed.contains(r#"moqom_relay_cache_lookups_total{outcome="hit"} 40"#));
+        assert!(exposed.contains("moqom_relay_clock_synchronised 1"));
+        assert!(exposed.contains("moqom_relay_clock_max_error_nanoseconds 2500000"));
+    }
+
+    /// A relay with a bad clock keeps serving media perfectly and shows nothing
+    /// unusual in any other metric, so this gauge is the only warning an
+    /// operator gets before a month of unorderable records.
+    #[test]
+    fn an_undisciplined_clock_is_visible_in_the_scrape() {
+        let metrics = Metrics::new();
+        let exposed = metrics.expose(&Gauges::default());
+
+        assert!(exposed.contains("moqom_relay_clock_synchronised 0"));
+    }
+
+    /// The gauge above says the host is unwell now; this says how much evidence
+    /// was written while it was, which is what decides whether a recording can
+    /// still be assembled afterwards.
+    #[test]
+    fn fallback_stamps_are_countable_in_the_scrape() {
+        let metrics = Metrics::new();
+        let exposed = metrics.expose(&Gauges {
+            clock_fallbacks: 1_312,
+            ..Gauges::default()
+        });
+
+        assert!(exposed.contains("moqom_relay_clock_fallback_stamps_total 1312"));
+        assert!(exposed.contains("# TYPE moqom_relay_clock_fallback_stamps_total counter"));
     }
 
     /// Every metric needs HELP and TYPE before its samples, and a name must not

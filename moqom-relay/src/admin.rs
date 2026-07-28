@@ -192,6 +192,12 @@ impl Surface {
         let cache = self.fabric.cache().stats();
         let (hits, misses) = self.fabric.cache().hit_rate();
 
+        // `None` means the kernel could not be asked at all, which is off
+        // Linux. Reported the same way as an undisciplined clock, because for
+        // anything downstream it means the same thing: do not trust the
+        // timestamps this relay writes.
+        let clock = self.fabric.clock().health().unwrap_or_default();
+
         Gauges {
             namespaces: announcements.len(),
             rooms: occupancy.rooms.len(),
@@ -202,6 +208,10 @@ impl Surface {
             cache_bytes: cache.bytes,
             cache_hits: hits,
             cache_misses: misses,
+            clock_synchronised: clock.synchronised,
+            clock_error: clock.max_error,
+            clock_leap_pending: clock.leap_pending,
+            clock_fallbacks: self.fabric.clock().fallbacks(),
         }
     }
 

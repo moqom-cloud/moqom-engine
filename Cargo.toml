@@ -37,6 +37,10 @@ rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# Linux only, and only for `adjtimex`. The relay needs the kernel's own bound on
+# how wrong its clock might be, and there is no way to that number in std.
+libc = "0.2"
+
 # Dev
 proptest = "1"
 

@@ -713,6 +713,7 @@ dependencies = [
  "aws-lc-rs",
  "base64",
  "bytes",
+ "libc",
  "moqom-proto",
  "moqom-transport",
  "quinn",

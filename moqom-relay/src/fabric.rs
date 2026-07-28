@@ -38,6 +38,7 @@ use moqom_proto::model::{FullTrackName, TrackAlias, TrackNamespace};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::cache::Cache;
+use crate::clock;
 use crate::identity::Authenticator;
 use crate::metrics::Metrics;
 use crate::quota::Governor;
@@ -209,6 +210,12 @@ pub struct Fabric {
     /// How a session's credential is checked, which is what makes the governor
     /// able to charge anybody in particular.
     authenticator: Authenticator,
+    /// The host clock, and the kernel's opinion of how good it is.
+    ///
+    /// Shared so that every record this relay writes carries the same error
+    /// bound, and so the health behind it is read once per second rather than
+    /// once per session.
+    clock: Arc<clock::Host>,
 }
 
 /// Defaults that limit nothing and verify nothing.
@@ -227,6 +234,7 @@ impl Default for Fabric {
             metrics: Metrics::default(),
             governor: Governor::disabled(),
             authenticator: Authenticator::disabled(),
+            clock: Arc::default(),
         }
     }
 }
@@ -287,6 +295,12 @@ impl Fabric {
     #[must_use]
     pub const fn metrics(&self) -> &Metrics {
         &self.metrics
+    }
+
+    /// The host clock, with the kernel's bound on how wrong it might be.
+    #[must_use]
+    pub fn clock(&self) -> &clock::Host {
+        &self.clock
     }
 
     /// What limits sessions are held to.
