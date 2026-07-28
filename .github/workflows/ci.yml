@@ -92,6 +92,9 @@ jobs:
   # repository and verified here. Checking it in one direction only would let
   # the two drift: this job re-mints it over there and fails if the bytes this
   # repository verifies are no longer the bytes that repository produces.
+  #
+  # MOQOM_REPO_TOKEN is an organisation secret with read access to moqom-cloud.
+  # GITHUB_TOKEN cannot stand in for it, being scoped to this repository alone.
   tokens:
     name: Token fixture
     runs-on: ubuntu-latest
@@ -104,7 +107,7 @@ jobs:
         with:
           repository: moqom-cloud/moqom
           path: moqom
-          token: ${{ secrets.PLATFORM_REPO_TOKEN }}
+          token: ${{ secrets.MOQOM_REPO_TOKEN }}
 
       - uses: actions/setup-go@v7
         with:
