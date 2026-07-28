@@ -559,15 +559,27 @@ mod tests {
     fn metrics_are_served_in_the_exposition_content_type() {
         let (surface, _fabric) = surface();
         let response = surface.respond("/metrics");
-        assert_eq!(response.content_type, "text/plain; version=0.0.4; charset=utf-8");
+        assert_eq!(
+            response.content_type,
+            "text/plain; version=0.0.4; charset=utf-8"
+        );
     }
 
     #[test]
     fn rooms_are_derived_from_announcements() {
         let (surface, fabric) = surface();
-        announce(&fabric, &namespace(&["acme", "r", "room-1", "ada", "phone"]));
-        announce(&fabric, &namespace(&["acme", "r", "room-1", "grace", "mac"]));
-        announce(&fabric, &namespace(&["acme", "r", "room-2", "ada", "phone"]));
+        announce(
+            &fabric,
+            &namespace(&["acme", "r", "room-1", "ada", "phone"]),
+        );
+        announce(
+            &fabric,
+            &namespace(&["acme", "r", "room-1", "grace", "mac"]),
+        );
+        announce(
+            &fabric,
+            &namespace(&["acme", "r", "room-2", "ada", "phone"]),
+        );
 
         let body = surface.respond("/rooms").body;
         assert!(body.contains(r#""room":"room-1""#), "{body}");
@@ -588,7 +600,10 @@ mod tests {
     fn backstage_does_not_create_a_second_room() {
         let (surface, fabric) = surface();
         announce(&fabric, &namespace(&["acme", "r", "show", "ada", "phone"]));
-        announce(&fabric, &namespace(&["acme", "bs", "show", "guest", "phone"]));
+        announce(
+            &fabric,
+            &namespace(&["acme", "bs", "show", "guest", "phone"]),
+        );
 
         let metrics = surface.respond("/metrics").body;
         assert!(metrics.contains("moqom_relay_rooms 1"), "{metrics}");
@@ -727,7 +742,10 @@ mod tests {
             .expect("read");
 
         assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
-        assert!(response.contains("moqom_relay_uptime_seconds"), "{response}");
+        assert!(
+            response.contains("moqom_relay_uptime_seconds"),
+            "{response}"
+        );
     }
 
     /// A client that opens a connection and sends nothing must not hold a task

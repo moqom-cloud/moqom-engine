@@ -126,25 +126,15 @@ impl<'a> Scope<'a> {
             (_, []) => (None, None),
 
             // `(tenant, "u", username, device)`.
-            (false, [username, device]) => (
-                None,
-                Some(Participant {
-                    username,
-                    device,
-                }),
-            ),
+            (false, [username, device]) => (None, Some(Participant { username, device })),
 
             // `(tenant, "r"|"bs", room)`.
             (true, [room]) => (Some(&room[..]), None),
 
             // `(tenant, "r"|"bs", room, username, device)`.
-            (true, [room, username, device]) => (
-                Some(&room[..]),
-                Some(Participant {
-                    username,
-                    device,
-                }),
-            ),
+            (true, [room, username, device]) => {
+                (Some(&room[..]), Some(Participant { username, device }))
+            }
 
             // Everything else: a personal channel missing its device, a room
             // slot missing one, or anything deeper than a slot. Guessing here
@@ -211,10 +201,7 @@ mod tests {
         assert_eq!(scope.kind, Kind::Personal);
         assert_eq!(scope.room, None);
         assert_eq!(scope.room_key(), None);
-        assert_eq!(
-            scope.participant.map(|p| p.username),
-            Some(&b"ada"[..])
-        );
+        assert_eq!(scope.participant.map(|p| p.username), Some(&b"ada"[..]));
     }
 
     /// Backstage is a different namespace family so that a viewer's prefix
@@ -274,14 +261,9 @@ mod tests {
     /// has to handle that itself.
     #[test]
     fn a_non_utf8_room_still_parses() {
-        let namespace = TrackNamespace::from_parts([
-            b"acme".as_slice(),
-            b"r",
-            &[0xff, 0xfe],
-            b"ada",
-            b"phone",
-        ])
-        .expect("bytes are legal namespace fields");
+        let namespace =
+            TrackNamespace::from_parts([b"acme".as_slice(), b"r", &[0xff, 0xfe], b"ada", b"phone"])
+                .expect("bytes are legal namespace fields");
         let scope = Scope::of(&namespace).expect("a known shape");
         assert_eq!(scope.room, Some(&[0xff, 0xfe][..]));
     }

@@ -74,9 +74,22 @@ async fn a_connected_session_is_counted_and_described() {
         value(s, "moqom_relay_sessions") == 1
     })
     .await;
-    assert_eq!(series(&scrape, "moqom_relay_sessions_accepted_total", "carrier", "quic"), 1);
     assert_eq!(
-        series(&scrape, "moqom_relay_sessions_accepted_total", "carrier", "webtransport"),
+        series(
+            &scrape,
+            "moqom_relay_sessions_accepted_total",
+            "carrier",
+            "quic"
+        ),
+        1
+    );
+    assert_eq!(
+        series(
+            &scrape,
+            "moqom_relay_sessions_accepted_total",
+            "carrier",
+            "webtransport"
+        ),
         0
     );
 
@@ -112,15 +125,33 @@ async fn a_disconnected_session_leaves_the_live_set() {
     // Which reason it ended with depends on whether the client's close capsule
     // arrived before its connection went away, and both are honest answers. That
     // it was classified at all is the property worth asserting.
-    let clean = series(&scrape, "moqom_relay_sessions_ended_total", "reason", "clean");
-    let transport = series(&scrape, "moqom_relay_sessions_ended_total", "reason", "transport");
+    let clean = series(
+        &scrape,
+        "moqom_relay_sessions_ended_total",
+        "reason",
+        "clean",
+    );
+    let transport = series(
+        &scrape,
+        "moqom_relay_sessions_ended_total",
+        "reason",
+        "transport",
+    );
     assert_eq!(clean + transport, 1, "exactly one session ended: {scrape}");
     assert_eq!(
-        series(&scrape, "moqom_relay_sessions_ended_total", "reason", "protocol"),
+        series(
+            &scrape,
+            "moqom_relay_sessions_ended_total",
+            "reason",
+            "protocol"
+        ),
         0,
         "a client that simply disconnects has not violated anything"
     );
-    assert_eq!(value(&scrape, "moqom_relay_session_duration_seconds_count"), 1);
+    assert_eq!(
+        value(&scrape, "moqom_relay_session_duration_seconds_count"),
+        1
+    );
 
     let sessions = relay.surface.respond("/sessions").body;
     assert!(sessions.contains(r#""count":0"#), "{sessions}");
@@ -152,7 +183,9 @@ async fn egress_exceeds_ingress_by_the_fan_out_ratio() {
     let _one = one.expect("subscribed");
     let _two = two.expect("subscribed");
 
-    publisher.publish_subgroup(upstream, &[b"shared payload"]).await;
+    publisher
+        .publish_subgroup(upstream, &[b"shared payload"])
+        .await;
     first.read_subgroup().await;
     second.read_subgroup().await;
 
@@ -170,15 +203,30 @@ async fn egress_exceeds_ingress_by_the_fan_out_ratio() {
         "one subgroup to two subscribers is twice the bytes out"
     );
     assert_eq!(
-        series(&scrape, "moqom_relay_subgroups_total", "disposition", "forwarded"),
+        series(
+            &scrape,
+            "moqom_relay_subgroups_total",
+            "disposition",
+            "forwarded"
+        ),
         1
     );
     assert_eq!(
-        series(&scrape, "moqom_relay_subgroups_total", "disposition", "dropped"),
+        series(
+            &scrape,
+            "moqom_relay_subgroups_total",
+            "disposition",
+            "dropped"
+        ),
         0
     );
     assert_eq!(
-        series(&scrape, "moqom_relay_subscriptions_total", "outcome", "established"),
+        series(
+            &scrape,
+            "moqom_relay_subscriptions_total",
+            "outcome",
+            "established"
+        ),
         2
     );
 }
@@ -203,7 +251,12 @@ async fn a_subgroup_with_no_subscribers_is_counted_as_dropped() {
     })
     .await;
     assert_eq!(
-        series(&scrape, "moqom_relay_subgroups_total", "disposition", "forwarded"),
+        series(
+            &scrape,
+            "moqom_relay_subgroups_total",
+            "disposition",
+            "forwarded"
+        ),
         0
     );
     assert_eq!(value(&scrape, "moqom_relay_egress_bytes_total"), 0);
@@ -217,19 +270,36 @@ async fn a_subscription_with_no_publisher_is_counted_apart_from_a_refusal() {
     let relay = Relay::start();
     let mut subscriber = Client::connect(&relay).await;
 
-    let result = subscriber.subscribe(&track(&["acme", "nothing"], "video")).await;
+    let result = subscriber
+        .subscribe(&track(&["acme", "nothing"], "video"))
+        .await;
     assert!(result.is_err(), "there is no publisher");
 
     let scrape = eventually("the refusal to be counted", &relay, |s| {
-        series(s, "moqom_relay_subscriptions_total", "outcome", "no_publisher") == 1
+        series(
+            s,
+            "moqom_relay_subscriptions_total",
+            "outcome",
+            "no_publisher",
+        ) == 1
     })
     .await;
     assert_eq!(
-        series(&scrape, "moqom_relay_subscriptions_total", "outcome", "established"),
+        series(
+            &scrape,
+            "moqom_relay_subscriptions_total",
+            "outcome",
+            "established"
+        ),
         0
     );
     assert_eq!(
-        series(&scrape, "moqom_relay_subscriptions_total", "outcome", "refused"),
+        series(
+            &scrape,
+            "moqom_relay_subscriptions_total",
+            "outcome",
+            "refused"
+        ),
         0
     );
 }
@@ -296,7 +366,10 @@ async fn rooms_and_participants_are_derived_from_what_is_announced() {
     assert!(rooms.contains(r#""room":"room-42""#), "{rooms}");
     assert!(rooms.contains(r#""username":"ada""#), "{rooms}");
     assert!(rooms.contains(r#""stage":"backstage""#), "{rooms}");
-    assert!(rooms.contains(r#""count":3"#), "three participants: {rooms}");
+    assert!(
+        rooms.contains(r#""count":3"#),
+        "three participants: {rooms}"
+    );
 }
 
 /// A withdrawn announcement has to empty the room, or occupancy only ever grows.
@@ -354,7 +427,10 @@ async fn connection_quality_is_sampled_from_the_live_transport() {
         !sessions.contains(r#""rtt_ms":0.0"#),
         "a loopback RTT is small but not zero: {sessions}"
     );
-    assert!(!sessions.contains(r#""mtu":0"#), "the path has an MTU: {sessions}");
+    assert!(
+        !sessions.contains(r#""mtu":0"#),
+        "the path has an MTU: {sessions}"
+    );
     assert!(
         !sessions.contains(r#""cwnd_bytes":0"#),
         "a live connection has a congestion window: {sessions}"
