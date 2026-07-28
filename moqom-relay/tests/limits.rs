@@ -49,7 +49,7 @@ fn only(resource: &str, quota: Quota) -> Quotas {
 #[tokio::test]
 async fn a_subscription_over_the_limit_is_refused_with_a_retry_after() {
     // Two subscriptions at once, and nothing refills within the test.
-    let relay = Relay::governed(only("subscription", Quota::new(0.01, 2.0, 8)));
+    let relay = Relay::governed(&only("subscription", Quota::new(0.01, 2.0, 8)));
     let mut publisher = Client::connect(&relay).await;
     let mut subscriber = Client::connect(&relay).await;
 
@@ -93,7 +93,7 @@ async fn a_subscription_over_the_limit_is_refused_with_a_retry_after() {
 
 #[tokio::test]
 async fn a_refusal_leaves_the_rest_of_the_connection_working() {
-    let relay = Relay::governed(only("fetch", Quota::new(0.01, 1.0, 4)));
+    let relay = Relay::governed(&only("fetch", Quota::new(0.01, 1.0, 4)));
     let mut publisher = Client::connect(&relay).await;
     let mut subscriber = Client::connect(&relay).await;
 
@@ -136,7 +136,7 @@ async fn a_refusal_leaves_the_rest_of_the_connection_working() {
 
 #[tokio::test]
 async fn an_announcement_over_the_limit_does_not_reach_the_fabric() {
-    let relay = Relay::governed(only("announcement", Quota::new(0.01, 1.0, 1)));
+    let relay = Relay::governed(&only("announcement", Quota::new(0.01, 1.0, 1)));
     let mut publisher = Client::connect(&relay).await;
 
     let first = namespace(&["acme", "room-1"]);
@@ -162,7 +162,7 @@ async fn an_announcement_over_the_limit_does_not_reach_the_fabric() {
 
 #[tokio::test]
 async fn a_released_slot_can_be_taken_again() {
-    let relay = Relay::governed(only("announcement", Quota::new(1_000.0, 1_000.0, 1)));
+    let relay = Relay::governed(&only("announcement", Quota::new(1_000.0, 1_000.0, 1)));
     let mut publisher = Client::connect(&relay).await;
 
     let first = publisher.announce(&namespace(&["acme", "room-1"])).await;
@@ -196,7 +196,7 @@ async fn a_released_slot_can_be_taken_again() {
 #[tokio::test]
 async fn a_session_over_the_limit_is_closed_with_a_reason_it_can_act_on() {
     // One session at a time from this address.
-    let relay = Relay::governed(only("session", Quota::new(1_000.0, 1_000.0, 1)));
+    let relay = Relay::governed(&only("session", Quota::new(1_000.0, 1_000.0, 1)));
     let _first = Client::connect(&relay).await;
 
     // Refused before SETUP is answered rather than after. The identity comes out
@@ -222,7 +222,7 @@ async fn a_session_over_the_limit_is_closed_with_a_reason_it_can_act_on() {
 
 #[tokio::test]
 async fn refusals_are_counted_by_resource_and_tier_and_not_by_identity() {
-    let relay = Relay::governed(only("fetch", Quota::new(0.01, 1.0, 4)));
+    let relay = Relay::governed(&only("fetch", Quota::new(0.01, 1.0, 4)));
     let mut subscriber = Client::connect(&relay).await;
 
     let range = FetchKind::Standalone {

@@ -232,11 +232,13 @@ fn cache_limits() -> Result<Limits, Box<dyn std::error::Error>> {
         None => defaults.groups_per_track,
     };
     let total = match env("MOQOM_RELAY_CACHE_MB") {
-        Some(value) => value
-            .parse::<usize>()
-            .map_err(|e| format!("MOQOM_RELAY_CACHE_MB is not a count: {e}"))?
-            * 1024
-            * 1024,
+        Some(value) => {
+            value
+                .parse::<usize>()
+                .map_err(|e| format!("MOQOM_RELAY_CACHE_MB is not a count: {e}"))?
+                * 1024
+                * 1024
+        }
         None => defaults.bytes_total,
     };
 

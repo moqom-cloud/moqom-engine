@@ -442,8 +442,7 @@ impl Metrics {
     /// How long this process has been up.
     #[must_use]
     pub fn uptime(&self) -> Duration {
-        self.inner()
-            .map_or(Duration::ZERO, |i| i.started.elapsed())
+        self.inner().map_or(Duration::ZERO, |i| i.started.elapsed())
     }
 
     /// A handshake failed before a session existed.
@@ -516,8 +515,10 @@ impl Metrics {
             ORDER,
         );
 
-        live.rtt_micros
-            .store(current.rtt.as_micros().try_into().unwrap_or(u64::MAX), ORDER);
+        live.rtt_micros.store(
+            current.rtt.as_micros().try_into().unwrap_or(u64::MAX),
+            ORDER,
+        );
         live.cwnd.store(current.cwnd, ORDER);
         live.lost_packets.store(current.lost_packets, ORDER);
         live.mtu.store(u64::from(current.mtu), ORDER);
@@ -687,8 +688,13 @@ impl Metrics {
             &mut out,
             "moqom_relay_sessions_ended_total",
             "Sessions that finished, by how.",
-            &Ending::ALL
-                .map(|e| ("reason", e.label(), inner.sessions_ended[e.index()].load(ORDER))),
+            &Ending::ALL.map(|e| {
+                (
+                    "reason",
+                    e.label(),
+                    inner.sessions_ended[e.index()].load(ORDER),
+                )
+            }),
         );
         histogram(
             &mut out,
@@ -749,8 +755,7 @@ impl Metrics {
             &mut out,
             "moqom_relay_fetches_total",
             "FETCH requests answered, by outcome.",
-            &Fetched::ALL
-                .map(|f| ("outcome", f.label(), inner.fetches[f.index()].load(ORDER))),
+            &Fetched::ALL.map(|f| ("outcome", f.label(), inner.fetches[f.index()].load(ORDER))),
         );
         plain(
             &mut out,
@@ -764,8 +769,7 @@ impl Metrics {
             &mut out,
             "moqom_relay_requests_admitted_total",
             "Requests the rate limiter allowed, by resource.",
-            &Resource::ALL
-                .map(|r| ("resource", r.name(), inner.admitted[r.index()].load(ORDER))),
+            &Resource::ALL.map(|r| ("resource", r.name(), inner.admitted[r.index()].load(ORDER))),
         );
         // Two labels, because "we are refusing things" and "we are refusing them
         // because one person has too many devices" call for different responses,
@@ -1023,7 +1027,10 @@ fn labelled(
     let _ = writeln!(out, "# HELP {name} {help}");
     let _ = writeln!(out, "# TYPE {name} counter");
     for (one, two, count) in series {
-        let _ = writeln!(out, "{name}{{{first}=\"{one}\",{second}=\"{two}\"}} {count}");
+        let _ = writeln!(
+            out,
+            "{name}{{{first}=\"{one}\",{second}=\"{two}\"}} {count}"
+        );
     }
 }
 
@@ -1087,7 +1094,11 @@ mod tests {
 
         metrics.session_ended(id, Ending::Clean);
         assert_eq!(metrics.session_count(), 0);
-        assert!(metrics.expose(&Gauges::default()).contains("moqom_relay_sessions 0"));
+        assert!(
+            metrics
+                .expose(&Gauges::default())
+                .contains("moqom_relay_sessions 0")
+        );
     }
 
     /// The delta arithmetic is the part that would be wrong silently: absolute

@@ -51,7 +51,10 @@ fn tokens_minted_by_the_control_plane_verify_here() {
     let authenticator = Authenticator::new(&fixture.issuer, keys);
     let now = UNIX_EPOCH + Duration::from_secs(fixture.now);
 
-    assert!(!fixture.cases.is_empty(), "a fixture with no cases proves nothing");
+    assert!(
+        !fixture.cases.is_empty(),
+        "a fixture with no cases proves nothing"
+    );
     for case in &fixture.cases {
         let who = authenticator
             .identify([case.token.as_bytes()], peer(), now)

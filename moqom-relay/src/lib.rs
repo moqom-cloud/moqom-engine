@@ -43,8 +43,13 @@
 //!   publisher, which is the wrong direction — one slow viewer should be dropped
 //!   down a layer, not allowed to slow the broadcast. `moqom-cc` is where that
 //!   is fixed.
-//! - There is no authorisation. Tokens in Setup Options are parsed and ignored,
-//!   so anyone who can reach the port can publish under any namespace.
+//! - Sessions are *authenticated* but not *authorised*. [`identity`] checks the
+//!   signature on the token in Setup Options, so the relay knows which user on
+//!   which device it is talking to; [`quota`] uses that to charge rate and
+//!   concurrency limits to a person rather than to a connection. What no part of
+//!   this does yet is check that the holder may publish under the namespace it
+//!   announces, belongs to the room it names, or has not been banned. Anyone
+//!   with any valid token can still publish under any namespace.
 //! - Datagrams are not forwarded. Only subgroup streams are.
 //!
 //! Anything on that list is a thing to build, not a thing to be surprised by.

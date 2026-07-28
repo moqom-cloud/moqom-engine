@@ -82,8 +82,8 @@ impl Relay {
     /// harness so much as the thing worth testing: it is exactly the shape of a
     /// deployment behind a load balancer that does not preserve the client
     /// address.
-    pub fn governed(quotas: Quotas) -> Self {
-        Self::build(Limits::default(), Governor::new(quotas))
+    pub fn governed(quotas: &Quotas) -> Self {
+        Self::build(Limits::default(), Governor::new(*quotas))
     }
 
     /// Start a relay retaining history according to `limits`.

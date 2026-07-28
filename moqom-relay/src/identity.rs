@@ -514,10 +514,7 @@ mod tests {
     fn mint(header: &serde_json::Value, claims: &serde_json::Value) -> String {
         let signing = format!("{}.{}", segment(header), segment(claims));
         let signature = signer().sign(signing.as_bytes());
-        format!(
-            "{signing}.{}",
-            URL_SAFE_NO_PAD.encode(signature.as_ref())
-        )
+        format!("{signing}.{}", URL_SAFE_NO_PAD.encode(signature.as_ref()))
     }
 
     fn header() -> serde_json::Value {
@@ -691,7 +688,10 @@ mod tests {
     #[test]
     fn the_first_token_that_verifies_wins() {
         let now = at(0);
-        let stale = mint(&header(), &claims(at(0).saturating_sub(Duration::from_hours(1))));
+        let stale = mint(
+            &header(),
+            &claims(at(0).saturating_sub(Duration::from_hours(1))),
+        );
         let fresh = mint(&header(), &claims(now));
 
         // A client mid-rotation sends both. The option is defined to repeat
@@ -756,7 +756,8 @@ mod tests {
     fn a_jwk_set_is_read_in_either_shape() {
         let x = URL_SAFE_NO_PAD.encode(signer().public_key().as_ref());
         let bare = format!(r#"[{{"kty":"OKP","crv":"Ed25519","kid":"k1","x":"{x}"}}]"#);
-        let wrapped = format!(r#"{{"keys":[{{"kty":"OKP","crv":"Ed25519","kid":"k1","x":"{x}"}}]}}"#);
+        let wrapped =
+            format!(r#"{{"keys":[{{"kty":"OKP","crv":"Ed25519","kid":"k1","x":"{x}"}}]}}"#);
 
         for document in [&bare, &wrapped] {
             let keys = VerificationKey::parse_set(document).expect("parses");

@@ -385,8 +385,12 @@ impl Session {
             // reads it waits; one that does not is no worse off than before.
             Err(SessionError::OverLimit(refusal)) => session.transport.close(
                 code::EXCESSIVE_LOAD,
-                format!("{} retry_after_ms={}", refusal.reason_phrase(), refusal.retry_after_ms())
-                    .as_bytes(),
+                format!(
+                    "{} retry_after_ms={}",
+                    refusal.reason_phrase(),
+                    refusal.retry_after_ms()
+                )
+                .as_bytes(),
             ),
             Err(_) => session.transport.close(code::INTERNAL, b"session failed"),
         }
@@ -424,11 +428,10 @@ impl Session {
         let _session = self.handshake(&mut control_send, &mut control).await?;
 
         let peer = self.connection().remote_address();
-        let live = self.fabric.metrics().session_started(
-            self.id,
-            peer.to_string(),
-            self.carrier,
-        );
+        let live = self
+            .fabric
+            .metrics()
+            .session_started(self.id, peer.to_string(), self.carrier);
         // Peer and session identifier together, once, at the point both are
         // known. Every later line carries the identifier alone, which is what
         // makes this the line that joins a connection to its address.
@@ -560,7 +563,10 @@ impl Session {
     /// through [`crate::Quotas`] how far that gets it.
     fn establish_identity(&self, peer: &Setup) -> Result<(), SessionError> {
         let address = self.connection().remote_address().ip();
-        let tokens = peer.options.authorization_tokens().map(bytes::Bytes::as_ref);
+        let tokens = peer
+            .options
+            .authorization_tokens()
+            .map(bytes::Bytes::as_ref);
 
         let who = match self
             .fabric

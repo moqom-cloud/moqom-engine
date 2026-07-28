@@ -455,8 +455,12 @@ pub struct Quotas {
     /// This bounds the limiter's own memory, which matters because a table
     /// keyed on something the peer influences is itself an amplification: an
     /// attacker who can make the relay allocate an entry per request has turned
-    /// the defence into the attack. See [`Governor::admit`] for what happens
-    /// when the table is full, which is the part that has to be right.
+    /// the defence into the attack. See `Governor::ensure` for what happens when
+    /// the table is full, which is the part that has to be right.
+    ///
+    /// Zero means unbounded, for symmetry with [`Quota::concurrent`], and is
+    /// only sensible when nothing is being limited — with limits on it is the
+    /// setting that lets a peer grow the relay's memory by connecting.
     pub principals: usize,
 }
 
@@ -748,7 +752,8 @@ impl Table {
 
     /// Forget every entry whose removal cannot change a decision.
     fn sweep(&mut self, allowance: &Allowance, now: Instant) {
-        self.entries.retain(|_, entry| !entry.is_idle(allowance, now));
+        self.entries
+            .retain(|_, entry| !entry.is_idle(allowance, now));
         self.swept = Some(now);
     }
 }
@@ -821,12 +826,7 @@ impl Governor {
     /// # Errors
     /// [`Refusal`] when any tier this principal is charged against is out of
     /// allowance. No tier is debited when any tier refuses.
-    pub fn charge(
-        &self,
-        who: &Principal,
-        resource: Resource,
-        now: Instant,
-    ) -> Result<(), Refusal> {
+    pub fn charge(&self, who: &Principal, resource: Resource, now: Instant) -> Result<(), Refusal> {
         self.admit(who, resource, false, now).map(drop)
     }
 
@@ -842,12 +842,11 @@ impl Governor {
         resource: Resource,
         now: Instant,
     ) -> Result<Lease, Refusal> {
-        self.admit(who, resource, true, now)
-            .map(|charges| Lease {
-                state: Arc::clone(&self.state),
-                charges,
-                resource,
-            })
+        self.admit(who, resource, true, now).map(|charges| Lease {
+            state: Arc::clone(&self.state),
+            charges,
+            resource,
+        })
     }
 
     /// How many principals are currently tracked in a tier, for diagnostics.
@@ -1245,7 +1244,9 @@ mod tests {
         let governor = governor(Quota::new(1.0, 1.0, 0), Quota::new(1.0, 1.0, 0), 0);
         let theirs = Principal::verified("globex", "ada", "device-1");
 
-        governor.charge(&phone(), Resource::Fetch, at).expect("ours");
+        governor
+            .charge(&phone(), Resource::Fetch, at)
+            .expect("ours");
         // Same username, same device name, different customer. Sharing a
         // bucket here would let anyone who can sign up exhaust the allowance of
         // a name they guessed in someone else's tenant.
@@ -1273,7 +1274,9 @@ mod tests {
 
         // Spending a fetch must not spend a subscribe. One shared bucket would
         // make a client that reconnects unable to resubscribe.
-        governor.charge(&phone(), Resource::Fetch, at).expect("fetch");
+        governor
+            .charge(&phone(), Resource::Fetch, at)
+            .expect("fetch");
         governor
             .charge(&phone(), Resource::Fetch, at)
             .expect_err("fetch is spent");
@@ -1318,7 +1321,9 @@ mod tests {
         // neither refills. Neither can be forgotten without handing its owner a
         // fresh allowance.
         governor.charge(&phone(), Resource::Fetch, at).expect("one");
-        governor.charge(&laptop(), Resource::Fetch, at).expect("two");
+        governor
+            .charge(&laptop(), Resource::Fetch, at)
+            .expect("two");
 
         let third = Principal::verified("acme", "ada", "device-3");
         let refusal = governor
