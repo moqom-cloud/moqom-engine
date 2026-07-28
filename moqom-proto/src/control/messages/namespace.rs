@@ -27,6 +27,7 @@ use crate::control::params::Parameters;
 use crate::control::request_id::RequestId;
 use crate::error::DecodeError;
 use crate::model::{FullTrackName, TrackNamespace};
+use crate::varint::VarInt;
 
 /// Generates a message body of `RequestId`, a namespace, and counted
 /// parameters — the shape shared by the three namespace requests.
@@ -213,15 +214,204 @@ namespace_suffix! {
     MessageType::Namespace
 }
 
-namespace_suffix! {
-    /// A previously announced namespace is no longer being served.
+/// Why a namespace stopped being served.
+///
+/// Draft-19 has nowhere to put this. There is no `UNANNOUNCE` — a publisher
+/// withdraws by closing its [`PublishNamespace`] stream — and the resulting
+/// [`NamespaceDone`] is a bare suffix with no parameters. So the two endings
+/// arrive identically, and a receiver cannot tell a publisher who stopped on
+/// purpose from one whose connection died.
+///
+/// For a room that difference decides behaviour rather than decorating it. A
+/// deliberate stop means the participant is gone and their place can be
+/// released; a dead session means they may be back in seconds, and releasing it
+/// reflows everybody's layout for a lift or a tunnel. Guessing wrong is visible
+/// to every viewer, and the relay is the only party that knows.
+///
+/// See [`NamespaceDone::reason`] for how this travels without breaking a peer
+/// that has never heard of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DoneReason {
+    /// The publisher withdrew it, by closing the stream that announced it.
+    Stopped,
+
+    /// The session ended without withdrawing it.
     ///
-    /// Ordering is normative: this must never arrive before the [`Namespace`]
-    /// it retracts, and a subscriber that sees one MUST close the session. A
-    /// reset or `FIN` on the response stream means the same thing for every
-    /// namespace still active on it.
-    NamespaceDone,
-    MessageType::NamespaceDone
+    /// Covers the idle timeout, a transport failure, and a protocol violation
+    /// the relay closed the session over — anything, in short, where nobody
+    /// said they were going. The publisher may be reconnecting.
+    Vanished,
+
+    /// A code this build does not know.
+    ///
+    /// Kept rather than rejected so that a relay may add reasons without every
+    /// older client treating the extra ones as a decode failure. Treat it as
+    /// [`Self::Vanished`], which is the conservative reading: waiting for
+    /// somebody who has actually left costs a stale entry, and releasing
+    /// somebody who is coming back costs a visible disruption to everyone.
+    Other(u64),
+}
+
+impl DoneReason {
+    const STOPPED: u64 = 0;
+    const VANISHED: u64 = 1;
+
+    /// The wire code.
+    #[must_use]
+    pub const fn code(self) -> u64 {
+        match self {
+            Self::Stopped => Self::STOPPED,
+            Self::Vanished => Self::VANISHED,
+            Self::Other(code) => code,
+        }
+    }
+
+    /// Read a wire code, keeping one this build does not recognise.
+    #[must_use]
+    pub const fn from_code(code: u64) -> Self {
+        match code {
+            Self::STOPPED => Self::Stopped,
+            Self::VANISHED => Self::Vanished,
+            other => Self::Other(other),
+        }
+    }
+
+    /// Whether the publisher may yet come back.
+    ///
+    /// The question every caller actually has, and the reason
+    /// [`Self::Other`] is not an error: an unknown reason answers `true` here,
+    /// so a client that meets a newer relay errs towards patience.
+    #[must_use]
+    pub const fn may_return(self) -> bool {
+        !matches!(self, Self::Stopped)
+    }
+}
+
+/// A previously announced namespace is no longer being served.
+///
+/// Ordering is normative: this must never arrive before the [`Namespace`]
+/// it retracts, and a subscriber that sees one MUST close the session. A
+/// reset or `FIN` on the response stream means the same thing for every
+/// namespace still active on it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NamespaceDone {
+    /// The namespace fields *after* the prefix from the request that caused
+    /// this message. Not a whole namespace.
+    pub suffix: TrackNamespace,
+
+    /// Why it went away, if the sender said.
+    ///
+    /// A MOQOM extension, and deliberately shaped so that it is not a new
+    /// dialect. It rides *after* the suffix in the same message body, which
+    /// works in both directions because control messages are length-framed and
+    /// every decoder reads the fields it knows and stops:
+    ///
+    /// - A draft-19 receiver reads the suffix, ignores the trailing varint, and
+    ///   behaves exactly as it did before.
+    /// - This receiver, given a draft-19 sender, finds no trailing bytes and
+    ///   gets `None`.
+    ///
+    /// A new message type would not have this property. Draft-19 §10 requires
+    /// closing the session over an unknown message type, so inventing one would
+    /// make every conformant peer hang up rather than ignore us.
+    ///
+    /// `None` therefore means "not stated" and not "no reason". Read it through
+    /// [`DoneReason::may_return`], which resolves both the missing case and the
+    /// unrecognised one the same conservative way.
+    pub reason: Option<DoneReason>,
+}
+
+impl NamespaceDone {
+    /// Wrap a suffix, saying nothing about why.
+    #[must_use]
+    pub const fn new(suffix: TrackNamespace) -> Self {
+        Self {
+            suffix,
+            reason: None,
+        }
+    }
+
+    /// Wrap a suffix and say why.
+    #[must_use]
+    pub const fn because(suffix: TrackNamespace, reason: DoneReason) -> Self {
+        Self {
+            suffix,
+            reason: Some(reason),
+        }
+    }
+
+    /// The full namespace, given the prefix this was sent against.
+    ///
+    /// # Errors
+    /// [`crate::model::NameError`] if joining exceeds the field count or byte
+    /// budget.
+    pub fn resolve(
+        &self,
+        prefix: &TrackNamespace,
+    ) -> Result<TrackNamespace, crate::model::NameError> {
+        let mut full = prefix.clone();
+        for field in self.suffix.fields() {
+            full.push(field.clone())?;
+        }
+        Ok(full)
+    }
+
+    /// Encoded size of the message body.
+    #[must_use]
+    pub fn encoded_len(&self) -> usize {
+        self.suffix.encoded_len()
+            + self.reason.map_or(0, |reason| {
+                VarInt::new(reason.code()).map_or(0, VarInt::size)
+            })
+    }
+
+    /// Append the message body to `buf`.
+    pub fn encode<B: BufMut>(&self, buf: &mut B) {
+        self.suffix.encode(buf);
+        if let Some(reason) = self.reason {
+            // A code too large for a varint cannot be written, and dropping it
+            // is the right failure: the suffix is what the message is *for*, and
+            // a receiver that gets it without a reason falls back to waiting.
+            // Only reachable through `Other` with a hand-made value.
+            if let Ok(code) = VarInt::new(reason.code()) {
+                code.encode(buf);
+            }
+        }
+    }
+
+    /// Read a message body.
+    ///
+    /// # Errors
+    /// [`DecodeError::Short`] if incomplete; [`DecodeError::Invalid`] if the
+    /// namespace violates its constraints.
+    pub fn decode<B: Buf>(buf: &mut B) -> Result<Self, DecodeError> {
+        let suffix = TrackNamespace::decode(buf)?;
+
+        // Absent rather than malformed when there is nothing left. This is the
+        // whole compatibility story: a draft-19 sender stops after the suffix,
+        // and that has to read as "did not say" rather than as a truncated
+        // message.
+        let reason = if buf.has_remaining() {
+            Some(DoneReason::from_code(VarInt::decode(buf)?.get()))
+        } else {
+            None
+        };
+
+        Ok(Self { suffix, reason })
+    }
+}
+
+impl MessageBody for NamespaceDone {
+    const MESSAGE_TYPE: MessageType = MessageType::NamespaceDone;
+
+    fn encoded_len(&self) -> usize {
+        Self::encoded_len(self)
+    }
+
+    fn encode<B: BufMut>(&self, buf: &mut B) {
+        Self::encode(self, buf);
+    }
 }
 
 /// A track inside a subscribed namespace will not be offered.
@@ -339,6 +529,71 @@ mod tests {
             value.encode(&mut buf);
             assert_eq!(NamespaceDone::decode(&mut buf.as_slice()).unwrap(), value);
         }
+    }
+
+    #[test]
+    fn a_stated_reason_round_trips() {
+        for reason in [
+            DoneReason::Stopped,
+            DoneReason::Vanished,
+            DoneReason::Other(41),
+        ] {
+            let value = NamespaceDone::because(ns(&[b"room-1"]), reason);
+            let mut buf = Vec::new();
+            value.encode(&mut buf);
+            assert_eq!(buf.len(), value.encoded_len());
+            assert_eq!(NamespaceDone::decode(&mut buf.as_slice()).unwrap(), value);
+        }
+    }
+
+    /// The compatibility claim in both directions, which is the only reason the
+    /// reason is a trailing field rather than a message of its own.
+    #[test]
+    fn the_reason_is_optional_on_the_wire() {
+        // A draft-19 sender: suffix and nothing else. Must read as "did not
+        // say" rather than as a short message.
+        let bare = Namespace::new(ns(&[b"room-1"]));
+        let mut buf = Vec::new();
+        bare.encode(&mut buf);
+
+        let decoded = NamespaceDone::decode(&mut buf.as_slice()).unwrap();
+        assert_eq!(decoded.suffix, ns(&[b"room-1"]));
+        assert_eq!(decoded.reason, None);
+
+        // A draft-19 *receiver*: reads the suffix off a body that carries a
+        // reason, and is unbothered by what follows. `Namespace` stands in for
+        // one here, being the same bare-suffix decoder this used to be.
+        let stated = NamespaceDone::because(ns(&[b"room-1"]), DoneReason::Vanished);
+        let mut buf = Vec::new();
+        stated.encode(&mut buf);
+
+        let mut cursor = buf.as_slice();
+        assert_eq!(
+            Namespace::decode(&mut cursor).unwrap().suffix,
+            ns(&[b"room-1"])
+        );
+        assert!(
+            !cursor.is_empty(),
+            "the reason should be the bytes an older decoder leaves behind"
+        );
+    }
+
+    /// An unknown reason must not be a decode failure, or adding one later
+    /// would break every client that had not been rebuilt.
+    #[test]
+    fn an_unknown_reason_survives_and_reads_as_patience() {
+        let value = NamespaceDone::because(ns(&[b"room-1"]), DoneReason::Other(9_999));
+        let mut buf = Vec::new();
+        value.encode(&mut buf);
+
+        let decoded = NamespaceDone::decode(&mut buf.as_slice()).unwrap();
+        assert_eq!(decoded.reason, Some(DoneReason::Other(9_999)));
+
+        // Erring towards holding the seat, because releasing somebody who is
+        // coming back is the more visible mistake.
+        assert!(DoneReason::Other(9_999).may_return());
+        assert!(DoneReason::Vanished.may_return());
+        assert!(!DoneReason::Stopped.may_return());
     }
 
     /// The suffix rule is invisible on the wire, so the join is the only place

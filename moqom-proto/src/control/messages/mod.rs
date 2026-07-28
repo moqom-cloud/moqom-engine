@@ -16,7 +16,8 @@ pub mod subscribe;
 pub use fetch::{Fetch, FetchKind, FetchOk};
 pub use goaway::{Goaway, GoawayError};
 pub use namespace::{
-    Namespace, NamespaceDone, PublishNamespace, PublishSkipped, SubscribeNamespace, SubscribeTracks,
+    DoneReason, Namespace, NamespaceDone, PublishNamespace, PublishSkipped, SubscribeNamespace,
+    SubscribeTracks,
 };
 pub use publish::{Publish, PublishDone, PublishDoneStatus, RequestUpdate, StreamCount};
 pub use request::{Redirect, RequestError, RequestErrorCode, RequestOk};
