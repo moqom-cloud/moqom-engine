@@ -40,8 +40,10 @@
 /// not a trait.
 pub type Session = web_transport_quinn::Session;
 
+pub mod liveness;
 pub mod server;
 
+pub use liveness::{Liveness, LivenessError};
 pub use server::{AcceptError, Accepting, Negotiated, Server};
 
 /// Protocol identifiers offered during the handshake.

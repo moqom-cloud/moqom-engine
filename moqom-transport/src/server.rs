@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use web_transport_quinn::proto::ConnectResponse;
 
-use crate::{Carrier, Dialect, Session, alpn};
+use crate::{Carrier, Dialect, Liveness, Session, alpn};
 
 /// Why a session could not be established.
 #[derive(Debug, thiserror::Error)]
@@ -53,13 +53,44 @@ impl Server {
 
     /// Bind a socket with the given TLS configuration.
     ///
+    /// Uses [`Liveness::DEFAULT`]. See [`Server::bind_with`] to choose.
+    ///
     /// # Errors
     /// If the address cannot be bound, or the TLS configuration is not usable
     /// for QUIC.
     pub fn bind(addr: SocketAddr, tls: rustls::ServerConfig) -> io::Result<Self> {
+        Self::bind_with(addr, tls, Liveness::DEFAULT)
+    }
+
+    /// Bind a socket, choosing how long a silent peer has.
+    ///
+    /// # Errors
+    /// If the address cannot be bound, the TLS configuration is not usable for
+    /// QUIC, or the liveness timings cannot be encoded.
+    pub fn bind_with(
+        addr: SocketAddr,
+        tls: rustls::ServerConfig,
+        liveness: Liveness,
+    ) -> io::Result<Self> {
         let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        let config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
+        let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
+
+        let mut transport = quinn::TransportConfig::default();
+        liveness
+            .apply(&mut transport)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        config.transport_config(Arc::new(transport));
+
+        // Already the default, and set anyway because of what it does here. A
+        // phone moving from wifi to cellular keeps its QUIC connection: the
+        // path changes underneath and the connection ID does not, so the
+        // session survives what would end a TCP one. Turning this off would
+        // convert every handover into a disconnection, a reconnection, and a
+        // gap in somebody's broadcast -- and it would do so silently, which is
+        // why it is written down rather than inherited.
+        config.migration(true);
+
         Ok(Self::new(quinn::Endpoint::server(config, addr)?))
     }
 
