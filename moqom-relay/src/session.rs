@@ -575,12 +575,12 @@ impl Session {
             .authorization_tokens()
             .map(bytes::Bytes::as_ref);
 
-        let who = match self
+        let admitted = match self
             .fabric
             .authenticator()
-            .identify(tokens, address, SystemTime::now())
+            .admit(tokens, address, SystemTime::now())
         {
-            Ok(who) => who,
+            Ok(admitted) => admitted,
             Err(e) => {
                 // Logged at info rather than warn: an expired token during a
                 // reconnection is routine, and a relay that shouts about it
@@ -592,11 +592,24 @@ impl Session {
             }
         };
 
-        if who.is_verified() {
+        if admitted.who.is_verified() {
             tracing::debug!(session = %self.id, "session authenticated");
         }
+        // Logged and not stored, because there is nowhere for it to go yet: what
+        // carries provenance onward is the control-plane session link, and no part
+        // of this relay reports session state to the control plane so far. Until
+        // then this line is the only way to confirm from a running relay that
+        // attribution is reaching it at all, which is worth more than a field
+        // nothing reads.
+        //
+        // Deliberately not folded into the principal, which is a quota key: an
+        // audience is not something anybody is charged for, and combining them
+        // would hand each user one rate-limit bucket per route they arrived by.
+        if let Some(via) = &admitted.via {
+            tracing::debug!(session = %self.id, %via, "session was brought by somebody");
+        }
         // Only ever set once, and this is the only place that sets it.
-        let _ = self.principal.set(who);
+        let _ = self.principal.set(admitted.who);
         Ok(())
     }
 

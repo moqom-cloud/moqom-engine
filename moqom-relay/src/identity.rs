@@ -182,6 +182,19 @@ struct Claims {
     exp: i64,
     #[serde(default)]
     cnf: Confirmation,
+    /// The username whose following brought this session in, if any.
+    ///
+    /// Read here and not acted on here. It exists so that the relay can report
+    /// which audience a session belongs to, and later attribute per-track egress
+    /// to it -- when two cohosts bring their own followings to one room, whose
+    /// bandwidth B's media is when it reaches A's viewers is a question only the
+    /// party forwarding the bytes can answer.
+    ///
+    /// Deliberately not part of the lax-parsing caveat above: this decides
+    /// nothing about what anybody may do, so a token that omits it is a session
+    /// nobody brought rather than a session with unknown rights.
+    #[serde(default)]
+    via: String,
 }
 
 #[derive(Deserialize, Default)]
@@ -337,26 +350,74 @@ impl Authenticator {
         address: std::net::IpAddr,
         now: SystemTime,
     ) -> Result<Principal, AuthError> {
+        self.admit(tokens, address, now)
+            .map(|admitted| admitted.who)
+    }
+
+    /// The same check, keeping what the token said beyond who it names.
+    ///
+    /// Separate from [`Self::identify`] rather than replacing it because the two
+    /// answer different questions and only one of them may reach a quota key. A
+    /// [`Principal`] is what a request is charged against, and it is compared for
+    /// equality to find the bucket -- so folding provenance into it would make
+    /// two sessions of one user distinct whenever they arrived by different
+    /// routes, which is a rate limit anybody could escape by joining twice.
+    ///
+    /// # Errors
+    /// As [`Self::identify`].
+    pub fn admit<'a>(
+        &self,
+        tokens: impl IntoIterator<Item = &'a [u8]>,
+        address: std::net::IpAddr,
+        now: SystemTime,
+    ) -> Result<Admission, AuthError> {
         let Some(keys) = &self.inner else {
-            return Ok(Principal::anonymous(address));
+            return Ok(Admission::anonymous(address));
         };
 
         let mut last = None;
         for token in tokens {
             match keys.verify(token, now) {
-                Ok(principal) => return Ok(principal),
+                Ok(admitted) => return Ok(admitted),
                 Err(e) => last = Some(e),
             }
         }
         match last {
             Some(e) => Err(e),
-            None => Ok(Principal::anonymous(address)),
+            None => Ok(Admission::anonymous(address)),
+        }
+    }
+}
+
+/// What a verified token said: who the holder is, and who brought them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Admission {
+    /// Who they are, and the only part of this a limit or a ban may read.
+    pub who: Principal,
+
+    /// The username whose following brought them, from the `via` claim.
+    ///
+    /// `None` for a session nobody brought, which is the ordinary case rather
+    /// than missing information -- a viewer who found the room themselves is a
+    /// cohort of their own, and the size of it is how a cohost's contribution is
+    /// judged.
+    pub via: Option<Arc<str>>,
+}
+
+impl Admission {
+    /// An unauthenticated peer, who by definition arrived through nobody: there
+    /// is no signed claim, and an unsigned one is worth less than nothing here.
+    #[must_use]
+    pub const fn anonymous(address: std::net::IpAddr) -> Self {
+        Self {
+            who: Principal::anonymous(address),
+            via: None,
         }
     }
 }
 
 impl Keys {
-    fn verify(&self, token: &[u8], now: SystemTime) -> Result<Principal, AuthError> {
+    fn verify(&self, token: &[u8], now: SystemTime) -> Result<Admission, AuthError> {
         if token.is_empty() || token.len() > MAX_TOKEN_BYTES {
             return Err(AuthError::Malformed("token length is out of range"));
         }
@@ -421,7 +482,17 @@ impl Keys {
         if claims.aud.is_empty() || claims.sub.is_empty() || device.is_empty() {
             return Err(AuthError::Incomplete);
         }
-        Ok(Principal::verified(&claims.aud, &claims.sub, device))
+        // A token attributed to its own subject is dropped rather than refused.
+        // The control plane will not mint one, so this is defence against a bug
+        // rather than an attack, and rejecting the session over it would turn a
+        // miscounted audience into somebody unable to watch.
+        let via = Some(claims.via)
+            .filter(|via| !via.is_empty() && *via != claims.sub)
+            .map(Arc::from);
+        Ok(Admission {
+            who: Principal::verified(&claims.aud, &claims.sub, device),
+            via,
+        })
     }
 }
 
@@ -540,6 +611,99 @@ mod tests {
 
     fn at(seconds: u64) -> SystemTime {
         UNIX_EPOCH + Duration::from_secs(1_800_000_000 + seconds)
+    }
+
+    #[test]
+    fn a_token_says_who_brought_its_holder() {
+        let now = at(0);
+        let mut brought = claims(now);
+        brought["via"] = serde_json::json!("bea");
+        let token = mint(&header(), &brought);
+
+        let admitted = authenticator()
+            .admit([token.as_bytes()], peer(), now)
+            .expect("verifies");
+
+        assert_eq!(admitted.via.as_deref(), Some("bea"));
+        // And the identity is untouched by it.
+        assert_eq!(
+            admitted.who,
+            Principal::verified("acme", "ada", "OuXpLpEHW7dCPqjK")
+        );
+    }
+
+    #[test]
+    fn provenance_stays_out_of_the_quota_key() {
+        // The reason `Admission` exists rather than a field on `Principal`. A
+        // principal is compared for equality to find the bucket a request is
+        // charged against, so if provenance were part of it, one user could have
+        // as many buckets as there are routes into a room -- and shed a rate
+        // limit by joining through a different link.
+        let now = at(0);
+        let mut brought = claims(now);
+        brought["via"] = serde_json::json!("bea");
+        let mut otherwise = claims(now);
+        otherwise["via"] = serde_json::json!("ana");
+
+        let one = authenticator()
+            .admit([mint(&header(), &brought).as_bytes()], peer(), now)
+            .expect("verifies");
+        let two = authenticator()
+            .admit([mint(&header(), &otherwise).as_bytes()], peer(), now)
+            .expect("verifies");
+
+        assert_ne!(one.via, two.via);
+        assert_eq!(one.who, two.who, "the same user, however they arrived");
+    }
+
+    #[test]
+    fn a_token_nobody_brought_is_ordinary() {
+        let now = at(0);
+        let admitted = authenticator()
+            .admit([mint(&header(), &claims(now)).as_bytes()], peer(), now)
+            .expect("verifies");
+
+        // Absent rather than empty, so "arrived alone" is a value and not a
+        // string somebody has to remember to check the length of.
+        assert_eq!(admitted.via, None);
+    }
+
+    #[test]
+    fn a_token_attributed_to_itself_is_ignored_not_refused() {
+        // The control plane will not mint one, so this is a bug rather than an
+        // attack -- and refusing the session over a miscounted audience would
+        // stop somebody watching for no good reason.
+        let now = at(0);
+        let mut itself = claims(now);
+        itself["via"] = serde_json::json!("ada");
+
+        let admitted = authenticator()
+            .admit([mint(&header(), &itself).as_bytes()], peer(), now)
+            .expect("verifies despite the nonsense");
+
+        assert_eq!(admitted.via, None);
+        assert!(admitted.who.is_verified());
+    }
+
+    #[test]
+    fn provenance_cannot_be_rewritten_by_its_holder() {
+        // What makes it worth carrying in the token at all: these counts divide
+        // money between cohosts.
+        let now = at(0);
+        let mut brought = claims(now);
+        brought["via"] = serde_json::json!("bea");
+        let token = mint(&header(), &brought);
+
+        let mut forged = claims(now);
+        forged["via"] = serde_json::json!("ana");
+        let (head, _) = token.split_once('.').expect("three segments");
+        let tail = token.rsplit('.').next().expect("a signature");
+        let rewritten = format!("{head}.{}.{tail}", segment(&forged));
+
+        assert_eq!(
+            authenticator().admit([rewritten.as_bytes()], peer(), now),
+            Err(AuthError::BadSignature)
+        );
     }
 
     #[test]

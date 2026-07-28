@@ -33,6 +33,10 @@ struct Case {
     tenant: String,
     username: String,
     device: String,
+    /// Who brought this holder, where the control plane said. Absent for the
+    /// cases that arrived alone.
+    #[serde(default)]
+    arrived_via: Option<String>,
 }
 
 fn fixture() -> Fixture {
@@ -56,17 +60,31 @@ fn tokens_minted_by_the_control_plane_verify_here() {
         "a fixture with no cases proves nothing"
     );
     for case in &fixture.cases {
-        let who = authenticator
-            .identify([case.token.as_bytes()], peer(), now)
+        let admitted = authenticator
+            .admit([case.token.as_bytes()], peer(), now)
             .unwrap_or_else(|e| panic!("{}: {e}", case.name));
 
         assert_eq!(
-            who,
+            admitted.who,
             Principal::verified(&case.tenant, &case.username, &case.device),
             "{}: the two sides disagree about who this is",
             case.name
         );
+        // Provenance decides which cohost's audience a viewer counts towards, so
+        // a disagreement here is a cohort that reads as organic on one side and
+        // attributed on the other -- silent, and eventually a revenue dispute.
+        assert_eq!(
+            admitted.via.as_deref(),
+            case.arrived_via.as_deref(),
+            "{}: the two sides disagree about who brought this holder",
+            case.name
+        );
     }
+
+    assert!(
+        fixture.cases.iter().any(|case| case.arrived_via.is_some()),
+        "no case carries provenance, so this proves only that both sides ignore it"
+    );
 }
 
 #[test]
