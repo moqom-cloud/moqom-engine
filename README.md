@@ -61,10 +61,19 @@ Requires the toolchain pinned in `rust-toolchain.toml`, which rustup installs
 automatically.
 
 ```sh
-cargo test --all-features
-cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --all --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 ```
+
+All four, in that order, are what CI runs — the last one included, since a
+broken intra-doc link fails the build and nothing about it fails a test.
+
+**On a Mac, that is not the whole check.** The relay reads the kernel's clock
+health through `adjtimex`, which is behind `cfg(target_os = "linux")`, so a
+local run compiles the other branch and never sees that code. CI is the only
+thing that builds it.
 
 `quinn` is vendored under `vendor/` and patched in at the workspace root, so a
 build here links our copy rather than the registry's. Both halves of that claim
