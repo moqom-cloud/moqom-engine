@@ -245,6 +245,93 @@ impl std::fmt::Display for Location {
     }
 }
 
+/// Where a range of history stops.
+///
+/// On the wire this is one location described as "the last object, plus one",
+/// with a zero object meaning the whole group. Two readings of §10.12 disagree:
+/// the prose calls the range inclusive and the field description says plus one.
+/// Following only the prose returns one object too many; following only the
+/// field description loses the last object of every fetch.
+///
+/// Both cases live here so the off-by-one is applied once, by
+/// [`Self::from_wire`] and [`Self::wire`], instead of by every caller who has to
+/// remember it exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FetchEnd {
+    /// Through this object, inclusive.
+    Through(Location),
+
+    /// Through the end of this group, however many objects it turns out to
+    /// hold. The only way to ask for the rest of a group without knowing how
+    /// long it is — which a subscriber joining a live track never does.
+    EndOfGroup(GroupId),
+}
+
+impl FetchEnd {
+    /// Interpret the End Location field of a FETCH.
+    ///
+    /// # Panics
+    /// Never: the subtraction is guarded by the zero check, and one less than a
+    /// varint is always a varint.
+    #[must_use]
+    pub fn from_wire(end: Location) -> Self {
+        if end.object == ObjectId::ZERO {
+            Self::EndOfGroup(end.group)
+        } else {
+            // Safe because the object is nonzero, so subtracting one cannot
+            // underflow the group.
+            Self::Through(Location::new(
+                end.group,
+                ObjectId::new(
+                    VarInt::new(end.object.get() - 1).expect("one less than a varint is a varint"),
+                ),
+            ))
+        }
+    }
+
+    /// The End Location field to put on the wire.
+    ///
+    /// `None` for a `Through` whose object is the varint maximum, which cannot
+    /// be expressed as a plus-one and is not a range anything real asks for.
+    #[must_use]
+    pub fn wire(self) -> Option<Location> {
+        match self {
+            Self::Through(location) => Some(Location::new(
+                location.group,
+                ObjectId::new(VarInt::new(location.object.get() + 1).ok()?),
+            )),
+            Self::EndOfGroup(group) => Some(Location::new(group, ObjectId::ZERO)),
+        }
+    }
+
+    /// Whether `location` falls within a range ending here.
+    #[must_use]
+    pub fn covers(self, location: Location) -> bool {
+        match self {
+            Self::Through(last) => location <= last,
+            Self::EndOfGroup(group) => location.group <= group,
+        }
+    }
+
+    /// The last group the range can reach into.
+    #[must_use]
+    pub const fn last_group(self) -> GroupId {
+        match self {
+            Self::Through(location) => location.group,
+            Self::EndOfGroup(group) => group,
+        }
+    }
+}
+
+impl std::fmt::Display for FetchEnd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Through(location) => write!(f, "through {location}"),
+            Self::EndOfGroup(group) => write!(f, "through the end of group {group}"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,5 +396,50 @@ mod tests {
         let max = GroupId::new(VarInt::MAX);
         assert!(max.next().is_none());
         assert_eq!(GroupId::ZERO.next().unwrap().get(), 1);
+    }
+
+    fn loc(group: u32, object: u32) -> Location {
+        Location::new(GroupId::from(group), ObjectId::from(object))
+    }
+
+    /// The plus-one is the whole point of the type, and it has to survive both
+    /// directions: a range asking through object 9 arrives as 10 and has to be
+    /// understood as 9 again.
+    #[test]
+    fn a_fetch_end_round_trips_through_the_wire_form() {
+        for end in [
+            FetchEnd::Through(loc(4, 9)),
+            FetchEnd::Through(loc(0, 0)),
+            FetchEnd::EndOfGroup(GroupId::from(7u32)),
+        ] {
+            let wire = end.wire().expect("representable");
+            assert_eq!(FetchEnd::from_wire(wire), end);
+        }
+    }
+
+    #[test]
+    fn a_through_end_includes_its_own_object() {
+        let end = FetchEnd::Through(loc(4, 9));
+        assert_eq!(end.wire().unwrap(), loc(4, 10), "the wire form is plus one");
+        assert!(end.covers(loc(4, 9)), "the named object is in the range");
+        assert!(!end.covers(loc(4, 10)));
+        assert!(!end.covers(loc(5, 0)));
+    }
+
+    /// A zero object is not "through object zero", it is "all of this group".
+    /// Treating it as the former makes every whole-group fetch return one object.
+    #[test]
+    fn a_zero_object_means_the_whole_group() {
+        let end = FetchEnd::from_wire(loc(7, 0));
+        assert_eq!(end, FetchEnd::EndOfGroup(GroupId::from(7u32)));
+        assert!(end.covers(loc(7, 0)));
+        assert!(end.covers(loc(7, 999_999)));
+        assert!(!end.covers(loc(8, 0)));
+    }
+
+    #[test]
+    fn a_through_end_at_the_ceiling_has_no_wire_form() {
+        let end = FetchEnd::Through(Location::new(GroupId::ZERO, ObjectId::new(VarInt::MAX)));
+        assert!(end.wire().is_none());
     }
 }

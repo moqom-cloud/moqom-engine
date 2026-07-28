@@ -10,18 +10,26 @@
 //! it would make these tests circular: a mistake in the framing would be made by
 //! both ends and observed by neither.
 
+// Every integration test binary compiles this module in full and uses a subset of
+// it, so anything only one of them needs is dead code in the others.
+#![allow(dead_code)]
+
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 use bytes::{Buf, Bytes, BytesMut};
 use moqom_proto::control::{
-    ControlFrame, MessageBody, MessageType, Namespace, NamespaceDone, PublishNamespace, RequestId,
-    RequestIdGenerator, Role, Setup, Subscribe, SubscribeNamespace, SubscribeOk, write_message,
+    ControlFrame, Fetch, FetchKind, FetchOk, MessageBody, MessageType, Namespace, NamespaceDone,
+    PublishNamespace, RequestId, RequestIdGenerator, Role, Setup, Subscribe, SubscribeNamespace,
+    SubscribeOk, write_message,
 };
-use moqom_proto::data::{SubgroupHeader, SubgroupSource};
+use moqom_proto::data::{
+    FetchHeader, FetchReader, FetchRecord, GroupOrder, SubgroupHeader, SubgroupSource,
+};
 use moqom_proto::error::DecodeError;
-use moqom_proto::model::{FullTrackName, GroupId, TrackAlias, TrackNamespace};
-use moqom_relay::{Fabric, Session};
+use moqom_proto::model::{FullTrackName, GroupId, Location, TrackAlias, TrackNamespace};
+use moqom_relay::admin::Surface;
+use moqom_relay::{Cache, Fabric, Limits, Metrics, Session};
 use moqom_transport::{Server, alpn, server::with_moqt_alpn};
 use web_transport_quinn::{RecvStream, SendStream};
 
@@ -45,6 +53,14 @@ pub async fn within<F: Future>(what: &str, future: F) -> F::Output {
 pub struct Relay {
     pub addr: SocketAddr,
     pub fabric: Fabric,
+    /// What the relay counted, always enabled here.
+    ///
+    /// On rather than off in every test, including the ones that assert nothing
+    /// about it: instrumentation on the forwarding path is code, and code that
+    /// only runs in production is code whose first execution is in production.
+    pub metrics: Metrics,
+    /// The admin endpoints over this relay's state.
+    pub surface: Surface,
     /// The certificate the client must trust, held so tests can pin it.
     pub certificate: rustls::pki_types::CertificateDer<'static>,
     accept: tokio::task::JoinHandle<()>,
@@ -56,6 +72,11 @@ impl Relay {
     /// Must be called from within a runtime: the accept loop is spawned here, so
     /// that a test can connect immediately rather than sequencing the two.
     pub fn start() -> Self {
+        Self::retaining(Limits::default())
+    }
+
+    /// Start a relay retaining history according to `limits`.
+    pub fn retaining(limits: Limits) -> Self {
         install_crypto_provider();
 
         let generated = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
@@ -75,7 +96,9 @@ impl Relay {
         .expect("binding a loopback port");
         let addr = server.local_addr().expect("bound address");
 
-        let fabric = Fabric::new();
+        let metrics = Metrics::new();
+        let fabric = Fabric::observed(Cache::new(limits), metrics.clone());
+        let surface = Surface::new(metrics.clone(), fabric.clone());
         let accept = tokio::spawn({
             let fabric = fabric.clone();
             async move {
@@ -94,9 +117,16 @@ impl Relay {
         Self {
             addr,
             fabric,
+            metrics,
+            surface,
             certificate,
             accept,
         }
+    }
+
+    /// The Prometheus exposition this relay would serve right now.
+    pub fn scrape(&self) -> String {
+        self.surface.respond("/metrics").body
     }
 }
 
@@ -240,6 +270,7 @@ impl Client {
                 let ok = SubscribeOk::decode(&mut frame.body.clone()).expect("a decodable answer");
                 Ok(Subscription {
                     alias: ok.track_alias,
+                    request_id: request.request_id,
                     _send: send,
                     _frames: frames,
                 })
@@ -284,26 +315,115 @@ impl Client {
 
     /// Write one subgroup of objects on a fresh unidirectional stream.
     pub async fn publish_subgroup(&self, alias: TrackAlias, payloads: &[&[u8]]) {
+        self.publish_group(alias, GroupId::ZERO, payloads).await;
+    }
+
+    /// Write one subgroup into a named group, numbering objects from zero.
+    pub async fn publish_group(&self, alias: TrackAlias, group: GroupId, payloads: &[&[u8]]) {
+        let numbered: Vec<(u32, &[u8])> = payloads
+            .iter()
+            .enumerate()
+            .map(|(index, payload)| (index as u32, *payload))
+            .collect();
+        self.publish_objects(alias, group, &numbered).await;
+    }
+
+    /// Write a subgroup carrying objects with the Object IDs given.
+    ///
+    /// Explicit IDs are what makes a hole expressible, which the gap tests need:
+    /// a subgroup that skips from object 1 to object 4 leaves two the relay has
+    /// never seen.
+    ///
+    /// Finishing the stream matters for the cache tests. The relay parses as bytes
+    /// arrive, so a stream left open leaves its last objects in flight.
+    pub async fn publish_objects(
+        &self,
+        alias: TrackAlias,
+        group: GroupId,
+        objects: &[(u32, &[u8])],
+    ) {
         let mut stream = self
             .session
             .open_uni()
             .await
             .expect("opening a data stream");
-        let header = SubgroupHeader::new(alias, GroupId::ZERO, SubgroupSource::Zero);
+        let header = SubgroupHeader::new(alias, group, SubgroupSource::Zero);
 
         let mut buf = BytesMut::new();
         header.encode(&mut buf);
         let mut writer = moqom_proto::data::SubgroupWriter::new(&header);
-        for (index, payload) in payloads.iter().enumerate() {
-            let object = moqom_proto::data::SubgroupObject::new(
-                index as u32,
-                Bytes::copy_from_slice(payload),
-            );
+        for (id, payload) in objects {
+            let object =
+                moqom_proto::data::SubgroupObject::new(*id, Bytes::copy_from_slice(payload));
             writer.write(&mut buf, &object).expect("a writable object");
         }
 
         stream.write_all(&buf).await.expect("writing a subgroup");
         stream.finish().expect("finishing a subgroup");
+    }
+
+    /// Fetch a range, reading both the answer and the objects it produces.
+    ///
+    /// The two arrive on different streams — the answer on the request stream,
+    /// the objects on a unidirectional one the relay opens — so this reads them
+    /// in that order, which is also the order the relay writes them.
+    pub async fn fetch(&mut self, kind: FetchKind) -> Result<Fetched, u64> {
+        let (mut send, recv) = self
+            .session
+            .open_bi()
+            .await
+            .expect("opening a request stream");
+        let request = Fetch::new(self.next_request(), kind);
+        write(&mut send, &request).await;
+
+        let mut frames = Frames::new(recv);
+        let frame = within("an answer to FETCH", frames.expect()).await;
+        match frame.message_type {
+            MessageType::FetchOk => {
+                let ok = FetchOk::decode(&mut frame.body.clone()).expect("a decodable FETCH_OK");
+                let records = self.read_fetch(request.request_id).await;
+                Ok(Fetched {
+                    end: ok.end,
+                    records,
+                    _send: send,
+                    _frames: frames,
+                })
+            }
+            MessageType::RequestError => {
+                let error = moqom_proto::control::RequestError::decode(&mut frame.body.clone())
+                    .expect("a decodable error");
+                Err(error.code.get())
+            }
+            other => panic!("unexpected {other:?} answering FETCH"),
+        }
+    }
+
+    /// Read one fetch data stream to its end.
+    async fn read_fetch(&self, expected: RequestId) -> Vec<FetchRecord> {
+        let recv = within("a fetch data stream", self.session.accept_uni())
+            .await
+            .expect("the relay opens a data stream");
+        let bytes = within("the fetch body", async move {
+            let mut recv = recv;
+            recv.read_to_end(1024 * 1024)
+                .await
+                .expect("reading a fetch stream")
+        })
+        .await;
+
+        let mut cursor = &bytes[..];
+        let header = FetchHeader::decode(&mut cursor).expect("a decodable fetch header");
+        assert_eq!(
+            header.request_id, expected,
+            "a fetch stream must name the request it answers"
+        );
+
+        let mut reader = FetchReader::new(GroupOrder::Ascending);
+        let mut records = Vec::new();
+        while !cursor.is_empty() {
+            records.push(reader.read(&mut cursor).expect("a decodable record"));
+        }
+        records
     }
 
     /// Read one forwarded subgroup: its header, and every payload on it.
@@ -341,8 +461,38 @@ impl Client {
 pub struct Subscription {
     /// The alias the relay assigned, which forwarded headers must carry.
     pub alias: TrackAlias,
+    /// The ID this subscription was requested with, which a joining fetch names.
+    pub request_id: RequestId,
     _send: SendStream,
     _frames: Frames,
+}
+
+/// An answered fetch: the range delivered, and the records on its data stream.
+pub struct Fetched {
+    /// The end the relay reported, which is the last location delivered plus one.
+    pub end: Location,
+    /// Every record on the fetch stream, in the order it arrived.
+    pub records: Vec<FetchRecord>,
+    _send: SendStream,
+    _frames: Frames,
+}
+
+impl Fetched {
+    /// The payloads of the objects delivered, ignoring gap markers.
+    pub fn payloads(&self) -> Vec<Bytes> {
+        self.records
+            .iter()
+            .filter_map(|record| match record {
+                FetchRecord::Object(object) => Some(object.payload.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Where each delivered record sits in the track.
+    pub fn locations(&self) -> Vec<Location> {
+        self.records.iter().map(FetchRecord::location).collect()
+    }
 }
 
 /// A subscription this peer is serving as publisher.

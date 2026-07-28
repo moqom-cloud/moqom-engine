@@ -8,6 +8,16 @@
 //! - `MOQOM_RELAY_CERT`, `MOQOM_RELAY_KEY` — PEM paths. Both or neither; with
 //!   neither, a self-signed certificate is generated for the names in
 //!   `MOQOM_RELAY_NAMES` (default `localhost`).
+//! - `MOQOM_RELAY_CACHE_GROUPS` — groups of history retained per track, which is
+//!   what a reconnecting client can ask for. `0` retains nothing and refuses
+//!   every fetch. Default 8.
+//! - `MOQOM_RELAY_CACHE_MB` — megabytes of history retained across all tracks.
+//!   Default 512.
+//! - `MOQOM_RELAY_ADMIN_ADDR` — address for the metrics and diagnostics
+//!   endpoints. Unset means no admin listener and no metrics collection at all,
+//!   which is the default because an observability port that appears without
+//!   being asked for is one that gets exposed by accident. See
+//!   [`moqom_relay::admin`] for what it serves and why it is a separate port.
 //!
 //! A generated certificate prints its SPKI hash to stdout as
 //! `certificate-hash: <base64>`, which is what a client needs to trust it. That
@@ -26,7 +36,8 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use base64::Engine as _;
-use moqom_relay::{Fabric, Session};
+use moqom_relay::admin::Surface;
+use moqom_relay::{Cache, Fabric, Limits, Metrics, Session};
 use moqom_transport::{Server, server::with_moqt_alpn};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -82,11 +93,48 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     io::Write::flush(&mut io::stdout())?;
     tracing::info!(%bound, "relay listening");
 
-    let fabric = Fabric::new();
+    let limits = cache_limits()?;
+    tracing::info!(
+        groups = limits.groups_per_track,
+        megabytes = limits.bytes_total / (1024 * 1024),
+        "retaining history"
+    );
+    // Metrics exist only when something can read them. A registry nobody scrapes
+    // is a per-object atomic add that no query will ever run against.
+    let admin_addr = match env("MOQOM_RELAY_ADMIN_ADDR") {
+        Some(value) => Some(value.parse::<SocketAddr>()?),
+        None => None,
+    };
+    let metrics = if admin_addr.is_some() {
+        Metrics::new()
+    } else {
+        tracing::info!("no MOQOM_RELAY_ADMIN_ADDR, so metrics are off");
+        Metrics::disabled()
+    };
+
+    let fabric = Fabric::observed(Cache::new(limits), metrics.clone());
+    let surface = Surface::new(metrics, fabric.clone());
+    if let Some(addr) = admin_addr {
+        let serving = surface.clone();
+        tokio::spawn(async move {
+            if let Err(e) = serving.serve(addr).await {
+                // Not fatal to the relay: losing the metrics endpoint is worth
+                // reporting loudly and is not worth dropping live broadcasts
+                // over.
+                tracing::error!(%addr, error = %e, "admin listener failed");
+            }
+        });
+    }
+
     loop {
         tokio::select! {
             () = shutdown() => {
                 tracing::info!("draining");
+                // Readiness drops before the drain begins, so a load balancer
+                // stops sending new connections while the existing ones finish.
+                // Doing it the other way round refuses traffic it was still
+                // capable of serving.
+                surface.draining();
                 server.shutdown().await;
                 return Ok(());
             }
@@ -100,7 +148,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 tokio::spawn(async move {
                     let peer = incoming.remote_address();
                     match incoming.establish().await {
-                        Err(e) => tracing::debug!(%peer, error = %e, "handshake failed"),
+                        Err(e) => {
+                            fabric.metrics().handshake_failed();
+                            tracing::debug!(%peer, error = %e, "handshake failed");
+                        }
                         Ok((session, negotiated)) => {
                             if let Err(e) =
                                 Session::serve(session, negotiated.carrier, fabric).await
@@ -142,6 +193,35 @@ async fn shutdown() {
 
 fn env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.is_empty())
+}
+
+/// How much history to retain, from the environment.
+///
+/// The per-track byte budget is derived rather than configured separately: one
+/// track should not be able to fill the process on its own, and a quarter of the
+/// total is a defensible share without adding a third knob nobody would tune.
+fn cache_limits() -> Result<Limits, Box<dyn std::error::Error>> {
+    let defaults = Limits::default();
+    let groups = match env("MOQOM_RELAY_CACHE_GROUPS") {
+        Some(value) => value
+            .parse()
+            .map_err(|e| format!("MOQOM_RELAY_CACHE_GROUPS is not a count: {e}"))?,
+        None => defaults.groups_per_track,
+    };
+    let total = match env("MOQOM_RELAY_CACHE_MB") {
+        Some(value) => value
+            .parse::<usize>()
+            .map_err(|e| format!("MOQOM_RELAY_CACHE_MB is not a count: {e}"))?
+            * 1024
+            * 1024,
+        None => defaults.bytes_total,
+    };
+
+    Ok(Limits {
+        groups_per_track: groups,
+        bytes_per_track: (total / 4).max(1),
+        bytes_total: total,
+    })
 }
 
 fn env_path(key: &str) -> Option<PathBuf> {

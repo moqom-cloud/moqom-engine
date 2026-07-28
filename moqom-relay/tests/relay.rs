@@ -14,6 +14,11 @@
 
 mod support;
 
+use moqom_proto::control::FetchKind;
+use moqom_proto::data::FetchRecord;
+use moqom_proto::model::{FetchEnd, GroupId, Location, ObjectId, TrackAlias};
+use moqom_proto::varint::VarInt;
+use moqom_relay::Limits;
 use support::{Announced, Client, Relay, namespace, track, within};
 
 /// SETUP, both directions, over raw QUIC with the `moqt-19` ALPN.
@@ -241,4 +246,376 @@ async fn every_subscriber_gets_the_objects_under_its_own_alias() {
     assert_ne!(two.alias, upstream);
     assert_eq!(payloads_one, payloads_two);
     assert_eq!(payloads_one, vec![bytes::Bytes::from_static(b"shared")]);
+}
+
+// MARK: - Retained history
+
+/// A publisher, a subscriber pulling its track, and some groups already gone by.
+///
+/// Returned in a struct because every history test needs all of it alive: drop
+/// the announcement and the namespace goes, drop the subscription and the relay
+/// stops pulling.
+struct Broadcast {
+    relay: Relay,
+    publisher: Client,
+    subscriber: Client,
+    track: moqom_proto::model::FullTrackName,
+    subscription: support::Subscription,
+    _announcement: support::Announcement,
+    /// The publisher's side of the relay's upstream subscription. Held because
+    /// dropping it resets that request stream, which the relay reads as a
+    /// cancellation and answers by tearing down the route.
+    _served: support::Served,
+}
+
+/// Set up a broadcast and publish `groups` groups of two objects each.
+///
+/// The subscriber exists because the relay only pulls a track somebody has
+/// subscribed to — with no subscriber there is no upstream subscription, no
+/// forwarded objects, and so nothing to retain.
+///
+/// Boxed rather than `async fn` because the body holds two clients, each with a
+/// QUIC endpoint, and inlining that into every caller's future makes each test a
+/// twenty-kilobyte stack frame.
+fn broadcast(relay: Relay, groups: u32) -> impl Future<Output = Broadcast> {
+    Box::pin(setup(relay, groups))
+}
+
+async fn setup(relay: Relay, groups: u32) -> Broadcast {
+    let mut publisher = Client::connect(&relay).await;
+    let mut subscriber = Client::connect(&relay).await;
+
+    let room = namespace(&["acme", "room-42"]);
+    let announcement = publisher.announce(&room).await;
+    within("the announcement to register", async {
+        while relay.fabric.namespaces().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+
+    let video = track(&["acme", "room-42"], "video");
+    let upstream = TrackAlias::from(7_u32);
+    let (served, subscription) = tokio::join!(
+        publisher.answer_subscription(upstream),
+        subscriber.subscribe(&video),
+    );
+    let subscription = subscription.expect("the relay accepts the subscription");
+
+    for group in 0..groups {
+        publisher
+            .publish_group(
+                upstream,
+                GroupId::from(group),
+                &[
+                    format!("g{group}o0").as_bytes(),
+                    format!("g{group}o1").as_bytes(),
+                ],
+            )
+            .await;
+        // Read it downstream before publishing the next, so the relay has
+        // finished parsing this group into the cache. Without this the test races
+        // its own setup.
+        let (_header, payloads) = subscriber.read_subgroup().await;
+        assert_eq!(payloads.len(), 2, "group {group} should have forwarded");
+    }
+
+    Broadcast {
+        relay,
+        publisher,
+        subscriber,
+        track: video,
+        subscription,
+        _announcement: announcement,
+        _served: served,
+    }
+}
+
+fn location(group: u32, object: u32) -> Location {
+    Location::new(GroupId::from(group), ObjectId::from(object))
+}
+
+/// The end-to-end version of the whole feature: objects that already went by are
+/// fetchable from the relay, not just from the publisher.
+///
+/// The publisher here never answers a fetch — the harness has no code for it — so
+/// a passing test can only mean the relay answered from its own history.
+#[tokio::test]
+async fn a_fetch_is_answered_from_retained_history() {
+    let mut show = broadcast(Relay::start(), 3).await;
+
+    let fetched = show
+        .subscriber
+        .fetch(FetchKind::Standalone {
+            track: show.track.clone(),
+            start: location(1, 0),
+            end: FetchEnd::EndOfGroup(GroupId::from(1u32))
+                .wire()
+                .expect("representable"),
+        })
+        .await
+        .expect("the relay serves the range");
+
+    assert_eq!(
+        fetched.payloads(),
+        vec![
+            bytes::Bytes::from_static(b"g1o0"),
+            bytes::Bytes::from_static(b"g1o1")
+        ]
+    );
+    assert_eq!(fetched.locations(), vec![location(1, 0), location(1, 1)]);
+    // The reported end is the last object delivered plus one, which is what lets
+    // a client tell a clipped range from a complete one.
+    assert_eq!(fetched.end, location(1, 2));
+}
+
+/// A fetch spanning several groups comes back as one stream, in order.
+#[tokio::test]
+async fn a_fetch_can_span_groups() {
+    let mut show = broadcast(Relay::start(), 3).await;
+
+    let fetched = show
+        .subscriber
+        .fetch(FetchKind::Standalone {
+            track: show.track.clone(),
+            start: Location::ZERO,
+            end: FetchEnd::EndOfGroup(GroupId::from(2u32))
+                .wire()
+                .expect("representable"),
+        })
+        .await
+        .expect("the relay serves the range");
+
+    assert_eq!(fetched.payloads().len(), 6);
+    assert_eq!(
+        fetched.locations(),
+        vec![
+            location(0, 0),
+            location(0, 1),
+            location(1, 0),
+            location(1, 1),
+            location(2, 0),
+            location(2, 1),
+        ],
+        "groups ascend and objects ascend within them"
+    );
+}
+
+/// The reconnection case, which is what all of this is for: a client that was
+/// away asks for everything since where it stopped and gets what is still held.
+#[tokio::test]
+async fn a_client_that_missed_objects_can_ask_for_them() {
+    // Deliberately tighter than the broadcast, so the answer has to be clipped
+    // to retention rather than to the request.
+    let relay = Relay::retaining(Limits {
+        groups_per_track: 2,
+        ..Limits::default()
+    });
+    let mut show = broadcast(relay, 4).await;
+
+    let fetched = show
+        .subscriber
+        .fetch(FetchKind::Standalone {
+            track: show.track.clone(),
+            // From the start of the broadcast, most of which is long gone.
+            start: Location::ZERO,
+            end: FetchEnd::EndOfGroup(GroupId::from(3u32))
+                .wire()
+                .expect("representable"),
+        })
+        .await
+        .expect("the relay serves what it still has");
+
+    assert_eq!(
+        fetched.locations(),
+        vec![
+            location(2, 0),
+            location(2, 1),
+            location(3, 0),
+            location(3, 1),
+        ],
+        "the answer starts where retention does, not where the client asked"
+    );
+    // And it says so: the end reported is the end delivered, so a client can see
+    // its request was clipped rather than assume it received everything.
+    assert_eq!(fetched.end, location(3, 2));
+}
+
+/// A joining fetch names a subscription rather than a track, and the relay
+/// derives the range from it. This is what a client actually sends on subscribing:
+/// it is the warm start that makes a joined stream show a picture immediately.
+#[tokio::test]
+async fn a_joining_fetch_resolves_its_subscription() {
+    let mut show = broadcast(Relay::start(), 3).await;
+
+    let fetched = show
+        .subscriber
+        .fetch(FetchKind::RelativeJoining {
+            request_id: show.subscription.request_id,
+            preceding_groups: VarInt::from(1u32),
+        })
+        .await
+        .expect("the relay resolves the subscription");
+
+    // One group back from the live edge, through the edge itself.
+    assert_eq!(
+        fetched.locations(),
+        vec![
+            location(1, 0),
+            location(1, 1),
+            location(2, 0),
+            location(2, 1),
+        ]
+    );
+}
+
+/// A joining fetch naming a subscription that does not exist is refused rather
+/// than answered from whatever track happened to be handy.
+#[tokio::test]
+async fn a_joining_fetch_for_an_unknown_subscription_is_refused() {
+    let mut show = broadcast(Relay::start(), 2).await;
+
+    let outcome = show
+        .subscriber
+        .fetch(FetchKind::RelativeJoining {
+            // A client-allocated ID this session never used for a subscription.
+            request_id: moqom_proto::control::RequestId::new(4242).unwrap(),
+            preceding_groups: VarInt::from(1u32),
+        })
+        .await;
+
+    assert_eq!(
+        outcome.err(),
+        Some(moqom_proto::control::RequestErrorCode::DOES_NOT_EXIST.get())
+    );
+}
+
+/// A range the relay holds nothing for is refused, not answered with an empty
+/// stream. An empty stream reads as "these objects do not exist", which would
+/// stop a client asking anyone who does have them.
+#[tokio::test]
+async fn a_range_with_no_history_is_refused() {
+    let mut show = broadcast(Relay::start(), 2).await;
+
+    let outcome = show
+        .subscriber
+        .fetch(FetchKind::Standalone {
+            track: show.track.clone(),
+            start: location(900, 0),
+            end: FetchEnd::EndOfGroup(GroupId::from(901u32))
+                .wire()
+                .expect("representable"),
+        })
+        .await;
+
+    assert_eq!(
+        outcome.err(),
+        Some(moqom_proto::control::RequestErrorCode::DOES_NOT_EXIST.get())
+    );
+}
+
+/// A fetch for a track nobody ever published is refused.
+#[tokio::test]
+async fn a_fetch_for_an_unknown_track_is_refused() {
+    let relay = Relay::start();
+    let mut client = Client::connect(&relay).await;
+
+    let outcome = client
+        .fetch(FetchKind::Standalone {
+            track: track(&["acme", "nothing"], "video"),
+            start: Location::ZERO,
+            end: FetchEnd::EndOfGroup(GroupId::ZERO)
+                .wire()
+                .expect("representable"),
+        })
+        .await;
+
+    assert_eq!(
+        outcome.err(),
+        Some(moqom_proto::control::RequestErrorCode::DOES_NOT_EXIST.get())
+    );
+}
+
+/// Retention is bounded, and the bound is enforced on the real path rather than
+/// only in the cache's own tests.
+#[tokio::test]
+async fn retention_is_bounded_on_the_wire() {
+    let relay = Relay::retaining(Limits {
+        groups_per_track: 2,
+        ..Limits::default()
+    });
+    let show = broadcast(relay, 5).await;
+
+    let stats = show.relay.fabric.cache().stats();
+    assert_eq!(stats.groups, 2, "only the last two groups are kept");
+    assert_eq!(stats.objects, 4);
+}
+
+/// A relay configured to retain nothing refuses every fetch, and forwarding still
+/// works. Operators who cannot store media at all need this to be a supported
+/// configuration rather than a broken one.
+#[tokio::test]
+async fn a_relay_can_retain_nothing() {
+    let relay = Relay::retaining(Limits::none());
+    let mut show = broadcast(relay, 2).await;
+
+    assert_eq!(show.relay.fabric.cache().stats().objects, 0);
+    let outcome = show
+        .subscriber
+        .fetch(FetchKind::Standalone {
+            track: show.track.clone(),
+            start: Location::ZERO,
+            end: FetchEnd::EndOfGroup(GroupId::from(1u32))
+                .wire()
+                .expect("representable"),
+        })
+        .await;
+    assert!(outcome.is_err(), "nothing was retained to serve");
+}
+
+/// A hole in what the relay holds comes back as a marker saying so, rather than
+/// as a stream that quietly skips it. The distinction is what tells a client
+/// whether to ask somebody else.
+#[tokio::test]
+async fn a_gap_is_reported_rather_than_skipped() {
+    let mut show = broadcast(Relay::start(), 1).await;
+
+    // A second subgroup in the same group, with a hole where objects 2 and 3
+    // would be. Published directly rather than through the helper because the
+    // helper always starts at object zero.
+    let upstream = TrackAlias::from(7_u32);
+    show.publisher
+        .publish_objects(upstream, GroupId::ZERO, &[(4, b"late")])
+        .await;
+    let (_header, payloads) = show.subscriber.read_subgroup().await;
+    assert_eq!(payloads.len(), 1);
+
+    let fetched = show
+        .subscriber
+        .fetch(FetchKind::Standalone {
+            track: show.track.clone(),
+            start: Location::ZERO,
+            end: FetchEnd::EndOfGroup(GroupId::ZERO)
+                .wire()
+                .expect("representable"),
+        })
+        .await
+        .expect("the relay serves what it has");
+
+    assert!(
+        fetched
+            .records
+            .iter()
+            .any(|record| matches!(record, FetchRecord::EndOfUnknownRange(_))),
+        "expected a gap marker covering the missing objects, got {:?}",
+        fetched.records
+    );
+    assert_eq!(
+        fetched.payloads(),
+        vec![
+            bytes::Bytes::from_static(b"g0o0"),
+            bytes::Bytes::from_static(b"g0o1"),
+            bytes::Bytes::from_static(b"late"),
+        ]
+    );
 }

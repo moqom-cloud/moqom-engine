@@ -33,9 +33,11 @@
 //!   a relay is for: the bandwidth saving from fanning out one copy is most of
 //!   the point. Fixing it means a per-track record between the fabric and the
 //!   route table, and it is the next thing to do here.
-//! - There is no cache, so no FETCH: a fetch needs retained history and this
-//!   holds none. Catch-up therefore only works against a publisher that answers
-//!   fetches itself.
+//! - Recent objects are retained ([`cache`]) and FETCH is served from them, so a
+//!   late joiner can warm-start on the group in progress and a client that
+//!   dropped its connection can ask for what it missed. Retention is bounded, so
+//!   an outage longer than the window is answered with the gap markers that say
+//!   so rather than with silence.
 //! - There is no congestion-aware scheduling. Objects go out in the order they
 //!   arrive, and a subscriber that cannot keep up applies back pressure to the
 //!   publisher, which is the wrong direction — one slow viewer should be dropped
@@ -50,8 +52,13 @@
 
 #![forbid(unsafe_code)]
 
+pub mod admin;
+pub mod cache;
 pub mod fabric;
+pub mod metrics;
 pub mod session;
 
+pub use cache::{Cache, Limits};
 pub use fabric::Fabric;
+pub use metrics::Metrics;
 pub use session::{Session, SessionError};

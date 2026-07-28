@@ -20,11 +20,18 @@
 //!
 //! Every object belongs to exactly one subgroup *or* is a datagram, in which
 //! case it has no subgroup at all.
+//!
+//! [`layout`] is the exception to all of this: it is MOQOM's own convention for
+//! what goes in which namespace field, not anything draft-19 defines. It lives
+//! here because it is the inverse of the tuples the client builds, and both
+//! sides have to agree.
 
 pub mod ids;
+pub mod layout;
 pub mod name;
 pub mod object;
 
-pub use ids::{GroupId, Location, ObjectId, ObjectSeq, SubgroupId, TrackAlias};
+pub use ids::{FetchEnd, GroupId, Location, ObjectId, ObjectSeq, SubgroupId, TrackAlias};
+pub use layout::{Kind, Participant, Scope};
 pub use name::{FullTrackName, NameError, TrackNamespace};
 pub use object::ObjectStatus;

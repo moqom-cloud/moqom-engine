@@ -37,6 +37,9 @@ use moqom_proto::control::RequestErrorCode;
 use moqom_proto::model::{FullTrackName, TrackAlias, TrackNamespace};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::cache::Cache;
+use crate::metrics::Metrics;
+
 /// Identifies a session within one relay process.
 ///
 /// Not a protocol value and never sent on the wire — it exists so an
@@ -44,6 +47,18 @@ use tokio::sync::{mpsc, oneshot};
 /// when that session ends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SessionId(u64);
+
+impl SessionId {
+    /// The bare number, for output that has its own field for it.
+    ///
+    /// Everything human-facing should use [`Display`](std::fmt::Display), which
+    /// prefixes it — a bare integer in a log line is indistinguishable from any
+    /// other integer in that log line.
+    #[must_use]
+    pub const fn number(self) -> u64 {
+        self.0
+    }
+}
 
 impl std::fmt::Display for SessionId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -172,13 +187,56 @@ struct State {
 pub struct Fabric {
     state: Arc<Mutex<State>>,
     next_session: Arc<AtomicU64>,
+    /// Retained history, shared for the same reason announcements are: a fetch
+    /// arrives on a different session from the one that published the objects,
+    /// and the track name is the only thing the two have in common.
+    cache: Cache,
+    /// What the process counts about itself.
+    ///
+    /// Here rather than passed to [`crate::Session::serve`] because it is shared
+    /// per-relay state, which is what this type is for — and because threading a
+    /// second argument through every constructor would make instrumenting a new
+    /// code path a signature change rather than a one-line call.
+    metrics: Metrics,
 }
 
 impl Fabric {
-    /// An empty fabric.
+    /// An empty fabric, retaining [`crate::Limits::default()`] of history and
+    /// counting nothing.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// An empty fabric retaining history according to `cache`.
+    #[must_use]
+    pub fn with_cache(cache: Cache) -> Self {
+        Self {
+            cache,
+            ..Self::default()
+        }
+    }
+
+    /// An empty fabric that retains history and reports on itself.
+    #[must_use]
+    pub fn observed(cache: Cache, metrics: Metrics) -> Self {
+        Self {
+            cache,
+            metrics,
+            ..Self::default()
+        }
+    }
+
+    /// The shared object cache.
+    #[must_use]
+    pub const fn cache(&self) -> &Cache {
+        &self.cache
+    }
+
+    /// What this process counts.
+    #[must_use]
+    pub const fn metrics(&self) -> &Metrics {
+        &self.metrics
     }
 
     /// Allocate an identifier for a newly accepted session.
@@ -306,6 +364,25 @@ impl Fabric {
     #[must_use]
     pub fn namespaces(&self) -> Vec<TrackNamespace> {
         self.lock().namespaces.keys().cloned().collect()
+    }
+
+    /// Every announcement with the session holding it.
+    ///
+    /// One namespace can appear more than once, because a reconnecting publisher
+    /// re-announces before the relay has reaped its previous session. Callers
+    /// counting participants have to collapse those; callers listing what a
+    /// session publishes want them separate.
+    #[must_use]
+    pub fn announcements(&self) -> Vec<(TrackNamespace, SessionId)> {
+        self.lock()
+            .namespaces
+            .iter()
+            .flat_map(|(namespace, holders)| {
+                holders
+                    .iter()
+                    .map(move |holder| (namespace.clone(), holder.owner))
+            })
+            .collect()
     }
 }
 

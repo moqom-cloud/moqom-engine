@@ -37,18 +37,24 @@ use std::sync::{Arc, Mutex};
 
 use bytes::{Buf, Bytes, BytesMut};
 use moqom_proto::control::{
-    ControlFrame, MessageBody, MessageType, Namespace, NamespaceDone, PublishNamespace,
-    ReasonPhrase, RequestError, RequestErrorCode, RequestId, RequestIdGenerator, Role, Setup,
-    Subscribe, SubscribeNamespace, SubscribeOk, setup, write_message,
+    ControlFrame, Fetch, FetchKind, FetchOk, MessageBody, MessageType, Namespace, NamespaceDone,
+    PublishNamespace, ReasonPhrase, RequestError, RequestErrorCode, RequestId, RequestIdGenerator,
+    Role, Setup, Subscribe, SubscribeNamespace, SubscribeOk, setup, write_message,
 };
-use moqom_proto::data::SubgroupHeader;
+use moqom_proto::data::{
+    FetchHeader, FetchRecord, FetchWriter, GroupOrder, SubgroupHeader, SubgroupReader,
+};
 use moqom_proto::error::DecodeError;
-use moqom_proto::model::{FullTrackName, TrackAlias, TrackNamespace};
+use moqom_proto::model::{
+    FetchEnd, FullTrackName, GroupId, Location, ObjectId, TrackAlias, TrackNamespace,
+};
 use moqom_proto::varint::VarInt;
 use tokio::sync::{mpsc, oneshot};
 use web_transport_quinn::{RecvStream, SendStream};
 
 use crate::fabric::{Command, Fabric, NamespaceEvent, Route, SessionId, UpstreamError};
+use crate::metrics::{Ending, Fetched, Metrics, Subscribed};
+use crate::{cache, metrics};
 
 /// Identifies this build in Setup Options, for the other end's logs.
 const IMPLEMENTATION: &[u8] = concat!("moqom-relay/", env!("CARGO_PKG_VERSION")).as_bytes();
@@ -91,6 +97,35 @@ pub enum SessionError {
     /// A stream ended in the middle of a message.
     #[error("stream ended mid-message")]
     Truncated,
+}
+
+impl Ending {
+    /// Classify how a session finished, for the counter that says whether a
+    /// spike of disconnections is the network's fault or the peer's.
+    ///
+    /// Deliberately has no catch-all arm. [`SessionError`] is `non_exhaustive`
+    /// to other crates but not to this one, so adding a variant breaks this
+    /// match — which is the point. A new failure silently folded into an
+    /// existing bucket is a new failure nobody can see.
+    fn of(result: &Result<(), SessionError>) -> Self {
+        match result {
+            Ok(()) => Self::Clean,
+            // A peer that sent something illegal or unparseable broke the
+            // protocol; that these are three variants is about how the error was
+            // detected, not about whose fault it was.
+            Err(SessionError::Protocol(_) | SessionError::Setup(_) | SessionError::Decode(_)) => {
+                Self::Protocol
+            }
+            // A stream that stopped mid-message is a connection that went away,
+            // not a peer that lied: the bytes it did send were well formed.
+            Err(
+                SessionError::Transport(_)
+                | SessionError::Read(_)
+                | SessionError::Write(_)
+                | SessionError::Truncated,
+            ) => Self::Transport,
+        }
+    }
 }
 
 /// Application error codes this relay closes sessions with.
@@ -213,6 +248,19 @@ pub struct Session {
     requests: Arc<Mutex<RequestIdGenerator>>,
     /// Reaches this session's own command loop.
     commands: mpsc::Sender<Command>,
+    /// Which track each upstream alias carries, so forwarded objects can be
+    /// attributed to a track name for the cache.
+    ///
+    /// Subgroup headers carry an alias and nothing else, and an alias is only
+    /// meaningful within the session that assigned it — so without this a
+    /// forwarded object cannot be filed anywhere a fetch could find it.
+    pulling: Arc<Mutex<HashMap<TrackAlias, FullTrackName>>>,
+    /// Tracks this peer has subscribed to, by the Request ID it used.
+    ///
+    /// A joining fetch names a subscription rather than a track, on purpose:
+    /// deriving the range's end from the subscription is what makes the fetch and
+    /// the subscription provably contiguous. Resolving that reference needs this.
+    subscribed: Arc<Mutex<HashMap<RequestId, FullTrackName>>>,
 }
 
 /// Identity and carrier only. The rest is a connection, a lock, and channels,
@@ -261,10 +309,23 @@ impl Session {
             next_alias: Arc::new(AtomicU64::new(0)),
             requests: Arc::new(Mutex::new(RequestIdGenerator::new(Role::Server))),
             commands,
+            pulling: Arc::default(),
+            subscribed: Arc::default(),
         };
 
         let result = session.run(command_queue).await;
         fabric.remove_session(id);
+        let ending = Ending::of(&result);
+        fabric.metrics().session_ended(id, ending);
+        // The one lifecycle event that was missing: a session that ends cleanly
+        // used to leave no trace at all, so "did that publisher disconnect or
+        // did we drop it" was unanswerable from the logs.
+        tracing::info!(
+            session = %id,
+            outcome = ?ending,
+            error = result.as_ref().err().map(tracing::field::display),
+            "session ended"
+        );
 
         match &result {
             Ok(()) => session.transport.close(0, b"bye"),
@@ -288,20 +349,88 @@ impl Session {
         self.lock_routes().len()
     }
 
+    /// The QUIC connection under the session.
+    ///
+    /// Reached through `Deref` rather than by holding a second handle.
+    /// `web_transport_quinn::Session` has its own `stats` whose fields are
+    /// private, so naming the target type is what selects the one with the
+    /// numbers in it.
+    fn connection(&self) -> &quinn::Connection {
+        &self.transport
+    }
+
     async fn run(&self, commands: mpsc::Receiver<Command>) -> Result<(), SessionError> {
         let (mut control_send, control_recv) = self.transport.accept_bi().await?;
         let mut control = Frames::new(control_recv);
         self.handshake(&mut control_send, &mut control).await?;
-        tracing::info!(session = %self.id, carrier = ?self.carrier, "session established");
+
+        let peer = self.connection().remote_address();
+        let live = self.fabric.metrics().session_started(
+            self.id,
+            peer.to_string(),
+            self.carrier,
+        );
+        // Peer and session identifier together, once, at the point both are
+        // known. Every later line carries the identifier alone, which is what
+        // makes this the line that joins a connection to its address.
+        tracing::info!(
+            session = %self.id,
+            %peer,
+            carrier = ?self.carrier,
+            "session established"
+        );
 
         // Three loops rather than one `select!` over the accept futures: whether
         // `accept_bi` is cancel-safe is not something to bet a dropped stream
         // on, and separating them means each is only ever cancelled when the
         // session is already ending.
+        //
+        // The sampler is a fourth arm rather than a spawned task so that it is
+        // cancelled by the same mechanism as everything else. A spawned sampler
+        // would need its own shutdown signal, and the failure mode of getting
+        // that wrong is a task per dead connection, polling a closed one
+        // forever.
         tokio::select! {
             result = self.serve_control(control_send, control, commands) => result,
             result = self.accept_requests() => result,
             result = self.accept_data() => result,
+            result = self.sample_transport(live.as_deref()) => result,
+        }
+    }
+
+    /// Fold this connection's transport state into the metrics, forever.
+    ///
+    /// Never returns, so it never wins the `select!` it sits in. With metrics
+    /// disabled it parks instead of spinning: there is nowhere to put a reading.
+    async fn sample_transport(&self, live: Option<&metrics::Live>) -> Result<(), SessionError> {
+        let Some(live) = live else {
+            return std::future::pending().await;
+        };
+
+        let metrics = self.fabric.metrics();
+        let mut previous = metrics::Sample::default();
+        let mut ticker = tokio::time::interval(metrics::SAMPLE_INTERVAL);
+        // The first tick fires immediately, which would sample a connection that
+        // has barely sent a packet. Skipping it costs one interval of history and
+        // avoids seeding every RTT histogram with a handshake-time estimate.
+        ticker.tick().await;
+
+        loop {
+            ticker.tick().await;
+            let connection = self.connection();
+            let stats = connection.stats();
+            let current = metrics::Sample {
+                rtt: connection.rtt(),
+                cwnd: stats.path.cwnd,
+                lost_packets: stats.path.lost_packets,
+                congestion_events: stats.path.congestion_events,
+                udp_tx_bytes: stats.udp_tx.bytes,
+                udp_rx_bytes: stats.udp_rx.bytes,
+                mtu: stats.path.current_mtu,
+            };
+            metrics.sample(live, previous, current);
+            metrics.forwarding(live, self.forwarded_tracks());
+            previous = current;
         }
     }
 
@@ -429,6 +558,7 @@ impl Session {
                     .await
             }
             MessageType::Subscribe => self.on_subscribe(&frame, &mut send_stream).await,
+            MessageType::Fetch => self.on_fetch(&frame, &mut send_stream).await,
             other => {
                 tracing::debug!(session = %self.id, ?other, "unsupported request");
                 send(
@@ -466,6 +596,7 @@ impl Session {
             namespace = %request.namespace,
             "namespace announced"
         );
+        self.fabric.metrics().announced();
         self.fabric
             .announce(self.id, request.namespace.clone(), self.commands.clone());
 
@@ -556,6 +687,7 @@ impl Session {
 
         let Some(publisher) = self.fabric.publisher(track.namespace()) else {
             tracing::debug!(session = %self.id, %track, "no publisher for namespace");
+            self.fabric.metrics().subscribed(Subscribed::NoPublisher);
             return send(
                 send_stream,
                 &RequestError::new(
@@ -590,10 +722,16 @@ impl Session {
         match upstream {
             Ok(()) => {
                 tracing::info!(session = %self.id, %track, %alias, "subscription established");
+                self.fabric.metrics().subscribed(Subscribed::Established);
+                // Recorded only once established, so a joining fetch cannot name
+                // a subscription that was refused.
+                self.lock_subscribed()
+                    .insert(request.request_id, track.clone());
                 send(send_stream, &SubscribeOk::new(alias)).await
             }
             Err(e) => {
                 tracing::debug!(session = %self.id, %track, error = %e, "upstream refused");
+                self.fabric.metrics().subscribed(Subscribed::Refused);
                 send(
                     send_stream,
                     &RequestError::new(e.code, ReasonPhrase::truncating(&e.reason)),
@@ -601,6 +739,161 @@ impl Session {
                 .await
             }
         }
+    }
+
+    /// Answer a fetch from retained history.
+    ///
+    /// `FETCH_OK` reports the range that will *actually* be delivered, which is
+    /// where a request asking for more than exists gets clipped to reality — so it
+    /// cannot be sent until the answer is known. The objects then go out on their
+    /// own unidirectional stream, which is why this looks like a subscription in
+    /// reverse: the response arrives on the request stream and the media does not.
+    async fn on_fetch(
+        &self,
+        frame: &ControlFrame,
+        send_stream: &mut SendStream,
+    ) -> Result<(), SessionError> {
+        let request = Fetch::decode(&mut frame.body.clone())?;
+        let cache = self.fabric.cache();
+
+        let refuse = |code, reason: &str| RequestError::new(code, ReasonPhrase::truncating(reason));
+
+        let Some((track, start, end)) = self.resolve_fetch(&request.kind) else {
+            tracing::debug!(session = %self.id, "fetch names something this relay cannot resolve");
+            self.fabric.metrics().fetched(Fetched::Unresolvable, 0);
+            return send(
+                send_stream,
+                &refuse(
+                    RequestErrorCode::DOES_NOT_EXIST,
+                    "no such track or subscription here",
+                ),
+            )
+            .await;
+        };
+
+        let order = GroupOrder::Ascending;
+        let records = cache.fetch(&track, start, end, order);
+        if records.is_empty() {
+            // Nothing to say about this range, which is different from saying the
+            // range is empty. An empty stream would be read as "these objects do
+            // not exist" and stop the client asking anyone else.
+            tracing::debug!(session = %self.id, %track, "no retained history for this range");
+            self.fabric.metrics().fetched(Fetched::NoHistory, 0);
+            return send(
+                send_stream,
+                &refuse(
+                    RequestErrorCode::DOES_NOT_EXIST,
+                    "no retained history for that range",
+                ),
+            )
+            .await;
+        }
+
+        // The delivered end, not the requested one: the furthest location this
+        // answer reaches, plus one. Taken as a maximum rather than as the last
+        // record, because under descending order the last record is the *lowest*
+        // location on the stream.
+        let reached = records
+            .iter()
+            .map(FetchRecord::location)
+            .max()
+            .unwrap_or(Location::ZERO);
+        let Some(wire_end) = FetchEnd::Through(reached).wire() else {
+            self.fabric.metrics().fetched(Fetched::Unnameable, 0);
+            return send(
+                send_stream,
+                &refuse(RequestErrorCode::INTERNAL_ERROR, "range end is unnameable"),
+            )
+            .await;
+        };
+
+        send(send_stream, &FetchOk::new(wire_end)).await?;
+
+        let count = records.len();
+        self.fabric.metrics().fetched(Fetched::Served, count);
+        let request_id = request.request_id;
+        let session = self.clone();
+        // Spawned so the request stream is free to carry a cancellation while the
+        // objects are still going out. A fetch of several groups is a lot of
+        // bytes, and holding this task on the write would make the cancel
+        // unreadable until the write it is trying to cancel had finished.
+        tokio::spawn(async move {
+            if let Err(e) = session.write_fetch(request_id, &records, order).await {
+                tracing::debug!(session = %session.id, error = %e, "fetch delivery failed");
+            } else {
+                tracing::info!(session = %session.id, objects = count, "fetch delivered");
+            }
+        });
+        Ok(())
+    }
+
+    /// What a fetch is asking for, as a track and a range.
+    ///
+    /// The joining forms name a subscription instead of a track, and their range
+    /// ends at that subscription's live edge — which the *publisher* has to
+    /// compute, because a client working it out locally would be racing the edge
+    /// it is trying to meet.
+    fn resolve_fetch(&self, kind: &FetchKind) -> Option<(FullTrackName, Location, FetchEnd)> {
+        match kind {
+            FetchKind::Standalone { track, start, end } => {
+                Some((track.clone(), *start, FetchEnd::from_wire(*end)))
+            }
+
+            FetchKind::RelativeJoining {
+                request_id,
+                preceding_groups,
+            } => {
+                let track = self.lock_subscribed().get(request_id).cloned()?;
+                // A subscription starts at the *next* group, so the group in
+                // progress is the first one it will not deliver. Counting back
+                // from there is what makes the fetch and the subscription
+                // contiguous with neither a gap nor an overlap.
+                let live = self.fabric.cache().largest(&track)?;
+                let first = live.group.get().saturating_sub(preceding_groups.get());
+                let start = Location::new(
+                    GroupId::new(VarInt::new(first).unwrap_or(VarInt::ZERO)),
+                    ObjectId::ZERO,
+                );
+                Some((track, start, FetchEnd::Through(live)))
+            }
+
+            FetchKind::AbsoluteJoining {
+                request_id,
+                start_group,
+            } => {
+                let track = self.lock_subscribed().get(request_id).cloned()?;
+                let live = self.fabric.cache().largest(&track)?;
+                let start = Location::new(GroupId::new(*start_group), ObjectId::ZERO);
+                Some((track, start, FetchEnd::Through(live)))
+            }
+        }
+    }
+
+    /// Write a fetch's objects on their own unidirectional stream.
+    async fn write_fetch(
+        &self,
+        request_id: RequestId,
+        records: &[FetchRecord],
+        order: GroupOrder,
+    ) -> Result<(), SessionError> {
+        let mut stream = self.transport.open_uni().await?;
+        let mut buf = BytesMut::new();
+        FetchHeader::new(request_id).encode(&mut buf);
+
+        let mut writer = FetchWriter::new(order);
+        for record in records {
+            // A refusal here means the cache produced records out of order, which
+            // is this relay's bug rather than the peer's. Sending a partial stream
+            // is still the better outcome: the client can tell where it stopped.
+            if let Err(e) = writer.write(&mut buf, record) {
+                tracing::warn!(session = %self.id, error = %e, "cache produced an unorderable answer");
+                break;
+            }
+        }
+
+        stream.write_all(&buf).await?;
+        let _ = stream.finish();
+        Ok(())
     }
 
     // MARK: - Requests to the peer
@@ -661,6 +954,7 @@ impl Session {
                 let downstream = route.alias;
                 let upstream = ok.track_alias;
                 self.add_route(upstream, route);
+                self.lock_pulling().insert(upstream, track.clone());
                 tracing::info!(
                     session = %self.id,
                     %track,
@@ -702,8 +996,12 @@ impl Session {
     /// Copy one incoming subgroup to every subscriber of its track.
     ///
     /// The header is re-encoded per destination because the alias differs;
-    /// everything after it is copied verbatim. The relay never looks at an
-    /// object, which is what lets payloads stay encrypted end to end.
+    /// everything after it is copied verbatim. The relay never *has* to look at
+    /// an object, which is what lets payloads stay encrypted end to end.
+    ///
+    /// It does look, on a copy, to fill the cache — see [`Tee`]. That parse is
+    /// downstream of the fan-out in every sense: it reads bytes already sent, and
+    /// a stream it cannot parse costs a cache miss rather than a dropped forward.
     async fn forward_subgroup(&self, recv: RecvStream) {
         let mut frames = Frames::new(recv);
         // A subgroup stream is not length-delimited, so the header is read
@@ -718,8 +1016,10 @@ impl Session {
             }
         };
 
+        let metrics = self.fabric.metrics();
         let routes = self.routes_for(header.track_alias);
-        if routes.is_empty() {
+        let mut tee = self.tee(&header);
+        if routes.is_empty() && tee.is_none() {
             // Nowhere to put this. Reading it to the end anyway would spend the
             // bandwidth twice over for nothing.
             tracing::trace!(
@@ -727,8 +1027,10 @@ impl Session {
                 alias = %header.track_alias,
                 "subgroup with no subscribers"
             );
+            metrics.subgroup_dropped();
             return;
         }
+        metrics.subgroup_forwarded();
 
         let mut outputs = Vec::with_capacity(routes.len());
         for route in routes {
@@ -748,20 +1050,53 @@ impl Session {
 
         let leftover = frames.take_buffered();
         if !leftover.is_empty() {
-            fan_out(&mut outputs, &leftover).await;
+            metrics.ingress(leftover.len());
+            fan_out(&mut outputs, &leftover, metrics).await;
+            if let Some(tee) = &mut tee {
+                tee.absorb(&leftover);
+            }
         }
 
         let mut chunk = [0u8; 8192];
-        while !outputs.is_empty() {
+        // Kept running for the cache's sake after the last subscriber has gone:
+        // the objects still belong in history, and a subscriber arriving a moment
+        // later wants them. Only a stream nobody is watching *and* nothing is
+        // retaining is abandoned.
+        while !outputs.is_empty() || tee.is_some() {
             match frames.stream.read(&mut chunk).await {
                 Ok(Some(0) | None) | Err(_) => break,
-                Ok(Some(n)) => fan_out(&mut outputs, &chunk[..n]).await,
+                Ok(Some(n)) => {
+                    metrics.ingress(n);
+                    fan_out(&mut outputs, &chunk[..n], metrics).await;
+                    if let Some(tee) = &mut tee {
+                        tee.absorb(&chunk[..n]);
+                    }
+                }
             }
         }
 
         for mut stream in outputs {
             let _ = stream.finish();
         }
+    }
+
+    /// A parser recording this stream into the cache, if it can be attributed to
+    /// a track and the cache is retaining anything.
+    fn tee(&self, header: &SubgroupHeader) -> Option<Tee> {
+        let track = self
+            .lock_pulling()
+            .get(&header.track_alias)
+            .cloned()
+            .or_else(|| {
+                tracing::trace!(
+                    session = %self.id,
+                    alias = %header.track_alias,
+                    "no track for this alias, so nothing to cache"
+                );
+                None
+            })?;
+        let recorder = self.fabric.cache().record(track, header);
+        recorder.is_enabled().then(|| Tee::new(header, recorder))
     }
 
     // MARK: - Bookkeeping
@@ -785,6 +1120,18 @@ impl Session {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    fn lock_pulling(&self) -> std::sync::MutexGuard<'_, HashMap<TrackAlias, FullTrackName>> {
+        self.pulling
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn lock_subscribed(&self) -> std::sync::MutexGuard<'_, HashMap<RequestId, FullTrackName>> {
+        self.subscribed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     fn add_route(&self, alias: TrackAlias, route: Route) {
         self.lock_routes().entry(alias).or_default().push(route);
     }
@@ -795,12 +1142,73 @@ impl Session {
             list.retain(|r| r.alias != downstream);
             if list.is_empty() {
                 routes.remove(&alias);
+                // The upstream subscription existed only to feed these routes,
+                // so with the last one gone the alias means nothing. Retained
+                // history stays: it belongs to the track, not to a subscription.
+                drop(routes);
+                self.lock_pulling().remove(&alias);
             }
         }
     }
 
     fn routes_for(&self, alias: TrackAlias) -> Vec<Route> {
         self.lock_routes().get(&alias).cloned().unwrap_or_default()
+    }
+}
+
+/// Parses a copy of a forwarded subgroup stream into the cache.
+///
+/// Object IDs on a subgroup stream are delta-encoded against the previous
+/// object, so this cannot be done a chunk at a time without keeping the reader's
+/// state — which is the whole reason it is a type and not a function. It holds
+/// the tail of a partially-arrived object and picks up where it left off.
+///
+/// Once a stream stops parsing it stays stopped. A desynchronised delta state
+/// produces wrong Object IDs indefinitely rather than failing again, and filing
+/// objects under invented IDs would let a fetch serve one object in place of
+/// another.
+struct Tee {
+    reader: SubgroupReader,
+    recorder: cache::Recorder,
+    /// Bytes received but not yet a whole object.
+    pending: BytesMut,
+    live: bool,
+}
+
+impl Tee {
+    fn new(header: &SubgroupHeader, recorder: cache::Recorder) -> Self {
+        Self {
+            reader: SubgroupReader::new(header),
+            recorder,
+            pending: BytesMut::new(),
+            live: true,
+        }
+    }
+
+    /// Take a copy of bytes already forwarded, storing whatever objects complete.
+    fn absorb(&mut self, bytes: &[u8]) {
+        if !self.live {
+            return;
+        }
+        self.pending.extend_from_slice(bytes);
+
+        loop {
+            let mut cursor = &self.pending[..];
+            match self.reader.read(&mut cursor) {
+                Ok(object) => {
+                    let consumed = self.pending.len() - cursor.len();
+                    self.pending.advance(consumed);
+                    self.recorder.push(&object);
+                }
+                Err(DecodeError::Short { .. }) => return,
+                Err(e) => {
+                    tracing::debug!(error = %e, "unparseable object, so this stream is not cached");
+                    self.live = false;
+                    self.pending.clear();
+                    return;
+                }
+            }
+        }
     }
 }
 
@@ -830,11 +1238,18 @@ async fn read_header(frames: &mut Frames) -> Result<SubgroupHeader, SessionError
 /// A subscriber whose connection has gone must not stop the others from
 /// receiving, so a failed write removes that output rather than aborting the
 /// forward.
-async fn fan_out(outputs: &mut Vec<SendStream>, bytes: &[u8]) {
+///
+/// Egress is counted per surviving copy, so it exceeds ingress by the fan-out
+/// ratio. That ratio is the whole reason a relay exists, and the two counters
+/// together are the only place it is visible.
+async fn fan_out(outputs: &mut Vec<SendStream>, bytes: &[u8], metrics: &Metrics) {
     let mut surviving = Vec::with_capacity(outputs.len());
     for mut stream in outputs.drain(..) {
         if stream.write_all(bytes).await.is_ok() {
+            metrics.egress(bytes.len());
             surviving.push(stream);
+        } else {
+            metrics.fanout_failed();
         }
     }
     *outputs = surviving;

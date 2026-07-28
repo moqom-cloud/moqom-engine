@@ -18,14 +18,26 @@
 //!   on that stream, which is why subgroup granularity is the lever — one
 //!   stream per subgroup means head-of-line blocking is scoped to media that
 //!   was already useless without its predecessor.
+//!
+//! A third mapping exists for objects that are already in the past. Fetch
+//! streams ([`fetch`]) answer one request rather than carrying a track, so they
+//! span groups, and their framing is delta-coded against the previous record
+//! instead of against a header. They also carry gap markers, because a relay
+//! answering from a bounded cache has to be able to say which part of the range
+//! it does not hold.
 
 pub mod datagram;
+pub mod fetch;
 pub mod flags;
 pub mod object;
 pub mod subgroup;
 
 pub use datagram::{
     DatagramContent, NonEmptyPayload, ObjectDatagram, PADDING_DATAGRAM_TYPE, PADDING_STREAM_TYPE,
+};
+pub use fetch::{
+    FETCH_HEADER_TYPE, FetchError, FetchHeader, FetchObject, FetchReader, FetchRecord, FetchWriter,
+    GroupOrder,
 };
 pub use flags::{DatagramType, SubgroupIdMode, SubgroupType};
 pub use object::TerminalStatus;
