@@ -55,7 +55,16 @@
 //! Anything on that list is a thing to build, not a thing to be surprised by.
 //! In particular, none of it is safe to expose to the internet yet.
 
-#![forbid(unsafe_code)]
+// `deny` rather than `forbid`, which is a weaker statement and a deliberate one.
+// `forbid` cannot be lifted by an inner `allow`, and there is exactly one place
+// that needs to: reading the kernel's own opinion of its clock means calling
+// `adjtimex`, and there is no way to that number in std. See [`clock`], where
+// the exception is scoped to the single function and argued for.
+//
+// The property worth keeping is that unsafe cannot appear by accident, and
+// `deny` keeps it: adding a block anywhere fails the build until somebody writes
+// an `allow` and, being visible in review, says why.
+#![deny(unsafe_code)]
 
 pub mod admin;
 pub mod cache;

@@ -328,15 +328,25 @@ fn nanos_of(duration: Duration) -> i64 {
     i64::try_from(duration.as_nanos()).unwrap_or(i64::MAX)
 }
 
+// The crate denies unsafe, and this is the one exception in it.
+//
+// The kernel's bound on how wrong its own clock might be is not reachable from
+// std, and the whole point of [`Timecode`] is that it carries a real
+// uncertainty rather than an invented one. The alternative to this syscall is
+// not safe code, it is a made-up number -- so the exception is scoped to this
+// function, which is four reads of a struct the kernel filled in.
 #[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
 fn read_health() -> Option<Health> {
-    // Zeroed, which means mode zero, which means read without adjusting.
-    // Getting this wrong would have the relay *setting* the system clock, so
-    // it is worth saying out loud: nothing here writes.
+    // SAFETY: `timex` is a C struct of integers, so all-zero is a valid value
+    // for it. Zeroed also means mode zero, which means read without adjusting.
+    // Getting that wrong would have the relay *setting* the system clock, so it
+    // is worth saying out loud: nothing here writes.
     let mut buffer: libc::timex = unsafe { std::mem::zeroed() };
 
-    // SAFETY: `adjtimex` reads and writes only the `timex` it is given, and
-    // the modes field is zero, so the call is a query.
+    // SAFETY: `adjtimex` reads and writes only the `timex` it is given, which
+    // is live and exclusively borrowed here, and the modes field is zero, so
+    // the call is a query.
     let state = unsafe { libc::adjtimex(&raw mut buffer) };
     if state < 0 {
         return None;
