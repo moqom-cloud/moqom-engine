@@ -29,7 +29,7 @@ use moqom_proto::data::{
 use moqom_proto::error::DecodeError;
 use moqom_proto::model::{FullTrackName, GroupId, Location, TrackAlias, TrackNamespace};
 use moqom_relay::admin::Surface;
-use moqom_relay::{Cache, Fabric, Limits, Metrics, Session};
+use moqom_relay::{Cache, Fabric, Governor, Limits, Metrics, Quotas, Session};
 use moqom_transport::{Server, alpn, server::with_moqt_alpn};
 use web_transport_quinn::{RecvStream, SendStream};
 
@@ -75,8 +75,23 @@ impl Relay {
         Self::retaining(Limits::default())
     }
 
+    /// Start a relay that holds every session to `quotas`.
+    ///
+    /// Every client here connects from loopback with no credential, so all of
+    /// them share one address-tier bucket. That is not a limitation of the
+    /// harness so much as the thing worth testing: it is exactly the shape of a
+    /// deployment behind a load balancer that does not preserve the client
+    /// address.
+    pub fn governed(quotas: Quotas) -> Self {
+        Self::build(Limits::default(), Governor::new(quotas))
+    }
+
     /// Start a relay retaining history according to `limits`.
     pub fn retaining(limits: Limits) -> Self {
+        Self::build(limits, Governor::disabled())
+    }
+
+    fn build(limits: Limits, governor: Governor) -> Self {
         install_crypto_provider();
 
         let generated = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
@@ -97,7 +112,7 @@ impl Relay {
         let addr = server.local_addr().expect("bound address");
 
         let metrics = Metrics::new();
-        let fabric = Fabric::observed(Cache::new(limits), metrics.clone());
+        let fabric = Fabric::observed(Cache::new(limits), metrics.clone()).governed(governor);
         let surface = Surface::new(metrics.clone(), fabric.clone());
         let accept = tokio::spawn({
             let fabric = fabric.clone();
@@ -130,6 +145,29 @@ impl Relay {
     }
 }
 
+/// Why the relay hung up, as the peer sees it.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Closed {
+    /// The application error code.
+    pub code: u64,
+    /// The reason phrase, which is where a session-level refusal has to put its
+    /// retry-after: a closing session has no request stream left to carry one.
+    pub reason: String,
+}
+
+async fn closed_reason(session: &moqom_transport::Session) -> Closed {
+    let error = within("the relay to close the session", session.closed()).await;
+    match error {
+        web_transport_quinn::SessionError::ConnectionError(
+            quinn::ConnectionError::ApplicationClosed(closed),
+        ) => Closed {
+            code: closed.error_code.into_inner(),
+            reason: String::from_utf8_lossy(&closed.reason).into_owned(),
+        },
+        other => panic!("expected an application close, got {other:?}"),
+    }
+}
+
 impl Drop for Relay {
     fn drop(&mut self) {
         self.accept.abort();
@@ -150,6 +188,18 @@ pub struct Client {
 impl Client {
     /// Connect to `relay` over raw QUIC and exchange SETUP.
     pub async fn connect(relay: &Relay) -> Self {
+        Self::try_connect(relay)
+            .await
+            .unwrap_or_else(|closed| panic!("the relay refused the session: {closed:?}"))
+    }
+
+    /// Connect, tolerating a relay that refuses before answering.
+    ///
+    /// A session the limiter turns away never receives a SETUP: the relay
+    /// refuses before answering rather than after, so there is no moment where
+    /// it has said yes and then hung up. That is the right behaviour and it
+    /// means the ordinary [`Client::connect`] cannot observe it.
+    pub async fn try_connect(relay: &Relay) -> Result<Self, Closed> {
         install_crypto_provider();
 
         let mut tls = rustls::ClientConfig::builder()
@@ -195,7 +245,10 @@ impl Client {
         write(&mut send, &ours).await;
 
         let mut frames = Frames::new(recv);
-        let frame = within("the relay's SETUP", frames.expect()).await;
+        let Some(frame) = within("the relay's SETUP", frames.next()).await else {
+            // The relay hung up instead of answering, and the close carries why.
+            return Err(closed_reason(&session).await);
+        };
         assert_eq!(
             frame.message_type,
             MessageType::Setup,
@@ -205,12 +258,12 @@ impl Client {
         let len = body.len();
         Setup::decode(&mut body, len).expect("a decodable SETUP");
 
-        Self {
+        Ok(Self {
             session,
             requests: RequestIdGenerator::new(Role::Client),
             _control: (send, frames),
             _endpoint: endpoint,
-        }
+        })
     }
 
     fn next_request(&mut self) -> RequestId {
@@ -249,12 +302,30 @@ impl Client {
         }
     }
 
+    /// Wait for the relay to close this session, and report how.
+    pub async fn closed(&self) -> Closed {
+        closed_reason(&self.session).await
+    }
+
     /// Subscribe to `track`.
     ///
     /// The returned [`Subscription`] holds the request stream: dropping it
     /// cancels the subscription, so callers keep it for as long as they expect
     /// objects.
     pub async fn subscribe(&mut self, track: &FullTrackName) -> Result<Subscription, u64> {
+        self.try_subscribe(track)
+            .await
+            .map_err(|error| error.code.get())
+    }
+
+    /// Subscribe, keeping the whole error rather than just its code.
+    ///
+    /// A rate limiter's answer is more than a code — the retry-after is the part
+    /// a client acts on — so the tests for it need the message intact.
+    pub async fn try_subscribe(
+        &mut self,
+        track: &FullTrackName,
+    ) -> Result<Subscription, moqom_proto::control::RequestError> {
         let (mut send, recv) = self
             .session
             .open_bi()
@@ -275,11 +346,10 @@ impl Client {
                     _frames: frames,
                 })
             }
-            MessageType::RequestError => {
-                let error = moqom_proto::control::RequestError::decode(&mut frame.body.clone())
-                    .expect("a decodable error");
-                Err(error.code.get())
-            }
+            MessageType::RequestError => Err(moqom_proto::control::RequestError::decode(
+                &mut frame.body.clone(),
+            )
+            .expect("a decodable error")),
             other => panic!("unexpected {other:?} answering SUBSCRIBE"),
         }
     }
@@ -579,13 +649,25 @@ impl Frames {
     }
 
     async fn expect(&mut self) -> ControlFrame {
+        self.next()
+            .await
+            .expect("a complete control message rather than a closed stream")
+    }
+
+    /// The next frame, or `None` if the stream ended first.
+    ///
+    /// Distinguished from `expect` because a stream that ends before answering
+    /// is a real outcome rather than only a failure: a session the relay refuses
+    /// gets a connection close instead of a reply, and the caller needs to be
+    /// able to go and read why.
+    async fn next(&mut self) -> Option<ControlFrame> {
         loop {
             let mut cursor = &self.buffer[..];
             match ControlFrame::decode(&mut cursor) {
                 Ok(frame) => {
                     let consumed = self.buffer.len() - cursor.remaining();
                     self.buffer.advance(consumed);
-                    return frame;
+                    return Some(frame);
                 }
                 Err(DecodeError::Short { .. }) => {}
                 Err(e) => panic!("undecodable control frame: {e}"),
@@ -593,9 +675,8 @@ impl Frames {
 
             let mut chunk = [0u8; 4096];
             match self.stream.read(&mut chunk).await {
-                Ok(Some(0) | None) => panic!("stream ended before a complete message"),
+                Ok(Some(0) | None) | Err(_) => return None,
                 Ok(Some(n)) => self.buffer.extend_from_slice(&chunk[..n]),
-                Err(e) => panic!("read failed: {e}"),
             }
         }
     }

@@ -38,7 +38,9 @@ use moqom_proto::model::{FullTrackName, TrackAlias, TrackNamespace};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::cache::Cache;
+use crate::identity::Authenticator;
 use crate::metrics::Metrics;
+use crate::quota::Governor;
 
 /// Identifies a session within one relay process.
 ///
@@ -183,7 +185,7 @@ struct State {
 /// The state shared between every session on one relay.
 ///
 /// Cheap to clone; all clones see the same state.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Fabric {
     state: Arc<Mutex<State>>,
     next_session: Arc<AtomicU64>,
@@ -198,6 +200,35 @@ pub struct Fabric {
     /// second argument through every constructor would make instrumenting a new
     /// code path a signature change rather than a one-line call.
     metrics: Metrics,
+    /// What limits every session on this relay is held to.
+    ///
+    /// Shared for the reason the limits exist: a per-session limiter is one an
+    /// attacker escapes by opening a second session, so there has to be exactly
+    /// one of these and every session has to meet it.
+    governor: Governor,
+    /// How a session's credential is checked, which is what makes the governor
+    /// able to charge anybody in particular.
+    authenticator: Authenticator,
+}
+
+/// Defaults that limit nothing and verify nothing.
+///
+/// Deliberately not the safe-looking choice, and the reason is the audience: a
+/// bare `Fabric` is what tests and embedders build, and a library that silently
+/// throttles is one whose failures look like bugs in the caller. The binary is
+/// the deployment, so the binary is where limits are on by default — see
+/// `src/bin/relay.rs`.
+impl Default for Fabric {
+    fn default() -> Self {
+        Self {
+            state: Arc::default(),
+            next_session: Arc::default(),
+            cache: Cache::default(),
+            metrics: Metrics::default(),
+            governor: Governor::disabled(),
+            authenticator: Authenticator::disabled(),
+        }
+    }
 }
 
 impl Fabric {
@@ -227,6 +258,25 @@ impl Fabric {
         }
     }
 
+    /// The same fabric, holding every session to `governor`.
+    #[must_use]
+    pub fn governed(self, governor: Governor) -> Self {
+        Self { governor, ..self }
+    }
+
+    /// The same fabric, checking credentials with `authenticator`.
+    ///
+    /// Without this every session is anonymous and charged by address, which is
+    /// correct but coarse: per-user and per-device limits need a user and a
+    /// device, and those only exist once a signature has been checked.
+    #[must_use]
+    pub fn authenticated(self, authenticator: Authenticator) -> Self {
+        Self {
+            authenticator,
+            ..self
+        }
+    }
+
     /// The shared object cache.
     #[must_use]
     pub const fn cache(&self) -> &Cache {
@@ -237,6 +287,18 @@ impl Fabric {
     #[must_use]
     pub const fn metrics(&self) -> &Metrics {
         &self.metrics
+    }
+
+    /// What limits sessions are held to.
+    #[must_use]
+    pub const fn governor(&self) -> &Governor {
+        &self.governor
+    }
+
+    /// How credentials are checked.
+    #[must_use]
+    pub const fn authenticator(&self) -> &Authenticator {
+        &self.authenticator
     }
 
     /// Allocate an identifier for a newly accepted session.

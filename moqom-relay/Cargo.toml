@@ -21,10 +21,17 @@ tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync
 tracing = { workspace = true }
 web-transport-quinn = { workspace = true }
 
-# Binary only. A relay in production is given a certificate; these are what let
-# it generate one for a test harness or a laptop, and print the hash to pin.
+# Verifying the credential a session presents. aws-lc-rs supplies Ed25519 and is
+# already here as the rustls provider, so the signature check costs no new
+# cryptography; serde reads the claims, which are JSON precisely so that the
+# media-path binary does not have to carry a CBOR/COSE stack.
 aws-lc-rs = { workspace = true }
 base64 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Binary only. A relay in production is given a certificate; these are what let
+# it generate one for a test harness or a laptop, and print the hash to pin.
 rcgen = { workspace = true }
 rustls-pemfile = { workspace = true }
 tracing-subscriber = { workspace = true }

@@ -33,7 +33,8 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Instant, SystemTime};
 
 use bytes::{Buf, Bytes, BytesMut};
 use moqom_proto::control::{
@@ -54,6 +55,7 @@ use web_transport_quinn::{RecvStream, SendStream};
 
 use crate::fabric::{Command, Fabric, NamespaceEvent, Route, SessionId, UpstreamError};
 use crate::metrics::{Ending, Fetched, Metrics, Subscribed};
+use crate::quota::{Lease, Principal, Refusal, Resource};
 use crate::{cache, metrics};
 
 /// Identifies this build in Setup Options, for the other end's logs.
@@ -97,6 +99,19 @@ pub enum SessionError {
     /// A stream ended in the middle of a message.
     #[error("stream ended mid-message")]
     Truncated,
+
+    /// The peer offered a credential that did not verify.
+    #[error("authentication: {0}")]
+    Unauthenticated(#[from] crate::identity::AuthError),
+
+    /// The peer is over the limit for something it cannot be refused piecemeal.
+    ///
+    /// Only a session itself: every other resource is refused with a
+    /// `REQUEST_ERROR` on its own stream, which leaves the rest of the
+    /// connection working. There is no smaller unit than the session to refuse
+    /// when the session is what ran out.
+    #[error("over limit: {0:?}")]
+    OverLimit(Refusal),
 }
 
 impl Ending {
@@ -124,6 +139,8 @@ impl Ending {
                 | SessionError::Write(_)
                 | SessionError::Truncated,
             ) => Self::Transport,
+            Err(SessionError::Unauthenticated(_)) => Self::Rejected,
+            Err(SessionError::OverLimit(_)) => Self::Throttled,
         }
     }
 }
@@ -134,6 +151,16 @@ mod code {
     pub const PROTOCOL_VIOLATION: u32 = 0x01;
     /// This relay failed, not the peer.
     pub const INTERNAL: u32 = 0x02;
+    /// The peer's credential did not verify.
+    pub const UNAUTHORIZED: u32 = 0x03;
+    /// The peer is over its limit.
+    ///
+    /// Distinct from `UNAUTHORIZED` because the client's correct response is
+    /// different and the difference matters at scale: a rejected credential
+    /// should stop a client trying, and a limit should make it wait. A client
+    /// that cannot tell them apart reconnects immediately in both cases, which
+    /// turns a rate limit into a reconnect storm.
+    pub const EXCESSIVE_LOAD: u32 = 0x04;
 }
 
 /// Reads length-delimited control messages off a stream.
@@ -261,6 +288,22 @@ pub struct Session {
     /// deriving the range's end from the subscription is what makes the fetch and
     /// the subscription provably contiguous. Resolving that reference needs this.
     subscribed: Arc<Mutex<HashMap<RequestId, FullTrackName>>>,
+    /// Quota slots held by established subscriptions.
+    ///
+    /// Separate from `subscribed` because they have different lifetimes in
+    /// principle — a slot is released when the subscription ends, and there is
+    /// no UNSUBSCRIBE here yet, so in practice both end with the session.
+    /// Keyed by request rather than pushed onto a list so that when unsubscribe
+    /// does land, releasing the right slot is a lookup rather than a rewrite.
+    holding: Arc<Mutex<HashMap<RequestId, Lease>>>,
+    /// Who this session's limits are charged to.
+    ///
+    /// Written once, during SETUP, and read by every request afterwards. A
+    /// `OnceLock` rather than a field because the identity is not known when the
+    /// session is constructed — the token arrives in the handshake — and rather
+    /// than a `Mutex<Option<_>>` because it genuinely is write-once: a peer that
+    /// could change who it is mid-session could shed a limit by doing so.
+    principal: Arc<OnceLock<Principal>>,
 }
 
 /// Identity and carrier only. The rest is a connection, a lock, and channels,
@@ -311,6 +354,8 @@ impl Session {
             commands,
             pulling: Arc::default(),
             subscribed: Arc::default(),
+            holding: Arc::default(),
+            principal: Arc::default(),
         };
 
         let result = session.run(command_queue).await;
@@ -332,6 +377,17 @@ impl Session {
             Err(SessionError::Protocol(reason)) => session
                 .transport
                 .close(code::PROTOCOL_VIOLATION, reason.as_bytes()),
+            Err(SessionError::Unauthenticated(e)) => session
+                .transport
+                .close(code::UNAUTHORIZED, e.name().as_bytes()),
+            // The retry-after goes in the close reason, since a session that is
+            // being closed has no request stream left to carry it. A client that
+            // reads it waits; one that does not is no worse off than before.
+            Err(SessionError::OverLimit(refusal)) => session.transport.close(
+                code::EXCESSIVE_LOAD,
+                format!("{} retry_after_ms={}", refusal.reason_phrase(), refusal.retry_after_ms())
+                    .as_bytes(),
+            ),
             Err(_) => session.transport.close(code::INTERNAL, b"session failed"),
         }
         result
@@ -362,7 +418,10 @@ impl Session {
     async fn run(&self, commands: mpsc::Receiver<Command>) -> Result<(), SessionError> {
         let (mut control_send, control_recv) = self.transport.accept_bi().await?;
         let mut control = Frames::new(control_recv);
-        self.handshake(&mut control_send, &mut control).await?;
+        // Held for the rest of this function. Dropping it is what frees the
+        // slot, and `run` returning is the one thing that happens on every path
+        // out of a session.
+        let _session = self.handshake(&mut control_send, &mut control).await?;
 
         let peer = self.connection().remote_address();
         let live = self.fabric.metrics().session_started(
@@ -443,7 +502,7 @@ impl Session {
         &self,
         send_stream: &mut SendStream,
         control: &mut Frames,
-    ) -> Result<(), SessionError> {
+    ) -> Result<Lease, SessionError> {
         let frame = control.expect().await?;
         if frame.message_type != MessageType::Setup {
             return Err(SessionError::Protocol(
@@ -455,6 +514,20 @@ impl Session {
         let len = body.len();
         let peer = Setup::decode(&mut body, len)?;
         peer.validate(Role::Client, self.carrier)?;
+
+        self.establish_identity(&peer)?;
+
+        // Charged before our SETUP goes out, not after. Answering and then
+        // closing would tell the peer the session was established and take it
+        // away in the same breath — and worse, a close can discard the stream
+        // data that was still in flight, so the peer would see a connection that
+        // vanished rather than one that said why.
+        //
+        // Held by the caller for the rest of the session; dropping it is what
+        // frees the slot.
+        let session = self
+            .acquire(Resource::Session)
+            .map_err(SessionError::OverLimit)?;
 
         if let Some(implementation) = peer.options.moqt_implementation() {
             tracing::debug!(
@@ -471,7 +544,92 @@ impl Session {
         ours.options
             .set_varint(setup::option_type::MAX_FILTER_RANGES, MAX_FILTER_RANGES)
             .map_err(|_| SessionError::Protocol("filter range limit not encodable"))?;
-        send(send_stream, &ours).await
+        send(send_stream, &ours).await?;
+        Ok(session)
+    }
+
+    /// Work out who this peer is, from the tokens it offered in SETUP.
+    ///
+    /// A token that fails to verify ends the session rather than downgrading it
+    /// to anonymous. Downgrading would make a deliberately corrupt token the way
+    /// to choose which tier you are limited under, and the address tier is the
+    /// one an attacker behind a large NAT would rather share.
+    ///
+    /// Offering no token at all is different, and is allowed: the peer has not
+    /// asserted anything, so it is charged by address and the deployment decides
+    /// through [`crate::Quotas`] how far that gets it.
+    fn establish_identity(&self, peer: &Setup) -> Result<(), SessionError> {
+        let address = self.connection().remote_address().ip();
+        let tokens = peer.options.authorization_tokens().map(bytes::Bytes::as_ref);
+
+        let who = match self
+            .fabric
+            .authenticator()
+            .identify(tokens, address, SystemTime::now())
+        {
+            Ok(who) => who,
+            Err(e) => {
+                // Logged at info rather than warn: an expired token during a
+                // reconnection is routine, and a relay that shouts about it
+                // trains people to filter the category that also carries the
+                // forgeries.
+                tracing::info!(session = %self.id, %address, error = %e, "token refused");
+                self.fabric.metrics().token_refused(e.name());
+                return Err(SessionError::Unauthenticated(e));
+            }
+        };
+
+        if who.is_verified() {
+            tracing::debug!(session = %self.id, "session authenticated");
+        }
+        // Only ever set once, and this is the only place that sets it.
+        let _ = self.principal.set(who);
+        Ok(())
+    }
+
+    /// Who this session's requests are charged to.
+    ///
+    /// Falls back to the peer address, which covers the window before SETUP has
+    /// completed and the case where no authenticator is configured. There is no
+    /// path here that trusts an unverified claim: the fallback is derived from
+    /// the connection, not from anything the peer said.
+    fn principal(&self) -> &Principal {
+        self.principal
+            .get_or_init(|| Principal::anonymous(self.connection().remote_address().ip()))
+    }
+
+    /// Take a slot held until the returned lease is dropped.
+    ///
+    /// Every request goes through here rather than some through
+    /// [`crate::Governor::charge`], including the ones that finish immediately.
+    /// A fetch holds nothing once it has been answered, but bounding how many
+    /// are in flight bounds how much of the cache is being read at once, and
+    /// that is worth having: the rate limit alone would let a client with a fast
+    /// link start a hundred large fetches inside one second.
+    fn acquire(&self, resource: Resource) -> Result<Lease, Refusal> {
+        let outcome = self
+            .fabric
+            .governor()
+            .acquire(self.principal(), resource, Instant::now());
+        self.record(resource, outcome.as_ref().err());
+        outcome
+    }
+
+    fn record(&self, resource: Resource, refusal: Option<&Refusal>) {
+        match refusal {
+            None => self.fabric.metrics().admitted(resource),
+            Some(refusal) => {
+                tracing::info!(
+                    session = %self.id,
+                    resource = resource.name(),
+                    tier = refusal.tier.name(),
+                    reason = refusal.reason.name(),
+                    retry_after_ms = refusal.retry_after_ms(),
+                    "request refused by the rate limiter"
+                );
+                self.fabric.metrics().refused(resource, refusal);
+            }
+        }
     }
 
     /// Watch the control stream, and act on requests from other sessions.
@@ -551,25 +709,70 @@ impl Session {
             }
         };
 
-        let outcome = match frame.message_type {
-            MessageType::PublishNamespace => self.on_publish_namespace(&frame, &mut frames).await,
-            MessageType::SubscribeNamespace => {
-                self.on_subscribe_namespace(&frame, &mut send_stream, &mut frames)
-                    .await
-            }
-            MessageType::Subscribe => self.on_subscribe(&frame, &mut send_stream).await,
-            MessageType::Fetch => self.on_fetch(&frame, &mut send_stream).await,
+        let resource = match frame.message_type {
+            MessageType::PublishNamespace => Resource::Announcement,
+            MessageType::SubscribeNamespace => Resource::Watch,
+            MessageType::Subscribe => Resource::Subscription,
+            MessageType::Fetch => Resource::Fetch,
             other => {
                 tracing::debug!(session = %self.id, ?other, "unsupported request");
-                send(
+                let outcome = send(
                     &mut send_stream,
                     &RequestError::new(
                         RequestErrorCode::NOT_SUPPORTED,
                         ReasonPhrase::truncating("this relay does not serve that request"),
                     ),
                 )
-                .await
+                .await;
+                if let Err(e) = outcome {
+                    tracing::debug!(session = %self.id, error = %e, "request failed");
+                }
+                let _ = send_stream.finish();
+                return;
             }
+        };
+
+        // Charged here rather than inside each handler, so a request type added
+        // later is limited by default instead of by remembering. The lease is
+        // held for the life of this task, which for an announcement and a watch
+        // is exactly the life of the thing they hold — both of those handlers
+        // return only when their stream ends, and the stream ending *is* the
+        // withdrawal. A subscription outlives its request stream, so
+        // `on_subscribe` takes the lease over.
+        let lease = match self.acquire(resource) {
+            Ok(lease) => lease,
+            Err(refusal) => {
+                let outcome = send(
+                    &mut send_stream,
+                    &RequestError::retryable(
+                        RequestErrorCode::EXCESSIVE_LOAD,
+                        ReasonPhrase::truncating(&refusal.reason_phrase()),
+                        refusal.retry_after_ms(),
+                    )
+                    .unwrap_or_else(|_| {
+                        RequestError::new(
+                            RequestErrorCode::EXCESSIVE_LOAD,
+                            ReasonPhrase::truncating(&refusal.reason_phrase()),
+                        )
+                    }),
+                )
+                .await;
+                if let Err(e) = outcome {
+                    tracing::debug!(session = %self.id, error = %e, "refusal not delivered");
+                }
+                let _ = send_stream.finish();
+                return;
+            }
+        };
+
+        let outcome = match frame.message_type {
+            MessageType::PublishNamespace => self.on_publish_namespace(&frame, &mut frames).await,
+            MessageType::SubscribeNamespace => {
+                self.on_subscribe_namespace(&frame, &mut send_stream, &mut frames)
+                    .await
+            }
+            MessageType::Subscribe => self.on_subscribe(&frame, &mut send_stream, lease).await,
+            _ => self.on_fetch(&frame, &mut send_stream).await,
         };
 
         if let Err(e) = outcome {
@@ -681,6 +884,7 @@ impl Session {
         &self,
         frame: &ControlFrame,
         send_stream: &mut SendStream,
+        slot: Lease,
     ) -> Result<(), SessionError> {
         let request = Subscribe::decode(&mut frame.body.clone())?;
         let track = request.track.clone();
@@ -727,6 +931,12 @@ impl Session {
                 // a subscription that was refused.
                 self.lock_subscribed()
                     .insert(request.request_id, track.clone());
+                // The slot outlives this request stream, because the
+                // subscription does: the stream carries the answer and closes,
+                // while objects keep flowing. Handing the lease to the session
+                // here is what makes the concurrency limit count subscriptions
+                // rather than requests in flight.
+                self.lock_holding().insert(request.request_id, slot);
                 send(send_stream, &SubscribeOk::new(alias)).await
             }
             Err(e) => {
@@ -1128,6 +1338,12 @@ impl Session {
 
     fn lock_subscribed(&self) -> std::sync::MutexGuard<'_, HashMap<RequestId, FullTrackName>> {
         self.subscribed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn lock_holding(&self) -> std::sync::MutexGuard<'_, HashMap<RequestId, Lease>> {
+        self.holding
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }

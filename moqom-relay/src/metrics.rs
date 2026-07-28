@@ -45,6 +45,7 @@ use std::time::{Duration, Instant};
 use moqom_proto::control::setup;
 
 use crate::fabric::SessionId;
+use crate::quota::{Reason, Refusal, Resource, Tier};
 
 /// Relaxed ordering throughout: every value here is a counter or a gauge read
 /// by a scrape that has no ordering relationship with anything else. Paying for
@@ -74,16 +75,32 @@ pub enum Ending {
     Protocol,
     /// The connection failed underneath us.
     Transport,
+    /// The peer offered a credential that did not verify.
+    ///
+    /// Separate from `Protocol` because the two mean opposite things
+    /// operationally: a spike of protocol errors is usually one broken client
+    /// build, and a spike of these is usually somebody trying keys.
+    Rejected,
+    /// The peer was over its limit before the session began.
+    Throttled,
 }
 
 impl Ending {
-    const ALL: [Self; 3] = [Self::Clean, Self::Protocol, Self::Transport];
+    const ALL: [Self; 5] = [
+        Self::Clean,
+        Self::Protocol,
+        Self::Transport,
+        Self::Rejected,
+        Self::Throttled,
+    ];
 
     const fn label(self) -> &'static str {
         match self {
             Self::Clean => "clean",
             Self::Protocol => "protocol",
             Self::Transport => "transport",
+            Self::Rejected => "rejected",
+            Self::Throttled => "throttled",
         }
     }
 
@@ -92,6 +109,8 @@ impl Ending {
             Self::Clean => 0,
             Self::Protocol => 1,
             Self::Transport => 2,
+            Self::Rejected => 3,
+            Self::Throttled => 4,
         }
     }
 }
@@ -269,6 +288,17 @@ struct Inner {
     fetches: [AtomicU64; Fetched::ALL.len()],
     fetch_records: AtomicU64,
 
+    admitted: [AtomicU64; Resource::ALL.len()],
+    /// By resource, then by the tier whose allowance ran out.
+    refused: [[AtomicU64; Tier::ALL.len()]; Resource::ALL.len()],
+    refusal_reasons: [AtomicU64; Reason::ALL.len()],
+    /// By cause, from the fixed set [`crate::AuthError::name`] returns.
+    ///
+    /// A map rather than an array because the causes belong to another module
+    /// and giving them a dense index here would be a second enumeration to keep
+    /// in step. Bounded by that fixed set, so it cannot grow with traffic.
+    tokens_refused: Mutex<HashMap<&'static str, u64>>,
+
     subgroups_forwarded: AtomicU64,
     subgroups_dropped: AtomicU64,
     ingress_bytes: AtomicU64,
@@ -370,6 +400,10 @@ impl Metrics {
                 subscriptions: counters(),
                 fetches: counters(),
                 fetch_records: AtomicU64::new(0),
+                admitted: counters(),
+                refused: std::array::from_fn(|_| counters()),
+                refusal_reasons: counters(),
+                tokens_refused: Mutex::new(HashMap::new()),
                 subgroups_forwarded: AtomicU64::new(0),
                 subgroups_dropped: AtomicU64::new(0),
                 ingress_bytes: AtomicU64::new(0),
@@ -518,6 +552,40 @@ impl Metrics {
             inner.fetches[outcome.index()].fetch_add(1, ORDER);
             inner.fetch_records.fetch_add(records as u64, ORDER);
         }
+    }
+
+    /// The rate limiter let a request through.
+    pub fn admitted(&self, resource: Resource) {
+        if let Some(inner) = self.inner() {
+            inner.admitted[resource.index()].fetch_add(1, ORDER);
+        }
+    }
+
+    /// The rate limiter turned a request away.
+    ///
+    /// Counted by resource, tier and reason and by nothing else. The identity is
+    /// deliberately absent: a label per user is unbounded cardinality, which
+    /// would let anyone who can connect grow the metrics endpoint without limit,
+    /// and it would also publish who is being throttled to everyone who can
+    /// scrape it.
+    pub fn refused(&self, resource: Resource, refusal: &Refusal) {
+        let Some(inner) = self.inner() else { return };
+        inner.refused[resource.index()][refusal.tier.index()].fetch_add(1, ORDER);
+        inner.refusal_reasons[refusal.reason.index()].fetch_add(1, ORDER);
+    }
+
+    /// A session offered a credential that did not verify.
+    ///
+    /// `cause` comes from [`crate::AuthError::name`], which is a fixed set.
+    pub fn token_refused(&self, cause: &'static str) {
+        let Some(inner) = self.inner() else { return };
+        inner
+            .tokens_refused
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(cause)
+            .and_modify(|count| *count += 1)
+            .or_insert(1);
     }
 
     /// A subgroup stream arrived and had somewhere to go.
@@ -690,6 +758,74 @@ impl Metrics {
             "moqom_relay_fetch_records_total",
             "Records delivered on fetch streams.",
             inner.fetch_records.load(ORDER),
+        );
+
+        counter(
+            &mut out,
+            "moqom_relay_requests_admitted_total",
+            "Requests the rate limiter allowed, by resource.",
+            &Resource::ALL
+                .map(|r| ("resource", r.name(), inner.admitted[r.index()].load(ORDER))),
+        );
+        // Two labels, because "we are refusing things" and "we are refusing them
+        // because one person has too many devices" call for different responses,
+        // and the tier is what tells them apart. Still bounded: five resources by
+        // three tiers is fifteen series no matter how much traffic arrives.
+        let mut refusals = Vec::with_capacity(Resource::ALL.len() * Tier::ALL.len());
+        for resource in Resource::ALL {
+            for tier in Tier::ALL {
+                refusals.push((
+                    resource.name(),
+                    tier.name(),
+                    inner.refused[resource.index()][tier.index()].load(ORDER),
+                ));
+            }
+        }
+        labelled(
+            &mut out,
+            "moqom_relay_requests_refused_total",
+            "Requests the rate limiter turned away, by resource and by which allowance ran out.",
+            "resource",
+            "tier",
+            &refusals,
+        );
+        counter(
+            &mut out,
+            "moqom_relay_refusals_total",
+            "Rate limiter refusals by reason. `saturated` means the limiter itself is full.",
+            &Reason::ALL.map(|r| {
+                (
+                    "reason",
+                    r.name(),
+                    inner.refusal_reasons[r.index()].load(ORDER),
+                )
+            }),
+        );
+
+        // Only the causes actually seen, because the fixed set lives in another
+        // module and enumerating it here would be a second list to keep in step.
+        // A cause with no occurrences is a series nobody needs.
+        let seen = {
+            let counts = inner
+                .tokens_refused
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut seen: Vec<(&'static str, u64)> =
+                counts.iter().map(|(&cause, &n)| (cause, n)).collect();
+            // Sorted so the exposition is stable between scrapes, which is what
+            // makes a diff of two scrapes readable.
+            seen.sort_unstable();
+            seen
+        };
+        let series: Vec<(&str, &str, u64)> = seen
+            .iter()
+            .map(|&(cause, count)| ("cause", cause, count))
+            .collect();
+        counter(
+            &mut out,
+            "moqom_relay_tokens_refused_total",
+            "Session credentials that did not verify, by cause.",
+            &series,
         );
 
         counter(
@@ -872,6 +1008,22 @@ fn counter(out: &mut String, name: &str, help: &str, series: &[(&str, &str, u64)
     let _ = writeln!(out, "# TYPE {name} counter");
     for (label, value, count) in series {
         let _ = writeln!(out, "{name}{{{label}=\"{value}\"}} {count}");
+    }
+}
+
+/// A counter with two labels.
+fn labelled(
+    out: &mut String,
+    name: &str,
+    help: &str,
+    first: &str,
+    second: &str,
+    series: &[(&str, &str, u64)],
+) {
+    let _ = writeln!(out, "# HELP {name} {help}");
+    let _ = writeln!(out, "# TYPE {name} counter");
+    for (one, two, count) in series {
+        let _ = writeln!(out, "{name}{{{first}=\"{one}\",{second}=\"{two}\"}} {count}");
     }
 }
 

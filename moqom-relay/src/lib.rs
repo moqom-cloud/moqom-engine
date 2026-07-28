@@ -55,10 +55,14 @@
 pub mod admin;
 pub mod cache;
 pub mod fabric;
+pub mod identity;
 pub mod metrics;
+pub mod quota;
 pub mod session;
 
 pub use cache::{Cache, Limits};
 pub use fabric::Fabric;
+pub use identity::{AuthError, Authenticator, VerificationKey};
 pub use metrics::Metrics;
+pub use quota::{Governor, Principal, Quotas, Refusal};
 pub use session::{Session, SessionError};

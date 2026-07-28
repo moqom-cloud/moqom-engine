@@ -18,6 +18,25 @@
 //!   which is the default because an observability port that appears without
 //!   being asked for is one that gets exposed by accident. See
 //!   [`moqom_relay::admin`] for what it serves and why it is a separate port.
+//! - `MOQOM_RELAY_LIMITS` — `off` disables per-user and per-device limits
+//!   entirely. On otherwise, which is the default.
+//! - `MOQOM_RELAY_LIMIT_SCALE` — multiply every allowance by this. Default 1.
+//! - `MOQOM_RELAY_MAX_PRINCIPALS` — how many identities each tier tracks before
+//!   it refuses new ones. Default 100000. See [`moqom_relay::quota`].
+//! - `MOQOM_RELAY_JWKS` — path to the control plane's verification keys. Unset
+//!   means no session is authenticated and every one is charged to its address,
+//!   which is a much smaller allowance.
+//! - `MOQOM_RELAY_ISSUER` — the issuer tokens must name. Unset accepts any,
+//!   which is for tests.
+//!
+//! # A caveat about the address tier
+//!
+//! Unauthenticated peers are limited by IP, and that is the address the relay
+//! sees. Behind a load balancer that does not preserve the client address, that
+//! is one address for everybody, so the address tier becomes a single global
+//! limit and legitimate clients starve each other. Either preserve the client
+//! address at the balancer, or configure `MOQOM_RELAY_JWKS` so sessions are
+//! identified by who they are rather than where they came from.
 //!
 //! A generated certificate prints its SPKI hash to stdout as
 //! `certificate-hash: <base64>`, which is what a client needs to trust it. That
@@ -37,7 +56,9 @@ use std::path::PathBuf;
 
 use base64::Engine as _;
 use moqom_relay::admin::Surface;
-use moqom_relay::{Cache, Fabric, Limits, Metrics, Session};
+use moqom_relay::{
+    Authenticator, Cache, Fabric, Governor, Limits, Metrics, Quotas, Session, VerificationKey,
+};
 use moqom_transport::{Server, server::with_moqt_alpn};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -112,7 +133,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Metrics::disabled()
     };
 
-    let fabric = Fabric::observed(Cache::new(limits), metrics.clone());
+    let fabric = Fabric::observed(Cache::new(limits), metrics.clone())
+        .governed(governor()?)
+        .authenticated(authenticator()?);
     let surface = Surface::new(metrics, fabric.clone());
     if let Some(addr) = admin_addr {
         let serving = surface.clone();
@@ -222,6 +245,93 @@ fn cache_limits() -> Result<Limits, Box<dyn std::error::Error>> {
         bytes_per_track: (total / 4).max(1),
         bytes_total: total,
     })
+}
+
+/// The limits every session is held to, from the environment.
+///
+/// On by default, which is the opposite of the library's default and the
+/// difference is deliberate. `Fabric::default()` is what tests and embedders
+/// build and it limits nothing, because a library that silently throttles
+/// produces failures that look like bugs in the caller. This is the deployment,
+/// and a defence that ships off is a defence nobody turns on.
+fn governor() -> Result<Governor, Box<dyn std::error::Error>> {
+    if env("MOQOM_RELAY_LIMITS").as_deref() == Some("off") {
+        tracing::warn!("MOQOM_RELAY_LIMITS=off, so no per-user or per-device limits are enforced");
+        return Ok(Governor::disabled());
+    }
+
+    let scale = match env("MOQOM_RELAY_LIMIT_SCALE") {
+        Some(value) => value
+            .parse::<f64>()
+            .map_err(|e| format!("MOQOM_RELAY_LIMIT_SCALE is not a number: {e}"))?,
+        None => 1.0,
+    };
+    if !scale.is_finite() || scale <= 0.0 {
+        return Err("MOQOM_RELAY_LIMIT_SCALE must be a positive number".into());
+    }
+
+    let defaults = Quotas::default();
+    let principals = match env("MOQOM_RELAY_MAX_PRINCIPALS") {
+        Some(value) => value
+            .parse()
+            .map_err(|e| format!("MOQOM_RELAY_MAX_PRINCIPALS is not a count: {e}"))?,
+        None => defaults.principals,
+    };
+
+    // One factor across all three tiers rather than a knob per resource. The
+    // ratios between them are the design -- a user gets more than a device, an
+    // address less -- and an operator who needs to move them all is usually
+    // sizing for a bigger or smaller relay, not rebalancing them.
+    let quotas = Quotas {
+        device: defaults.device.scaled(scale),
+        user: defaults.user.scaled(scale),
+        address: defaults.address.scaled(scale),
+        principals,
+    };
+    tracing::info!(
+        scale,
+        principals,
+        "limiting requests per device, per user, and per address"
+    );
+    Ok(Governor::new(quotas))
+}
+
+/// How session credentials are checked, from the environment.
+///
+/// Off by default, and this one really is the safe choice rather than the
+/// convenient one: with no keys there is no verified identity, so every session
+/// lands on the address tier and is limited hard. Turning it on is what lets a
+/// client earn the larger per-user and per-device allowances.
+///
+/// The failure worth avoiding is the middle position — reading the token and
+/// believing it without a key — which would key every limit on a string the
+/// peer chose.
+fn authenticator() -> Result<Authenticator, Box<dyn std::error::Error>> {
+    let Some(path) = env_path("MOQOM_RELAY_JWKS") else {
+        tracing::warn!(
+            "no MOQOM_RELAY_JWKS, so no session is authenticated and every one is \
+             limited by address"
+        );
+        return Ok(Authenticator::disabled());
+    };
+
+    let document = std::fs::read_to_string(&path)
+        .map_err(|e| format!("reading MOQOM_RELAY_JWKS {}: {e}", path.display()))?;
+    let keys = VerificationKey::parse_set(&document)
+        .map_err(|e| format!("MOQOM_RELAY_JWKS {}: {e}", path.display()))?;
+    if keys.is_empty() {
+        return Err(format!("MOQOM_RELAY_JWKS {} has no keys", path.display()).into());
+    }
+
+    // An unpinned issuer accepts a token minted by any deployment that happens
+    // to share a key identifier, which is a real hazard when identifiers are
+    // derived from the key and two environments restore the same secret.
+    let issuer = env("MOQOM_RELAY_ISSUER").unwrap_or_default();
+    if issuer.is_empty() {
+        tracing::warn!("no MOQOM_RELAY_ISSUER, so tokens from any issuer are accepted");
+    }
+    tracing::info!(keys = keys.len(), %issuer, "verifying session credentials");
+    Ok(Authenticator::new(issuer, keys))
 }
 
 fn env_path(key: &str) -> Option<PathBuf> {
