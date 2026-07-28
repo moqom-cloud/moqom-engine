@@ -43,6 +43,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use moqom_proto::control::setup;
+use moqom_proto::model::{FullTrackName, TrackAlias};
 
 use crate::fabric::SessionId;
 use crate::quota::{Reason, Refusal, Resource, Tier};
@@ -257,6 +258,19 @@ const RTT_BUCKETS: &[f64] = &[
     0.001, 0.005, 0.010, 0.020, 0.040, 0.060, 0.080, 0.100, 0.150, 0.200, 0.300, 0.500, 1.0, 2.0,
 ];
 
+/// How long a forwarded track may be silent before the scrape counts it.
+///
+/// Ascending, and read as "at least": each bound is a separate gauge, so an
+/// alert can be written against the one that matters without a histogram
+/// quantile over a population that changes shape every second.
+///
+/// The values come from what silence of that length means. Under a second is
+/// ordinary — a keyframe interval, a stall in an encoder, a congested uplink
+/// catching up. A few seconds is a publisher in trouble. Half a minute is a
+/// publisher that is not coming back on its own, still holding a subscription
+/// and a place in whatever the relay thinks the room contains.
+const SILENCE_BUCKETS: &[u64] = &[1, 5, 30];
+
 /// Buckets for how long a session lasted, in seconds.
 ///
 /// The short end is what matters: a cluster of sessions ending inside a second
@@ -312,6 +326,16 @@ struct Inner {
     congestion_events: AtomicU64,
 
     live: Mutex<HashMap<SessionId, Arc<Live>>>,
+
+    /// Tracks currently being pulled, keyed by the session and alias that
+    /// identify one upstream subscription.
+    ///
+    /// Not keyed by track name, though that would read better. A publisher that
+    /// reconnects before the relay reaps its old session has the same track
+    /// pulled twice for a moment, and under a name key the older subscription's
+    /// teardown would delete the newer one's row — silence that reads as total,
+    /// on the one track that is definitely fine.
+    flows: Mutex<HashMap<(SessionId, TrackAlias), Arc<Flowing>>>,
 }
 
 /// One connected session, as an observer sees it.
@@ -360,6 +384,136 @@ impl Live {
             udp_rx_bytes: AtomicU64::new(0),
             forwarding: AtomicU64::new(0),
         }
+    }
+}
+
+/// One track the relay is forwarding, and when it last carried anything.
+///
+/// # Why this exists when the transport already reports liveness
+///
+/// It answers a question no timeout can. A publisher whose camera freezes, whose
+/// encoder wedges, or whose app is suspended mid-broadcast keeps a perfectly
+/// healthy QUIC connection: it answers PINGs, its RTT is fine, and it will sit
+/// there indefinitely. Nothing in [`Live`] moves. The only evidence is that the
+/// track stopped carrying bytes, and this is the only place that is visible.
+///
+/// # Why bytes and not objects
+///
+/// Because the forwarding path does not parse objects, deliberately — see this
+/// module's header. So the honest measurement is when bytes last arrived on the
+/// track, which is what [`Self::silence`] reports, and it is the more sensitive
+/// of the two anyway: a publisher that stops mid-object shows up here at once
+/// and would not show up in an object count until the object completed, which is
+/// to say never.
+#[derive(Debug)]
+pub struct Flowing {
+    /// Which track this is, for a diagnostic endpoint that can afford the
+    /// cardinality. Never a metric label.
+    pub track: FullTrackName,
+
+    /// The session pulling it, so a row here can be joined to one in
+    /// `/sessions`.
+    pub session: SessionId,
+
+    /// The upstream alias, which is what a subgroup header carries and therefore
+    /// what a log line about one refers to.
+    pub alias: TrackAlias,
+
+    /// When the relay began pulling it.
+    pub since: Instant,
+
+    /// Microseconds after [`Self::since`] that bytes last arrived, or zero if
+    /// none ever have.
+    ///
+    /// Relative to `since` rather than an absolute instant because `Instant` is
+    /// not an atomic and the update is on the forwarding path. Zero is reserved
+    /// for "nothing yet", so a recorded arrival is floored at one microsecond.
+    last_micros: AtomicU64,
+
+    /// Subgroup streams received on it.
+    subgroups: AtomicU64,
+
+    /// Payload bytes received on it.
+    bytes: AtomicU64,
+}
+
+impl Flowing {
+    fn new(track: FullTrackName, session: SessionId, alias: TrackAlias) -> Self {
+        Self {
+            track,
+            session,
+            alias,
+            since: Instant::now(),
+            last_micros: AtomicU64::new(0),
+            subgroups: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
+        }
+    }
+
+    /// Bytes arrived. Called per read on the forwarding path.
+    pub fn carried(&self, bytes: usize) {
+        self.touch();
+        self.bytes.fetch_add(bytes as u64, ORDER);
+    }
+
+    /// A subgroup stream opened on this track.
+    ///
+    /// Counts as activity as much as the bytes do. A header is evidence the
+    /// publisher is running, and it is the only evidence on a subgroup that is
+    /// dropped for having no subscribers — where the payload is never read, so
+    /// [`Self::carried`] is never reached.
+    pub fn subgroup(&self) {
+        self.touch();
+        self.subgroups.fetch_add(1, ORDER);
+    }
+
+    fn touch(&self) {
+        let elapsed: u64 = self
+            .since
+            .elapsed()
+            .as_micros()
+            .try_into()
+            .unwrap_or(u64::MAX);
+        // Floored at one so that zero keeps meaning "nothing yet". Bytes can
+        // arrive in the same microsecond the pull was registered, and without
+        // this such a track would read as having carried nothing — for the rest
+        // of its life, since every later store is well past zero.
+        self.last_micros.store(elapsed.max(1), ORDER);
+    }
+
+    /// How long since anything arrived, counting from when the pull started if
+    /// nothing ever has.
+    ///
+    /// Measuring from the start rather than reporting "never" is what makes a
+    /// track that produced nothing at all indistinguishable from one that went
+    /// quiet — which is correct, because they are the same problem and want the
+    /// same alert.
+    #[must_use]
+    pub fn silence(&self) -> Duration {
+        // Saturating because `elapsed` is read after the store it is being
+        // compared against, and on a system where the two disagree slightly the
+        // answer is "no silence" rather than an underflowed eternity.
+        self.since
+            .elapsed()
+            .saturating_sub(Duration::from_micros(self.last_micros.load(ORDER)))
+    }
+
+    /// Whether anything has ever arrived on it.
+    #[must_use]
+    pub fn has_carried(&self) -> bool {
+        self.last_micros.load(ORDER) > 0
+    }
+
+    /// Subgroup streams received.
+    #[must_use]
+    pub fn subgroup_count(&self) -> u64 {
+        self.subgroups.load(ORDER)
+    }
+
+    /// Payload bytes received.
+    #[must_use]
+    pub fn byte_count(&self) -> u64 {
+        self.bytes.load(ORDER)
     }
 }
 
@@ -415,6 +569,7 @@ impl Metrics {
                 lost_packets: AtomicU64::new(0),
                 congestion_events: AtomicU64::new(0),
                 live: Mutex::new(HashMap::new()),
+                flows: Mutex::new(HashMap::new()),
             })),
         }
     }
@@ -524,6 +679,51 @@ impl Metrics {
         live.mtu.store(u64::from(current.mtu), ORDER);
         live.udp_tx_bytes.store(current.udp_tx_bytes, ORDER);
         live.udp_rx_bytes.store(current.udp_rx_bytes, ORDER);
+    }
+
+    /// The relay began pulling a track. The handle is where its activity goes.
+    ///
+    /// Returned unconditionally, unlike [`Self::session_started`]. The caller
+    /// keeps it in the map that resolves a subgroup's alias to its track, so a
+    /// `None` here would mean the cache stopped working when observability was
+    /// turned off. With metrics disabled the handle is simply not registered
+    /// anywhere, and updating it costs two relaxed atomics that nobody reads.
+    #[must_use]
+    pub fn track_started(
+        &self,
+        track: FullTrackName,
+        session: SessionId,
+        alias: TrackAlias,
+    ) -> Arc<Flowing> {
+        let flow = Arc::new(Flowing::new(track, session, alias));
+        if let Some(inner) = self.inner() {
+            inner
+                .lock_flows()
+                .insert((session, alias), Arc::clone(&flow));
+        }
+        flow
+    }
+
+    /// The relay stopped pulling a track.
+    pub fn track_ended(&self, session: SessionId, alias: TrackAlias) {
+        if let Some(inner) = self.inner() {
+            inner.lock_flows().remove(&(session, alias));
+        }
+    }
+
+    /// Every track being pulled, ordered by session then alias.
+    #[must_use]
+    pub fn flows(&self) -> Vec<Arc<Flowing>> {
+        let Some(inner) = self.inner() else {
+            return Vec::new();
+        };
+        let mut flows: Vec<((SessionId, TrackAlias), Arc<Flowing>)> = inner
+            .lock_flows()
+            .iter()
+            .map(|(key, flow)| (*key, Arc::clone(flow)))
+            .collect();
+        flows.sort_by_key(|(key, _)| *key);
+        flows.into_iter().map(|(_, flow)| flow).collect()
     }
 
     /// How many tracks a session is forwarding, for its diagnostic row.
@@ -871,6 +1071,49 @@ impl Metrics {
             inner.fanout_failures.load(ORDER),
         );
 
+        // Track liveness, aggregated at scrape time.
+        //
+        // Per-track series are what an operator actually wants and are exactly
+        // what this file may not publish: one series per track is one per
+        // participant per rung, which anybody who can connect could grow without
+        // limit. So the population is bucketed here and named in `/tracks`.
+        //
+        // Cumulative, so `{ge="5"}` means "silent for at least five seconds" and
+        // an alert is one comparison rather than a sum over buckets.
+        let silences: Vec<Duration> = inner
+            .lock_flows()
+            .values()
+            .map(|flow| flow.silence())
+            .collect();
+        let mut series = Vec::with_capacity(SILENCE_BUCKETS.len());
+        for &bound in SILENCE_BUCKETS {
+            let over = silences
+                .iter()
+                .filter(|silence| silence.as_secs() >= bound)
+                .count();
+            series.push(("ge", bound, over as u64));
+        }
+        plain(
+            &mut out,
+            "gauge",
+            "moqom_relay_tracks",
+            "Tracks the relay is currently pulling and forwarding.",
+            silences.len() as u64,
+        );
+        let _ = writeln!(
+            out,
+            "# HELP moqom_relay_tracks_silent Forwarded tracks whose last bytes arrived at \
+             least this many seconds ago. A publisher whose camera or encoder has stopped \
+             keeps a healthy connection, so this is the only signal that it has."
+        );
+        let _ = writeln!(out, "# TYPE moqom_relay_tracks_silent gauge");
+        for (label, bound, count) in series {
+            let _ = writeln!(
+                out,
+                "moqom_relay_tracks_silent{{{label}=\"{bound}\"}} {count}"
+            );
+        }
+
         histogram(
             &mut out,
             "moqom_relay_connection_rtt_seconds",
@@ -999,6 +1242,15 @@ impl Inner {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+
+    #[allow(clippy::type_complexity)] // the key is a pair; naming it would hide that
+    fn lock_flows(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<(SessionId, TrackAlias), Arc<Flowing>>> {
+        self.flows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 }
 
 /// Values read from live state at scrape time rather than counted as they
@@ -1109,6 +1361,7 @@ fn histogram(out: &mut String, name: &str, help: &str, hist: &Histogram) {
 mod tests {
     use super::*;
     use crate::fabric::Fabric;
+    use moqom_proto::model::TrackNamespace;
 
     /// A real identifier rather than a fabricated one, so these tests cannot
     /// drift from how identifiers are actually allocated.
@@ -1275,6 +1528,166 @@ mod tests {
         assert!(exposed.contains(r#"moqom_relay_cache_lookups_total{outcome="hit"} 40"#));
         assert!(exposed.contains("moqom_relay_clock_synchronised 1"));
         assert!(exposed.contains("moqom_relay_clock_max_error_nanoseconds 2500000"));
+    }
+
+    fn track(name: &str) -> FullTrackName {
+        FullTrackName::new(
+            TrackNamespace::from_parts(["acme", "r", "room-1", "ada", "phone"])
+                .expect("valid namespace"),
+            bytes::Bytes::copy_from_slice(name.as_bytes()),
+        )
+        .expect("valid track name")
+    }
+
+    /// The point of the whole thing: a track that has never carried anything
+    /// reads as silent for as long as it has existed, rather than as absent or
+    /// as fine.
+    #[test]
+    fn a_track_that_has_carried_nothing_is_silent_from_the_start() {
+        let metrics = Metrics::new();
+        let flow = metrics.track_started(track("video/360p"), session_id(), TrackAlias::from(1u32));
+
+        assert!(!flow.has_carried());
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(
+            flow.silence() >= Duration::from_millis(20),
+            "silence was {:?}",
+            flow.silence()
+        );
+    }
+
+    /// And bytes reset it, which is the other half of the same claim: without
+    /// this the gauge would report every busy track as stalled.
+    #[test]
+    fn carrying_bytes_resets_the_silence() {
+        let metrics = Metrics::new();
+        let flow = metrics.track_started(track("video/360p"), session_id(), TrackAlias::from(1u32));
+
+        std::thread::sleep(Duration::from_millis(20));
+        flow.carried(1400);
+
+        assert!(flow.has_carried());
+        assert!(
+            flow.silence() < Duration::from_millis(20),
+            "silence was {:?}",
+            flow.silence()
+        );
+        assert_eq!(flow.byte_count(), 1400);
+    }
+
+    /// A header with no payload is still evidence the publisher is running, and
+    /// it is the *only* evidence on a subgroup dropped for having no
+    /// subscribers, where the payload is never read at all.
+    #[test]
+    fn a_subgroup_header_alone_counts_as_activity() {
+        let metrics = Metrics::new();
+        let flow = metrics.track_started(track("video/360p"), session_id(), TrackAlias::from(1u32));
+
+        std::thread::sleep(Duration::from_millis(20));
+        flow.subgroup();
+
+        assert!(flow.silence() < Duration::from_millis(20));
+        assert_eq!(flow.subgroup_count(), 1);
+        assert_eq!(flow.byte_count(), 0, "a header is not payload");
+    }
+
+    /// One track per session and alias, not per name. A publisher reconnecting
+    /// holds the same track twice for a moment, and collapsing the two would let
+    /// the older one's teardown delete the live one's row.
+    #[test]
+    fn the_same_track_pulled_twice_is_two_rows() {
+        let metrics = Metrics::new();
+        // One fabric, so these are genuinely two identifiers. `session_id()`
+        // starts a fresh fabric each call and would hand back the same number
+        // twice, which is the collision this test is supposed to rule out.
+        let fabric = Fabric::new();
+        let old = fabric.next_session_id();
+        let new = fabric.next_session_id();
+        assert_ne!(old, new);
+        let alias = TrackAlias::from(1u32);
+
+        let _first = metrics.track_started(track("video/360p"), old, alias);
+        let second = metrics.track_started(track("video/360p"), new, alias);
+        second.carried(1400);
+        assert_eq!(metrics.flows().len(), 2);
+
+        metrics.track_ended(old, alias);
+
+        let remaining = metrics.flows();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(
+            remaining[0].session, new,
+            "the reconnected session's row survived its predecessor's teardown"
+        );
+        assert!(remaining[0].has_carried());
+    }
+
+    /// A series per track would be a series per participant per rung, which
+    /// anybody who can connect could mint without limit. So the population is
+    /// bucketed, and the bucket bounds are fixed at compile time.
+    #[test]
+    fn silence_is_exposed_as_a_bounded_set_of_buckets() {
+        let metrics = Metrics::new();
+        let session = session_id();
+        let busy = metrics.track_started(track("video/720p"), session, TrackAlias::from(1u32));
+        let _quiet = metrics.track_started(track("video/360p"), session, TrackAlias::from(2u32));
+        busy.carried(1400);
+
+        let exposed = metrics.expose(&Gauges::default());
+        assert!(exposed.contains("moqom_relay_tracks 2"), "{exposed}");
+        // Neither has been silent for a whole second yet, so the buckets are the
+        // shape rather than the numbers here. That they are all present is the
+        // property: a gauge that only appears once something is wrong cannot be
+        // alerted on, because the alert has nothing to compare against.
+        for bound in SILENCE_BUCKETS {
+            assert!(
+                exposed.contains(&format!("moqom_relay_tracks_silent{{ge=\"{bound}\"}} 0")),
+                "no bucket for {bound}: {exposed}"
+            );
+        }
+    }
+
+    /// The buckets read as "at least", so a track silent for six seconds is in
+    /// both the one-second and five-second buckets. Anything else makes an alert
+    /// a sum over buckets instead of one comparison.
+    #[test]
+    fn a_silent_track_lands_in_every_bucket_it_exceeds() {
+        let metrics = Metrics::new();
+        let flow = metrics.track_started(track("video/360p"), session_id(), TrackAlias::from(1u32));
+
+        // Reached by moving the start backwards rather than by waiting six
+        // seconds, which is the difference between a test suite that runs and
+        // one nobody runs.
+        let aged = Arc::new(Flowing {
+            track: flow.track.clone(),
+            session: flow.session,
+            alias: flow.alias,
+            since: Instant::now()
+                .checked_sub(Duration::from_secs(6))
+                .expect("a process that has been up for six seconds"),
+            last_micros: AtomicU64::new(0),
+            subgroups: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
+        });
+        metrics
+            .inner()
+            .expect("enabled")
+            .lock_flows()
+            .insert((flow.session, flow.alias), aged);
+
+        let exposed = metrics.expose(&Gauges::default());
+        assert!(
+            exposed.contains(r#"moqom_relay_tracks_silent{ge="1"} 1"#),
+            "{exposed}"
+        );
+        assert!(
+            exposed.contains(r#"moqom_relay_tracks_silent{ge="5"} 1"#),
+            "{exposed}"
+        );
+        assert!(
+            exposed.contains(r#"moqom_relay_tracks_silent{ge="30"} 0"#),
+            "six seconds is not thirty: {exposed}"
+        );
     }
 
     /// A relay with a bad clock keeps serving media perfectly and shows nothing

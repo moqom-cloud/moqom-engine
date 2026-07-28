@@ -176,9 +176,10 @@ impl Surface {
             }
             "/sessions" => Response::json(self.sessions_json()),
             "/rooms" => Response::json(self.rooms_json()),
+            "/tracks" => Response::json(self.tracks_json()),
             "/" => Response::text(
                 200,
-                "moqom-relay\n\n/metrics\n/healthz\n/readyz\n/sessions\n/rooms\n",
+                "moqom-relay\n\n/metrics\n/healthz\n/readyz\n/sessions\n/rooms\n/tracks\n",
             ),
             _ => Response::text(404, "no such endpoint\n"),
         }
@@ -272,6 +273,52 @@ impl Surface {
             self.metrics.session_count(),
             self.metrics.uptime().as_secs()
         );
+        out
+    }
+
+    /// Every track being forwarded, and how long since each carried anything.
+    ///
+    /// The endpoint to open when a viewer says a stream froze. `/sessions` will
+    /// show the publisher connected with a healthy RTT, because it is: the
+    /// connection is fine and the pictures stopped. `silent_ms` is the only place
+    /// the difference appears, and naming the track is the point — which is also
+    /// why it cannot be a metric, since a series per track is a series per
+    /// participant per rung and anybody who can connect could mint them.
+    ///
+    /// Sorted by descending silence, so whatever is wrong is at the top.
+    fn tracks_json(&self) -> String {
+        let mut flows = self.metrics.flows();
+        flows.sort_by(|a, b| {
+            b.silence()
+                .cmp(&a.silence())
+                // Ties broken by name so that a quiet relay produces stable
+                // output between scrapes, which is what makes diffing two of
+                // them meaningful.
+                .then_with(|| a.track.to_string().cmp(&b.track.to_string()))
+        });
+
+        let mut out = String::from("{\"tracks\":[");
+        for (index, flow) in flows.iter().enumerate() {
+            if index > 0 {
+                out.push(',');
+            }
+            let _ = write!(
+                out,
+                "{{\"namespace\":{},\"name\":{},\"session\":{},\"alias\":{},\
+                 \"age_seconds\":{},\"silent_ms\":{},\"carried\":{},\
+                 \"subgroups\":{},\"bytes\":{}}}",
+                json_namespace(flow.track.namespace()),
+                json_string(flow.track.name()),
+                flow.session.number(),
+                flow.alias.get(),
+                flow.since.elapsed().as_secs(),
+                flow.silence().as_millis(),
+                flow.has_carried(),
+                flow.subgroup_count(),
+                flow.byte_count(),
+            );
+        }
+        let _ = write!(out, "],\"count\":{}}}", flows.len());
         out
     }
 
@@ -507,6 +554,18 @@ mod tests {
         TrackNamespace::from_parts(fields).expect("valid namespace")
     }
 
+    fn track(namespace: &TrackNamespace, name: &str) -> moqom_proto::model::FullTrackName {
+        moqom_proto::model::FullTrackName::new(
+            namespace.clone(),
+            bytes::Bytes::copy_from_slice(name.as_bytes()),
+        )
+        .expect("valid track name")
+    }
+
+    fn alias(n: u32) -> moqom_proto::model::TrackAlias {
+        moqom_proto::model::TrackAlias::from(n)
+    }
+
     fn surface() -> (Surface, Fabric) {
         let fabric = Fabric::new();
         (Surface::new(Metrics::new(), fabric.clone()), fabric)
@@ -670,6 +729,51 @@ mod tests {
         assert!(body.contains(r#""cwnd_bytes":48000"#), "{body}");
         assert!(body.contains(r#""mtu":1350"#), "{body}");
         assert!(body.contains(r#""count":1"#), "{body}");
+    }
+
+    /// The endpoint exists to name what is stalled, so the ordering is the
+    /// feature: an operator opening this during an incident should not have to
+    /// sort a thousand healthy tracks to find the one that stopped.
+    #[test]
+    fn tracks_are_listed_worst_first() {
+        let (surface, fabric) = surface();
+        let session = fabric.next_session_id();
+        let namespace = namespace(&["acme", "r", "room-1", "ada", "phone"]);
+
+        let quiet =
+            surface
+                .metrics
+                .track_started(track(&namespace, "video/360p"), session, alias(1));
+        let busy =
+            surface
+                .metrics
+                .track_started(track(&namespace, "video/720p"), session, alias(2));
+        // Only one of them is carrying anything, so the other has been silent
+        // for its whole life and belongs first.
+        std::thread::sleep(Duration::from_millis(5));
+        busy.carried(1400);
+
+        let body = surface.respond("/tracks").body;
+        let quiet_at = body.find("video/360p").expect("the quiet track is listed");
+        let busy_at = body.find("video/720p").expect("the busy track is listed");
+        assert!(quiet_at < busy_at, "the silent track comes first: {body}");
+        assert!(body.contains(r#""carried":false"#), "{body}");
+        assert!(body.contains(r#""carried":true"#), "{body}");
+        assert!(body.contains(r#""bytes":1400"#), "{body}");
+        assert!(body.ends_with(r#","count":2}"#), "{body}");
+
+        drop(quiet);
+    }
+
+    /// The list is not a leak of everything that ever flowed: a relay pulling
+    /// nothing says so, which is what makes a non-empty list meaningful.
+    #[test]
+    fn a_relay_pulling_nothing_lists_nothing() {
+        let (surface, _fabric) = surface();
+        assert_eq!(
+            surface.respond("/tracks").body,
+            r#"{"tracks":[],"count":0}"#
+        );
     }
 
     /// A namespace an unauthenticated peer chose ends up in this JSON, so the

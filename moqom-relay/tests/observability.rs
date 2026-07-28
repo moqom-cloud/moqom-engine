@@ -55,6 +55,11 @@ async fn eventually(what: &str, relay: &Relay, check: impl Fn(&str) -> bool) -> 
     .await
 }
 
+/// The `/tracks` body a diagnostic request would return right now.
+fn tracks(relay: &Relay) -> String {
+    relay.surface.respond("/tracks").body
+}
+
 /// Wait for an announcement to reach the fabric before asserting on it.
 async fn registered(relay: &Relay) {
     within("the announcement to register", async {
@@ -229,6 +234,143 @@ async fn egress_exceeds_ingress_by_the_fan_out_ratio() {
         ),
         2
     );
+}
+
+/// The case no transport signal can reach: the publisher is connected, the
+/// connection is healthy, and the media has stopped.
+///
+/// This is the whole justification for tracking silence per track. Everything
+/// else the relay reports about that publisher looks correct, because it *is*
+/// correct — the session is live, the RTT is fine, the announcement stands — and
+/// a viewer is looking at a frozen picture. So the assertions here are as much
+/// about what stays healthy as about what goes stale.
+#[tokio::test]
+async fn a_publisher_that_stops_sending_shows_up_as_a_silent_track() {
+    let relay = Relay::start();
+    let mut publisher = Client::connect(&relay).await;
+    let mut subscriber = Client::connect(&relay).await;
+
+    let _announcement = publisher.announce(&namespace(&["acme", "room-42"])).await;
+    registered(&relay).await;
+
+    let video = track(&["acme", "room-42"], "video");
+    let upstream = TrackAlias::from(7_u32);
+    let (_served, feed) = tokio::join!(
+        publisher.answer_subscription(upstream),
+        subscriber.subscribe(&video),
+    );
+    let _feed = feed.expect("subscribed");
+
+    // Nothing has been published yet, so the track exists and has carried
+    // nothing. That must already read as silent: a publisher that never starts
+    // is the same problem as one that stops, and wants the same alert.
+    let scrape = eventually("the track to be counted", &relay, |s| {
+        value(s, "moqom_relay_tracks") == 1
+    })
+    .await;
+    for bound in ["1", "5", "30"] {
+        assert_eq!(
+            series(&scrape, "moqom_relay_tracks_silent", "ge", bound),
+            0,
+            "nothing has been silent for {bound}s yet"
+        );
+    }
+
+    let before = tracks(&relay);
+    assert!(
+        before.contains(r#""carried":false"#),
+        "a track that has carried nothing says so: {before}"
+    );
+
+    publisher
+        .publish_subgroup(upstream, &[b"a frame, and then nothing"])
+        .await;
+    subscriber.read_subgroup().await;
+
+    // Silence resets on arrival, which is the half that would make the gauge
+    // useless if it were wrong: without it every busy track reads as stalled.
+    let flowing = within("the track to report bytes", async {
+        loop {
+            let body = tracks(&relay);
+            if body.contains(r#""carried":true"#) {
+                return body;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(flowing.contains(r#""name":"video""#), "{flowing}");
+    assert!(flowing.contains(r#""subgroups":1"#), "{flowing}");
+
+    // And now the publisher simply stops. No withdrawal, no disconnect: it holds
+    // the connection open and sends nothing, which is what a frozen camera does.
+    let quiet = within("the silence to be measurable", async {
+        loop {
+            let body = tracks(&relay);
+            if !body.contains(r#""silent_ms":0"#) {
+                return body;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+
+    // The session is still perfectly healthy, which is exactly why the track
+    // needed its own signal.
+    let scrape = relay.scrape();
+    assert_eq!(value(&scrape, "moqom_relay_sessions"), 2);
+    assert_eq!(
+        series(
+            &scrape,
+            "moqom_relay_sessions_ended_total",
+            "reason",
+            "clean"
+        ),
+        0,
+        "nobody has gone anywhere: {quiet}"
+    );
+}
+
+/// The other direction: the row goes when the pull does, rather than
+/// accumulating into a list of tracks that stopped hours ago.
+///
+/// It matters more than tidiness. A row that never leaves is permanently and
+/// increasingly silent, so the gauge these feed climbs on its own — and a gauge
+/// that reports stalled publishers where there are none is worse than no gauge,
+/// because the alert built on it gets muted.
+#[tokio::test]
+async fn a_track_stops_being_reported_when_the_pull_ends() {
+    let relay = Relay::start();
+    let mut publisher = Client::connect(&relay).await;
+    let mut subscriber = Client::connect(&relay).await;
+
+    let _announcement = publisher.announce(&namespace(&["acme", "room-42"])).await;
+    registered(&relay).await;
+
+    let video = track(&["acme", "room-42"], "video");
+    let upstream = TrackAlias::from(7_u32);
+    let (served, feed) = tokio::join!(
+        publisher.answer_subscription(upstream),
+        subscriber.subscribe(&video),
+    );
+    let _feed = feed.expect("subscribed");
+
+    eventually("the track to be counted", &relay, |s| {
+        value(s, "moqom_relay_tracks") == 1
+    })
+    .await;
+
+    // The publisher ends the subscription it was serving, which closes the
+    // stream the relay was pulling on.
+    drop(served);
+
+    let scrape = eventually("the track to be released", &relay, |s| {
+        value(s, "moqom_relay_tracks") == 0
+    })
+    .await;
+    assert_eq!(value(&scrape, "moqom_relay_tracks"), 0);
+    let body = tracks(&relay);
+    assert!(body.contains(r#""count":0"#), "{body}");
 }
 
 /// A subgroup nobody wants is a different event from one that was forwarded, and

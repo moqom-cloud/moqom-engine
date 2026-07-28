@@ -14,7 +14,7 @@
 
 mod support;
 
-use moqom_proto::control::FetchKind;
+use moqom_proto::control::{DoneReason, FetchKind};
 use moqom_proto::data::FetchRecord;
 use moqom_proto::model::{FetchEnd, GroupId, Location, ObjectId, TrackAlias};
 use moqom_proto::varint::VarInt;
@@ -87,7 +87,44 @@ async fn closing_an_announcement_withdraws_it() {
     assert_eq!(watch.next().await, Announced::Available(room.clone()));
 
     announcement.withdraw();
-    assert_eq!(watch.next().await, Announced::Gone(room));
+
+    // `Stopped`, because the publisher chose to. This is the distinction a bare
+    // draft-19 `NAMESPACE_DONE` cannot carry, and the reason for the extension:
+    // a subscriber that cannot tell this from a dropped connection has to guess
+    // whether to hold the publisher's place open, and will be wrong half the
+    // time. See the next test for the other half.
+    assert_eq!(
+        watch.next().await,
+        Announced::Gone(room, Some(DoneReason::Stopped))
+    );
+}
+
+/// The other half: a publisher whose session dies without withdrawing anything.
+///
+/// Identical on the wire to the test above in draft-19 — same message, same
+/// suffix — and the whole point of the reason is that it no longer is.
+#[tokio::test]
+async fn a_vanished_publisher_is_reported_as_vanished() {
+    let relay = Relay::start();
+    let mut publisher = Client::connect(&relay).await;
+    let mut subscriber = Client::connect(&relay).await;
+
+    let room = namespace(&["acme", "room-42"]);
+    let announcement = publisher.announce(&room).await;
+    let mut watch = subscriber.watch(&namespace(&["acme"])).await;
+    assert_eq!(watch.next().await, Announced::Available(room.clone()));
+
+    // Gone without a word: the connection disappears rather than the
+    // announcement stream closing. Leaked deliberately, because dropping it
+    // would close the stream cleanly and produce `Stopped` — which is exactly
+    // the confusion under test.
+    std::mem::forget(announcement);
+    publisher.vanish();
+
+    assert_eq!(
+        watch.next().await,
+        Announced::Gone(room, Some(DoneReason::Vanished))
+    );
 }
 
 /// A watch under a different prefix hears nothing. Tuple prefixes are the reason

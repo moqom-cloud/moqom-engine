@@ -33,7 +33,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use moqom_proto::control::RequestErrorCode;
+use moqom_proto::control::{DoneReason, RequestErrorCode};
 use moqom_proto::model::{FullTrackName, TrackAlias, TrackNamespace};
 use tokio::sync::{mpsc, oneshot};
 
@@ -148,7 +148,11 @@ pub enum NamespaceEvent {
     /// A namespace is now available.
     Available(TrackNamespace),
     /// A namespace that was announced has been withdrawn.
-    Gone(TrackNamespace),
+    ///
+    /// Carries why, because the relay is the only party that can distinguish a
+    /// publisher who withdrew from one whose session died, and subscribers
+    /// cannot behave correctly without knowing which. See [`DoneReason`].
+    Gone(TrackNamespace, DoneReason),
 }
 
 impl NamespaceEvent {
@@ -156,7 +160,7 @@ impl NamespaceEvent {
     #[must_use]
     pub const fn namespace(&self) -> &TrackNamespace {
         match self {
-            Self::Available(namespace) | Self::Gone(namespace) => namespace,
+            Self::Available(namespace) | Self::Gone(namespace, _) => namespace,
         }
     }
 }
@@ -356,7 +360,15 @@ impl Fabric {
     /// namespace: with another session still publishing it, the namespace has
     /// not gone away, and saying otherwise would have subscribers tear down
     /// tracks that still work.
-    pub fn withdraw(&self, owner: SessionId, namespace: &TrackNamespace) {
+    /// Withdraw an announcement, saying why.
+    ///
+    /// `reason` is [`DoneReason::Stopped`] when the publisher asked, by closing
+    /// the stream that announced it, and [`DoneReason::Vanished`] when the
+    /// session ended without asking. Only the second is worth waiting out, so
+    /// telling them apart here is what lets a subscriber hold a place open for
+    /// somebody who is reconnecting without also holding one for somebody who
+    /// left.
+    pub fn withdraw(&self, owner: SessionId, namespace: &TrackNamespace, reason: DoneReason) {
         let mut state = self.lock();
         let Some(holders) = state.namespaces.get_mut(namespace) else {
             return;
@@ -368,11 +380,15 @@ impl Fabric {
         state.namespaces.remove(namespace);
         broadcast(
             &mut state.watchers,
-            &NamespaceEvent::Gone(namespace.clone()),
+            &NamespaceEvent::Gone(namespace.clone(), reason),
         );
     }
 
     /// Withdraw everything belonging to `owner`, for use when its session ends.
+    ///
+    /// Everything here is [`DoneReason::Vanished`] by construction: a publisher
+    /// that withdrew an announcement deliberately no longer holds it, so
+    /// whatever is left at teardown is precisely what nobody said goodbye for.
     pub fn remove_session(&self, owner: SessionId) {
         let published: Vec<TrackNamespace> = {
             let state = self.lock();
@@ -384,7 +400,7 @@ impl Fabric {
                 .collect()
         };
         for namespace in published {
-            self.withdraw(owner, &namespace);
+            self.withdraw(owner, &namespace, DoneReason::Vanished);
         }
         self.lock().watchers.retain(|w| w.owner != owner);
     }
@@ -510,7 +526,7 @@ mod tests {
         fabric.announce(publisher, namespace(&["room", "1"]), tx);
         assert!(fabric.publisher(&namespace(&["room", "1"])).is_some());
 
-        fabric.withdraw(publisher, &namespace(&["room", "1"]));
+        fabric.withdraw(publisher, &namespace(&["room", "1"]), DoneReason::Stopped);
         assert!(fabric.publisher(&namespace(&["room", "1"])).is_none());
     }
 
@@ -551,10 +567,13 @@ mod tests {
             Some(NamespaceEvent::Available(namespace(&["room", "7"])))
         );
 
-        fabric.withdraw(publisher, &namespace(&["room", "7"]));
+        fabric.withdraw(publisher, &namespace(&["room", "7"]), DoneReason::Stopped);
         assert_eq!(
             events.recv().await,
-            Some(NamespaceEvent::Gone(namespace(&["room", "7"])))
+            Some(NamespaceEvent::Gone(
+                namespace(&["room", "7"]),
+                DoneReason::Stopped
+            ))
         );
     }
 
@@ -636,14 +655,17 @@ mod tests {
         assert!(events.recv().await.is_some());
         assert!(events.recv().await.is_some());
 
-        fabric.withdraw(first, &namespace(&["room", "1"]));
+        fabric.withdraw(first, &namespace(&["room", "1"]), DoneReason::Stopped);
         assert_eq!(events.try_recv(), Err(mpsc::error::TryRecvError::Empty));
         assert!(fabric.publisher(&namespace(&["room", "1"])).is_some());
 
-        fabric.withdraw(second, &namespace(&["room", "1"]));
+        fabric.withdraw(second, &namespace(&["room", "1"]), DoneReason::Stopped);
         assert_eq!(
             events.recv().await,
-            Some(NamespaceEvent::Gone(namespace(&["room", "1"])))
+            Some(NamespaceEvent::Gone(
+                namespace(&["room", "1"]),
+                DoneReason::Stopped
+            ))
         );
     }
 
@@ -664,8 +686,8 @@ mod tests {
         fabric.remove_session(publisher);
         assert!(fabric.namespaces().is_empty());
         // The watcher is still live, so it saw both withdrawals.
-        assert!(matches!(events.try_recv(), Ok(NamespaceEvent::Gone(_))));
-        assert!(matches!(events.try_recv(), Ok(NamespaceEvent::Gone(_))));
+        assert!(matches!(events.try_recv(), Ok(NamespaceEvent::Gone(_, _))));
+        assert!(matches!(events.try_recv(), Ok(NamespaceEvent::Gone(_, _))));
 
         fabric.remove_session(watcher);
         let (tx, _rx) = commands();

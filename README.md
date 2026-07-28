@@ -42,12 +42,19 @@ parses an object, so end-to-end encryption and retention stay compatible.
 The relay can be watched. An admin surface on its own port — off unless
 `MOQOM_RELAY_ADMIN_ADDR` says otherwise — exposes Prometheus metrics for
 sessions, subscriptions, fetches, fan-out and bytes, plus JSON snapshots of live
-sessions and occupied rooms, and separate liveness and readiness so draining
-stops new connections without killing the ones in flight. Round-trip time,
-congestion window and loss are sampled from the QUIC connection itself rather
-than estimated a second time. Metric labels are fixed and low-cardinality;
-anything per-room or per-participant lives in the JSON, because a label whose
-values grow with traffic is how a metrics backend becomes an outage.
+sessions, occupied rooms and forwarded tracks, and separate liveness and
+readiness so draining stops new connections without killing the ones in flight.
+Round-trip time, congestion window and loss are sampled from the QUIC connection
+itself rather than estimated a second time. Metric labels are fixed and
+low-cardinality; anything per-room or per-participant lives in the JSON, because
+a label whose values grow with traffic is how a metrics backend becomes an
+outage.
+
+Track silence is reported alongside all that, because it is the one failure no
+transport signal reaches: a publisher whose camera freezes keeps a healthy
+connection and an unbroken announcement while its viewers watch a still picture.
+`/tracks` names which track stopped and how long ago; `/metrics` carries only the
+population, bucketed.
 
 **What the relay is not yet:** authorising anything (tokens are parsed and
 ignored), deduplicating upstream subscriptions, or scheduling under congestion.

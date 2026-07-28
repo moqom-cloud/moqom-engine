@@ -38,9 +38,10 @@ use std::time::{Instant, SystemTime};
 
 use bytes::{Buf, Bytes, BytesMut};
 use moqom_proto::control::{
-    ControlFrame, Fetch, FetchKind, FetchOk, MessageBody, MessageType, Namespace, NamespaceDone,
-    PublishNamespace, ReasonPhrase, RequestError, RequestErrorCode, RequestId, RequestIdGenerator,
-    Role, Setup, Subscribe, SubscribeNamespace, SubscribeOk, setup, write_message,
+    ControlFrame, DoneReason, Fetch, FetchKind, FetchOk, MessageBody, MessageType, Namespace,
+    NamespaceDone, PublishNamespace, ReasonPhrase, RequestError, RequestErrorCode, RequestId,
+    RequestIdGenerator, Role, Setup, Subscribe, SubscribeNamespace, SubscribeOk, setup,
+    write_message,
 };
 use moqom_proto::data::{
     FetchHeader, FetchRecord, FetchWriter, GroupOrder, SubgroupHeader, SubgroupReader,
@@ -54,7 +55,7 @@ use tokio::sync::{mpsc, oneshot};
 use web_transport_quinn::{RecvStream, SendStream};
 
 use crate::fabric::{Command, Fabric, NamespaceEvent, Route, SessionId, UpstreamError};
-use crate::metrics::{Ending, Fetched, Metrics, Subscribed};
+use crate::metrics::{Ending, Fetched, Flowing, Metrics, Subscribed};
 use crate::quota::{Lease, Principal, Refusal, Resource};
 use crate::{cache, metrics};
 
@@ -281,7 +282,13 @@ pub struct Session {
     /// Subgroup headers carry an alias and nothing else, and an alias is only
     /// meaningful within the session that assigned it — so without this a
     /// forwarded object cannot be filed anywhere a fetch could find it.
-    pulling: Arc<Mutex<HashMap<TrackAlias, FullTrackName>>>,
+    ///
+    /// The value is the track's [`Flowing`] record rather than its name because
+    /// the two are wanted in the same place: the fan-out looks the alias up
+    /// anyway, and noting that bytes arrived is then a store on something already
+    /// in hand rather than a second lookup in a second map that could disagree
+    /// with this one about which tracks exist.
+    pulling: Arc<Mutex<HashMap<TrackAlias, Arc<Flowing>>>>,
     /// Tracks this peer has subscribed to, by the Request ID it used.
     ///
     /// A joining fetch names a subscription rather than a track, on purpose:
@@ -809,20 +816,29 @@ impl Session {
         self.fabric
             .announce(self.id, request.namespace.clone(), self.commands.clone());
 
-        let result = match frames.next().await {
-            Ok(None) => Ok(()),
-            Ok(Some(_)) => Err(SessionError::Protocol(
-                "unexpected message on a PUBLISH_NAMESPACE stream",
-            )),
-            Err(e) => Err(e),
+        // How this stream ends is how the withdrawal is characterised, and it is
+        // the only place the difference is observable. A `FIN` is the publisher
+        // withdrawing on purpose -- draft-19 has no `UNANNOUNCE`, so closing
+        // this stream *is* the withdrawal. Anything else is the announcement
+        // outliving the thing that made it.
+        let (result, reason) = match frames.next().await {
+            Ok(None) => (Ok(()), DoneReason::Stopped),
+            Ok(Some(_)) => (
+                Err(SessionError::Protocol(
+                    "unexpected message on a PUBLISH_NAMESPACE stream",
+                )),
+                DoneReason::Vanished,
+            ),
+            Err(e) => (Err(e), DoneReason::Vanished),
         };
 
         tracing::info!(
             session = %self.id,
             namespace = %request.namespace,
+            reason = ?reason,
             "namespace withdrawn"
         );
-        self.fabric.withdraw(self.id, &request.namespace);
+        self.fabric.withdraw(self.id, &request.namespace, reason);
         result
     }
 
@@ -857,9 +873,9 @@ impl Session {
                             send(send_stream, &Namespace::new(suffix)).await?;
                         }
                     }
-                    Some(NamespaceEvent::Gone(namespace)) => {
+                    Some(NamespaceEvent::Gone(namespace, reason)) => {
                         if let Some(suffix) = suffix_of(&namespace, &prefix) {
-                            send(send_stream, &NamespaceDone::new(suffix)).await?;
+                            send(send_stream, &NamespaceDone::because(suffix, reason)).await?;
                         }
                     }
                 },
@@ -1170,7 +1186,12 @@ impl Session {
                 let downstream = route.alias;
                 let upstream = ok.track_alias;
                 self.add_route(upstream, route);
-                self.lock_pulling().insert(upstream, track.clone());
+                self.lock_pulling().insert(
+                    upstream,
+                    self.fabric
+                        .metrics()
+                        .track_started(track.clone(), self.id, upstream),
+                );
                 tracing::info!(
                     session = %self.id,
                     %track,
@@ -1234,6 +1255,14 @@ impl Session {
 
         let metrics = self.fabric.metrics();
         let routes = self.routes_for(header.track_alias);
+        // Looked up before the early return below, so that a subgroup arriving on
+        // a track nobody is watching still counts as the publisher being alive.
+        // Otherwise the last subscriber leaving would make a healthy publisher
+        // read as silent.
+        let flow = self.lock_pulling().get(&header.track_alias).cloned();
+        if let Some(flow) = &flow {
+            flow.subgroup();
+        }
         let mut tee = self.tee(&header);
         if routes.is_empty() && tee.is_none() {
             // Nowhere to put this. Reading it to the end anyway would spend the
@@ -1267,6 +1296,9 @@ impl Session {
         let leftover = frames.take_buffered();
         if !leftover.is_empty() {
             metrics.ingress(leftover.len());
+            if let Some(flow) = &flow {
+                flow.carried(leftover.len());
+            }
             fan_out(&mut outputs, &leftover, metrics).await;
             if let Some(tee) = &mut tee {
                 tee.absorb(&leftover);
@@ -1283,6 +1315,9 @@ impl Session {
                 Ok(Some(0) | None) | Err(_) => break,
                 Ok(Some(n)) => {
                     metrics.ingress(n);
+                    if let Some(flow) = &flow {
+                        flow.carried(n);
+                    }
                     fan_out(&mut outputs, &chunk[..n], metrics).await;
                     if let Some(tee) = &mut tee {
                         tee.absorb(&chunk[..n]);
@@ -1302,7 +1337,7 @@ impl Session {
         let track = self
             .lock_pulling()
             .get(&header.track_alias)
-            .cloned()
+            .map(|flow| flow.track.clone())
             .or_else(|| {
                 tracing::trace!(
                     session = %self.id,
@@ -1336,7 +1371,7 @@ impl Session {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn lock_pulling(&self) -> std::sync::MutexGuard<'_, HashMap<TrackAlias, FullTrackName>> {
+    fn lock_pulling(&self) -> std::sync::MutexGuard<'_, HashMap<TrackAlias, Arc<Flowing>>> {
         self.pulling
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1369,6 +1404,7 @@ impl Session {
                 // history stays: it belongs to the track, not to a subscription.
                 drop(routes);
                 self.lock_pulling().remove(&alias);
+                self.fabric.metrics().track_ended(self.id, alias);
             }
         }
     }

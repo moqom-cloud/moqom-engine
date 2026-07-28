@@ -19,9 +19,9 @@ use std::sync::Arc;
 
 use bytes::{Buf, Bytes, BytesMut};
 use moqom_proto::control::{
-    ControlFrame, Fetch, FetchKind, FetchOk, MessageBody, MessageType, Namespace, NamespaceDone,
-    PublishNamespace, RequestId, RequestIdGenerator, Role, Setup, Subscribe, SubscribeNamespace,
-    SubscribeOk, write_message,
+    ControlFrame, DoneReason, Fetch, FetchKind, FetchOk, MessageBody, MessageType, Namespace,
+    NamespaceDone, PublishNamespace, RequestId, RequestIdGenerator, Role, Setup, Subscribe,
+    SubscribeNamespace, SubscribeOk, write_message,
 };
 use moqom_proto::data::{
     FetchHeader, FetchReader, FetchRecord, GroupOrder, SubgroupHeader, SubgroupSource,
@@ -186,6 +186,17 @@ pub struct Client {
 }
 
 impl Client {
+    /// Go away without saying anything.
+    ///
+    /// Models the peer that stops existing: a battery that dies, an app the
+    /// system kills, a phone that goes into a tunnel and never comes out. What
+    /// makes it different from every other teardown here is what it does *not*
+    /// do — no stream is finished, so nothing is withdrawn, and the relay learns
+    /// about it from the transport rather than from a message.
+    pub fn vanish(&self) {
+        self.session.close(0, b"vanished");
+    }
+
     /// Connect to `relay` over raw QUIC and exchange SETUP.
     pub async fn connect(relay: &Relay) -> Self {
         Self::try_connect(relay)
@@ -600,8 +611,8 @@ pub struct Watch {
 pub enum Announced {
     /// A namespace became available.
     Available(TrackNamespace),
-    /// A namespace went away.
-    Gone(TrackNamespace),
+    /// A namespace went away, and why the relay said it did.
+    Gone(TrackNamespace, Option<DoneReason>),
 }
 
 impl Watch {
@@ -627,6 +638,7 @@ impl Watch {
                     message
                         .resolve(&self.prefix)
                         .expect("a suffix that fits the prefix"),
+                    message.reason,
                 )
             }
             other => panic!("unexpected {other:?} on a namespace watch"),
