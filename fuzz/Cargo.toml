@@ -1,7 +1,10 @@
 [package]
 name = "moqom-proto-fuzz"
 version = "0.0.0"
-description = "Coverage-guided fuzz targets for the moqom-proto codec"
+description = "Coverage-guided fuzz targets for the codecs that parse untrusted bytes"
+# Apache-2.0 as moqom-proto, even though this also targets the MIT-licensed
+# moqom-rans. Nothing of that crate's substance appears here — the target only
+# calls its public API — so the notice travels with the crate itself.
 license = "Apache-2.0"
 edition = "2024"
 publish = false
@@ -12,6 +15,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 moqom-proto = { path = "../moqom-proto", features = ["testing"] }
+moqom-rans = { path = "../moqom-rans" }
 
 # Fuzzing an unoptimised codec wastes most of the CPU budget on the decoder
 # rather than on exploring inputs.
@@ -28,6 +32,13 @@ bench = false
 [[bin]]
 name = "control_frame"
 path = "fuzz_targets/control_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rans_decoder"
+path = "fuzz_targets/rans_decoder.rs"
 test = false
 doc = false
 bench = false

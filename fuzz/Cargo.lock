@@ -89,6 +89,14 @@ version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
  "moqom-proto",
+ "moqom-rans",
+]
+
+[[package]]
+name = "moqom-rans"
+version = "0.0.0"
+dependencies = [
+ "thiserror",
 ]
 
 [[package]]

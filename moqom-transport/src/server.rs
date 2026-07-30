@@ -80,6 +80,7 @@ impl Server {
         liveness
             .apply(&mut transport)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        Self::size_windows(&mut transport);
         config.transport_config(Arc::new(transport));
 
         // Already the default, and set anyway because of what it does here. A
@@ -92,6 +93,35 @@ impl Server {
         config.migration(true);
 
         Ok(Self::new(quinn::Endpoint::server(config, addr)?))
+    }
+
+    /// Per-stream credit large enough that a media stream never needs a refill,
+    /// and a connection-wide cap to replace the unlimited default.
+    ///
+    /// The per-stream number is not about throughput. `quinn` sends
+    /// `MAX_STREAM_DATA` once a stream has been read past an eighth of its
+    /// window, which at the default 1.25 MB is every 160 KB — two or three times
+    /// a second for one 720p track. That is legal and ordinarily harmless, but a
+    /// subgroup stream *ends* at every group boundary, so sooner or later a
+    /// refill is in flight when the publisher finishes the stream and frees it.
+    /// RFC 9000 § 3.1 anticipates exactly this and says the sender "can safely
+    /// ignore" credit for a stream in `Data Sent`. Apple's stack does not: it
+    /// answers with `STREAM_STATE_ERROR` and takes the whole connection down,
+    /// which on a phone is the call ending mid-sentence roughly every fifteen
+    /// seconds. Sizing the window past what any group carries means the frame is
+    /// never sent, and the race has nothing to lose.
+    ///
+    /// The connection cap is the safety this trades against. `quinn` defaults
+    /// `receive_window` to unlimited, which with a window this large would let a
+    /// peer opening many streams at once buffer without bound; the cap is what
+    /// bounds it, and it is per connection rather than per stream because the
+    /// relay reads promptly and no single track legitimately needs more.
+    fn size_windows(transport: &mut quinn::TransportConfig) {
+        const STREAM_WINDOW: u32 = 16 * 1024 * 1024;
+        const CONNECTION_WINDOW: u32 = 64 * 1024 * 1024;
+
+        transport.stream_receive_window(STREAM_WINDOW.into());
+        transport.receive_window(CONNECTION_WINDOW.into());
     }
 
     /// The address actually bound, which differs from the requested one when

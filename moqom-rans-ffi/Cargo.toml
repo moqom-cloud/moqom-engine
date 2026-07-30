@@ -1,0 +1,24 @@
+[package]
+name = "moqom-rans-ffi"
+description = "C ABI for moqom-rans, for the iOS and Android client SDKs"
+version = "0.0.0"
+# MIT as moqom-rans, since this ships as one library with it.
+license = "MIT"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+# `staticlib` is what an iOS target links, and what `build-apple.sh` assembles
+# into an xcframework. `cdylib` covers Android and a desktop host. `rlib` keeps
+# the crate testable from cargo, which matters because the boundary is where the
+# unsafe lives and it needs tests of its own.
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+moqom-rans = { path = "../moqom-rans" }
+
+[lints]
+workspace = true

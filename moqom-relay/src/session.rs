@@ -478,6 +478,7 @@ impl Session {
 
         let metrics = self.fabric.metrics();
         let mut previous = metrics::Sample::default();
+        let mut blocked = (0u64, 0u64);
         let mut ticker = tokio::time::interval(metrics::SAMPLE_INTERVAL);
         // The first tick fires immediately, which would sample a connection that
         // has barely sent a packet. Skipping it costs one interval of history and
@@ -497,6 +498,33 @@ impl Session {
                 udp_rx_bytes: stats.udp_rx.bytes,
                 mtu: stats.path.current_mtu,
             };
+            // Being blocked by a peer's flow control is not a counter anybody
+            // watches, and it is the difference between "the network is slow" and
+            // "we are waiting a round trip for credit we could have had". A
+            // subscriber that reads slowly, or advertises a per-stream window
+            // smaller than a group, stalls the forward mid-group and then lets it
+            // burst — which arrives as judder rather than as loss, and looks from
+            // the outside exactly like congestion it is not.
+            //
+            // Logged as a delta per interval rather than promoted to a metric
+            // because it should normally be zero: a series that is always zero is
+            // a scrape nobody reads, and a line in the log that appears the moment
+            // it stops being zero is the thing that would have saved an evening.
+            let stream_blocks = stats.frame_tx.stream_data_blocked - blocked.0;
+            let data_blocks = stats.frame_tx.data_blocked - blocked.1;
+            if stream_blocks > 0 || data_blocks > 0 {
+                tracing::info!(
+                    session = %self.id(),
+                    stream_data_blocked = stream_blocks,
+                    data_blocked = data_blocks,
+                    "waiting on peer flow control"
+                );
+            }
+            blocked = (
+                stats.frame_tx.stream_data_blocked,
+                stats.frame_tx.data_blocked,
+            );
+
             metrics.sample(live, previous, current);
             metrics.forwarding(live, self.forwarded_tracks());
             previous = current;

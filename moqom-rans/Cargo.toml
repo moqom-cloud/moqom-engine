@@ -1,0 +1,27 @@
+[package]
+name = "moqom-rans"
+description = "rANS entropy coder for MLVC bitstreams, ported from Microsoft's msrtc_rans"
+version = "0.0.0"
+# MIT, not Apache-2.0 as the neighbouring protocol crates. This is a derivative
+# work of MIT-licensed code from microsoft/mlvc, and the licence requires the
+# copyright and permission notice to travel with it — see LICENSE, which carries
+# Microsoft's notice alongside ours.
+license = "MIT"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+# Inherited wholesale. The two cast lints and `similar_names` that this crate
+# additionally allows are in src/lib.rs, because Cargo permits a crate to inherit
+# the workspace table or to replace it, not to add to it — and replacing it would
+# silently drop `missing_docs` and the rest.
+workspace = true
