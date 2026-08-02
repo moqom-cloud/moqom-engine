@@ -1850,7 +1850,7 @@ impl Session {
     ) {
         // `pulled` before `routes` throughout. See [`share`](Self::share),
         // which is the operation this races with.
-        let pulled = self.lock_pulled();
+        let mut pulled = self.lock_pulled();
         let mut routes = self.lock_routes();
         let Some(remaining) = routes.get_mut(&upstream) else {
             return;
@@ -1864,14 +1864,34 @@ impl Session {
 
         tracing::info!(session = %self.id, %track, %upstream, "last subscriber left");
 
-        // Cancelling is left to the task holding the upstream request stream,
-        // which tears the rest down on its way out — one path for a pull
-        // ending, whether the publisher ended it or the audience did.
-        if let Some(Pull::Ready(pull)) = pulled.get(track)
-            && pull.alias == upstream
-        {
-            pull.stop.notify_one();
+        // Withdrawn here rather than left for the reading task to clear on its
+        // way out, and this is the whole of what makes the teardown safe. A
+        // subscription is not cancelled synchronously — the notify below only
+        // wakes a task — so between raising it and that task running there is a
+        // window in which this record still points at a pull that is finishing.
+        // A viewer arriving in that window would be attached to it and would
+        // receive nothing, forever, with a SUBSCRIBE_OK saying otherwise. That
+        // window is not rare: it is exactly what a phone changing rung does,
+        // unsubscribing and resubscribing to the same publisher in the same
+        // breath. Removing the record under the lock means such a viewer opens
+        // a fresh pull instead, which costs one round trip and is always right.
+        let Some(Pull::Ready(pull)) = pulled.get(track) else {
+            return;
+        };
+        // Only if the record still names *this* subscription: a track taken up
+        // again already holds a newer alias, and cancelling on its behalf would
+        // stop a pull that has an audience.
+        if pull.alias != upstream {
+            return;
         }
+        let stop = Arc::clone(&pull.stop);
+        pulled.remove(track);
+        drop(pulled);
+
+        // The rest of the teardown belongs to the task holding the upstream
+        // request stream, which does it on its way out — one path for a pull
+        // ending, whether the publisher ended it or the audience did.
+        stop.notify_one();
     }
 
     /// The routes for `alias`, forgetting any whose session has gone.

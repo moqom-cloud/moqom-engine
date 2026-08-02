@@ -166,6 +166,65 @@ async fn the_end_reports_how_many_streams_were_sent() {
     assert_eq!(done.stream_count, StreamCount::Exact(3));
 }
 
+/// Leaving and arriving in the same breath, which is what a rung change is.
+///
+/// A phone that moves between rungs unsubscribes and resubscribes to the same
+/// publisher immediately, so the arrival lands inside the teardown of the
+/// departure. Cancelling a pull is not synchronous — raising the signal only
+/// wakes a task — so unless the record is withdrawn at the same moment, a
+/// viewer in that window is attached to a subscription that is finishing and
+/// gets a `SUBSCRIBE_OK` for a track that will never deliver a byte. Silence
+/// with no error is the worst answer available here, and it is indistinguishable
+/// from a stalled network for as long as the viewer is willing to wait.
+///
+/// Repeated because the window is short. One pass proves the sequence works;
+/// the loop is what gives the race a chance to lose.
+#[tokio::test]
+async fn a_viewer_arriving_as_the_last_one_leaves_still_gets_objects() {
+    let relay = Relay::start();
+    let mut publisher = Client::connect(&relay).await;
+    let mut viewer = Client::connect(&relay).await;
+
+    let _announcement = publisher.announce(&namespace(&["acme", "room-42"])).await;
+    registered(&relay).await;
+
+    let video = track(&["acme", "room-42"], "video");
+    let (served, subscribed) = tokio::join!(
+        publisher.answer_subscription(TrackAlias::from(1_u32)),
+        viewer.subscribe(&video),
+    );
+    let mut holding = vec![served];
+    let mut previous = Some(subscribed.expect("the first subscription is accepted"));
+    let mut live = TrackAlias::from(1_u32);
+
+    for round in 2..10_u32 {
+        let next = TrackAlias::from(round);
+        let (asked, subscribed) = tokio::join!(publisher.answer_subscription_if_asked(next), {
+            // The departure and the arrival with nothing between them, which is
+            // what makes this the race rather than a sequence. Dropping first
+            // puts the subscribe inside the teardown.
+            drop(previous.take());
+            viewer.subscribe(&video)
+        });
+        let subscription = subscribed.expect("a subscription taken out as the last one is dropped");
+
+        // Whichever of the two the relay saw first decides where the objects
+        // come from now: a fresh pull if the departure landed first, the
+        // original one if the arrival did.
+        if let Some(served) = asked {
+            live = next;
+            holding.push(served);
+        }
+
+        publisher.publish_subgroup(live, &[b"joined"]).await;
+        let (header, payloads) = viewer.read_subgroup().await;
+        assert_eq!(header.track_alias, subscription.alias);
+        assert_eq!(payloads, vec![bytes::Bytes::from_static(b"joined")]);
+
+        previous = Some(subscription);
+    }
+}
+
 /// A viewer leaving one rung must not disturb another.
 ///
 /// Layer changes are the common case for unsubscribing — a phone moving between

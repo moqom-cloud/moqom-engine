@@ -548,6 +548,32 @@ impl Client {
         }
     }
 
+    /// Answer a SUBSCRIBE if one arrives, and say so if none does.
+    ///
+    /// For the cases where either answer is correct and the test must not
+    /// assume which. A viewer arriving as another leaves may join the pull that
+    /// is still there or open a new one, depending on which of the two the
+    /// relay sees first, and both are right; what matters is that objects reach
+    /// it either way. The window is short because a subscriber is blocked on
+    /// this: if the relay meant to ask, it has asked by now.
+    pub async fn answer_subscription_if_asked(&self, alias: TrackAlias) -> Option<Served> {
+        let window = std::time::Duration::from_millis(300);
+        let accepted = tokio::time::timeout(window, self.session.accept_bi()).await;
+        let (mut send, recv) = accepted.ok()?.expect("the relay opens a request stream");
+
+        let mut frames = Frames::new(recv);
+        let frame = within("a SUBSCRIBE", frames.expect()).await;
+        assert_eq!(frame.message_type, MessageType::Subscribe);
+        let request = Subscribe::decode(&mut frame.body.clone()).expect("a decodable SUBSCRIBE");
+
+        write(&mut send, &SubscribeOk::new(alias)).await;
+        Some(Served {
+            track: request.track,
+            _send: send,
+            frames,
+        })
+    }
+
     /// Assert the relay asks this publisher for nothing further.
     ///
     /// The claim deduplication makes is a negative — a SUBSCRIBE that does
