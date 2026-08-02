@@ -28,28 +28,49 @@
 //!
 //! - SETUP, `PUBLISH_NAMESPACE`, `SUBSCRIBE_NAMESPACE`, and SUBSCRIBE are
 //!   implemented, along with subgroup fan-out.
-//! - Upstream subscriptions are **not** deduplicated. Two subscribers for one
-//!   track cause two SUBSCRIBEs to the publisher, which is the opposite of what
-//!   a relay is for: the bandwidth saving from fanning out one copy is most of
-//!   the point. Fixing it means a per-track record between the fabric and the
-//!   route table, and it is the next thing to do here.
+//! - Upstream subscriptions are deduplicated: however many people watch one
+//!   track, the publisher is asked for it once and every copy after the first
+//!   is made here. That is the arithmetic the whole thing is for, and
+//!   `moqom_relay_subscriptions_total` reports it directly — `established`
+//!   counts the copies the publisher paid for and `shared` the ones it did not.
 //! - Recent objects are retained ([`cache`]) and FETCH is served from them, so a
 //!   late joiner can warm-start on the group in progress and a client that
 //!   dropped its connection can ask for what it missed. Retention is bounded, so
 //!   an outage longer than the window is answered with the gap markers that say
 //!   so rather than with silence.
-//! - There is no congestion-aware scheduling. Objects go out in the order they
-//!   arrive, and a subscriber that cannot keep up applies back pressure to the
-//!   publisher, which is the wrong direction — one slow viewer should be dropped
-//!   down a layer, not allowed to slow the broadcast. `moqom-cc` is where that
-//!   is fixed.
-//! - Sessions are *authenticated* but not *authorised*. [`identity`] checks the
-//!   signature on the token in Setup Options, so the relay knows which user on
-//!   which device it is talking to; [`quota`] uses that to charge rate and
-//!   concurrency limits to a person rather than to a connection. What no part of
-//!   this does yet is check that the holder may publish under the namespace it
-//!   announces, belongs to the room it names, or has not been banned. Anyone
-//!   with any valid token can still publish under any namespace.
+//! - Subscribers are isolated from each other and shed rather than queue. Each
+//!   copy of a subgroup is written by its own task with a short bounded queue,
+//!   so a viewer that cannot keep up is abandoned for that subgroup — stream
+//!   reset, `moqom_relay_subgroups_shed_total` incremented — instead of holding
+//!   up the room or backing pressure up into the publisher's phone.
+//!
+//!   What the relay does *not* do is choose a smaller rung on that viewer's
+//!   behalf. It cannot: the layers are the publisher's, the choice belongs to
+//!   the subscriber, and a relay that guessed would be overriding a decision
+//!   made with information it does not have. Shedding is what turns the
+//!   condition into something the subscriber can see and act on. Scheduling
+//!   between rungs of one broadcast — sending base layers before enhancement
+//!   ones under pressure — is still to come, in `moqom-cc`.
+//! - Subscriptions end at both ends. A subscriber closing its request stream is
+//!   how this protocol spells unsubscribe, and when the last one watching a
+//!   track does it the relay stops pulling that track — which is the saving
+//!   made real, since the publisher is usually a phone spending its uplink and
+//!   its battery on the room it is in. In the other direction a publisher that
+//!   stops is announced to every viewer with `PUBLISH_DONE`, because objects
+//!   merely ceasing is what a bad network looks like too, and a player is right
+//!   to wait that out.
+//! - Sessions are authenticated by [`identity`] and authorised by [`scope`]: a
+//!   token's tenant, room, and grants are compared against the namespace every
+//!   request names, so a holder may publish only as themselves, in the room
+//!   they were admitted to, and may reach only what that room contains. What is
+//!   still missing is revocation — a ban is enforced when the next token is
+//!   minted rather than against the session already open, because no relay has
+//!   ever attached to the control plane's link.
+//!
+//!   Note the shape of the default: with no keys configured there is no
+//!   verified tenant to compare anything against, and such a relay authorises
+//!   nothing at all. That is the mode the benches and the two-phone rig run in,
+//!   and it is the mode this warning is about.
 //! - Datagrams are not forwarded. Only subgroup streams are.
 //!
 //! Anything on that list is a thing to build, not a thing to be surprised by.
@@ -73,6 +94,7 @@ pub mod fabric;
 pub mod identity;
 pub mod metrics;
 pub mod quota;
+pub mod scope;
 pub mod session;
 
 pub use cache::{Cache, Limits};
@@ -80,4 +102,5 @@ pub use fabric::Fabric;
 pub use identity::{Admission, AuthError, Authenticator, VerificationKey};
 pub use metrics::Metrics;
 pub use quota::{Governor, Principal, Quotas, Refusal};
+pub use scope::{Denial, Permission, Publish, Scope};
 pub use session::{Session, SessionError};

@@ -119,8 +119,17 @@ impl Ending {
 /// How a SUBSCRIBE turned out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Subscribed {
-    /// Objects are flowing.
+    /// Objects are flowing, on a subscription this request opened upstream.
     Established,
+    /// Objects are flowing, on a subscription somebody else had already opened.
+    ///
+    /// Counted apart from [`Established`](Self::Established) because the two
+    /// together are the ratio the relay exists to produce: every subscription
+    /// answered from a pull that was already running is a copy the publisher
+    /// did not have to send. A room of viewers should be almost entirely this;
+    /// if it is not, the deduplication is missing them and the uplink is paying
+    /// for it.
+    Shared,
     /// Nothing on this relay publishes that namespace.
     NoPublisher,
     /// The publisher session refused, or ended while being asked.
@@ -128,11 +137,17 @@ pub enum Subscribed {
 }
 
 impl Subscribed {
-    const ALL: [Self; 3] = [Self::Established, Self::NoPublisher, Self::Refused];
+    const ALL: [Self; 4] = [
+        Self::Established,
+        Self::Shared,
+        Self::NoPublisher,
+        Self::Refused,
+    ];
 
     const fn label(self) -> &'static str {
         match self {
             Self::Established => "established",
+            Self::Shared => "shared",
             Self::NoPublisher => "no_publisher",
             Self::Refused => "refused",
         }
@@ -141,8 +156,9 @@ impl Subscribed {
     const fn index(self) -> usize {
         match self {
             Self::Established => 0,
-            Self::NoPublisher => 1,
-            Self::Refused => 2,
+            Self::Shared => 1,
+            Self::NoPublisher => 2,
+            Self::Refused => 3,
         }
     }
 }
@@ -312,9 +328,13 @@ struct Inner {
     /// and giving them a dense index here would be a second enumeration to keep
     /// in step. Bounded by that fixed set, so it cannot grow with traffic.
     tokens_refused: Mutex<HashMap<&'static str, u64>>,
+    /// Requests refused by authorisation, by the fixed set
+    /// [`crate::Denial::name`] returns. Same shape and same reasoning.
+    denials: Mutex<HashMap<&'static str, u64>>,
 
     subgroups_forwarded: AtomicU64,
     subgroups_dropped: AtomicU64,
+    subgroups_shed: AtomicU64,
     ingress_bytes: AtomicU64,
     forwarded_bytes: AtomicU64,
     fanout_failures: AtomicU64,
@@ -558,8 +578,10 @@ impl Metrics {
                 refused: std::array::from_fn(|_| counters()),
                 refusal_reasons: counters(),
                 tokens_refused: Mutex::new(HashMap::new()),
+                denials: Mutex::new(HashMap::new()),
                 subgroups_forwarded: AtomicU64::new(0),
                 subgroups_dropped: AtomicU64::new(0),
+                subgroups_shed: AtomicU64::new(0),
                 ingress_bytes: AtomicU64::new(0),
                 forwarded_bytes: AtomicU64::new(0),
                 fanout_failures: AtomicU64::new(0),
@@ -789,6 +811,25 @@ impl Metrics {
             .or_insert(1);
     }
 
+    /// A verified session asked for something its token does not cover.
+    ///
+    /// `reason` comes from [`crate::Denial::name`], which is a fixed set. The
+    /// namespace is deliberately not a label: it contains a room and a
+    /// username, so a series per denied name would publish who is trying to
+    /// reach what to anybody who can scrape the port -- and let them grow the
+    /// endpoint without limit while doing it. The log line beside this carries
+    /// the name for the operator who needs it.
+    pub fn denied(&self, reason: &'static str) {
+        let Some(inner) = self.inner() else { return };
+        inner
+            .denials
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(reason)
+            .and_modify(|count| *count += 1)
+            .or_insert(1);
+    }
+
     /// A subgroup stream arrived and had somewhere to go.
     pub fn subgroup_forwarded(&self) {
         if let Some(inner) = self.inner() {
@@ -800,6 +841,20 @@ impl Metrics {
     pub fn subgroup_dropped(&self) {
         if let Some(inner) = self.inner() {
             inner.subgroups_dropped.fetch_add(1, ORDER);
+        }
+    }
+
+    /// One subscriber's copy of a subgroup was abandoned because that
+    /// subscriber could not take it as fast as it arrived.
+    ///
+    /// Counted per copy rather than per subgroup, because that is what it
+    /// means: the same subgroup can be delivered to most of a room and shed by
+    /// the one person on a train. A relay that never sheds is either
+    /// comfortably provisioned or queueing, and the second one shows up as
+    /// latency nobody can locate.
+    pub fn subgroup_shed(&self) {
+        if let Some(inner) = self.inner() {
+            inner.subgroups_shed.fetch_add(1, ORDER);
         }
     }
 
@@ -1032,6 +1087,30 @@ impl Metrics {
             &series,
         );
 
+        // The series worth alerting on. A token that does not verify is usually
+        // an expiry; a token that verifies and then asks for a room it does not
+        // cover is either a client bug or somebody looking around.
+        let denied = {
+            let counts = inner
+                .denials
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut seen: Vec<(&'static str, u64)> =
+                counts.iter().map(|(&reason, &n)| (reason, n)).collect();
+            seen.sort_unstable();
+            seen
+        };
+        let series: Vec<(&str, &str, u64)> = denied
+            .iter()
+            .map(|&(reason, count)| ("reason", reason, count))
+            .collect();
+        counter(
+            &mut out,
+            "moqom_relay_requests_denied_total",
+            "Requests refused by authorisation, by reason.",
+            &series,
+        );
+
         counter(
             &mut out,
             "moqom_relay_subgroups_total",
@@ -1069,6 +1148,14 @@ impl Metrics {
             "moqom_relay_fanout_failures_total",
             "Subscriber streams dropped mid-forward because a write failed.",
             inner.fanout_failures.load(ORDER),
+        );
+        plain(
+            &mut out,
+            "counter",
+            "moqom_relay_subgroups_shed_total",
+            "Subgroup copies abandoned because a subscriber could not keep up, counted once \
+             per copy.",
+            inner.subgroups_shed.load(ORDER),
         );
 
         // Track liveness, aggregated at scrape time.

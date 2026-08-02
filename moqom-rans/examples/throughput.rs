@@ -103,7 +103,13 @@ fn load(dir: &Path, bits: Option<(i32, i32)>) -> Case {
     let (symbol_bits, bypass_bits) = bits.unwrap_or_else(|| {
         let text = std::fs::read_to_string(dir.join("bits.txt")).expect("bits.txt");
         let mut parts = text.split_whitespace();
-        let mut next = || parts.next().expect("two integers").parse().expect("integer");
+        let mut next = || {
+            parts
+                .next()
+                .expect("two integers")
+                .parse()
+                .expect("integer")
+        };
         (next(), next())
     });
     Case {
@@ -189,7 +195,11 @@ fn measure(case: &Case) -> (f64, f64) {
     decoder
         .decode(&mut recovered, &case.indices, &produced)
         .expect("decodable");
-    assert!(recovered == case.values, "{}: did not round-trip", case.name);
+    assert!(
+        recovered == case.values,
+        "{}: did not round-trip",
+        case.name
+    );
 
     // Warm up, so the first sample is not paying for page faults on the tables —
     // which for a real model are hundreds of kilobytes and would be resident.

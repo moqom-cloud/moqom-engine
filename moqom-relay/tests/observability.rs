@@ -14,46 +14,7 @@ mod support;
 
 use moqom_proto::control::FetchKind;
 use moqom_proto::model::{FetchEnd, GroupId, Location, ObjectId, TrackAlias};
-use support::{Client, Relay, namespace, track, within};
-
-/// The value of a single unlabelled metric in an exposition.
-fn value(scrape: &str, metric: &str) -> u64 {
-    for line in scrape.lines() {
-        if let Some(rest) = line.strip_prefix(metric) {
-            // Guard against a prefix match: `moqom_relay_sessions` must not read
-            // `moqom_relay_sessions_accepted_total`.
-            if let Some(number) = rest.strip_prefix(' ') {
-                return number.trim().parse().expect("a metric value");
-            }
-        }
-    }
-    panic!("no metric {metric} in:\n{scrape}");
-}
-
-/// The value of one series of a labelled metric.
-fn series(scrape: &str, metric: &str, label: &str, label_value: &str) -> u64 {
-    let needle = format!("{metric}{{{label}=\"{label_value}\"}} ");
-    for line in scrape.lines() {
-        if let Some(number) = line.strip_prefix(&needle) {
-            return number.trim().parse().expect("a metric value");
-        }
-    }
-    panic!("no series {needle} in:\n{scrape}");
-}
-
-/// Poll until `check` passes, so a test does not race the relay's bookkeeping.
-async fn eventually(what: &str, relay: &Relay, check: impl Fn(&str) -> bool) -> String {
-    within(what, async {
-        loop {
-            let scrape = relay.scrape();
-            if check(&scrape) {
-                return scrape;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-}
+use support::{Client, Relay, eventually, namespace, series, track, value, within};
 
 /// The `/tracks` body a diagnostic request would return right now.
 fn tracks(relay: &Relay) -> String {
@@ -177,14 +138,11 @@ async fn egress_exceeds_ingress_by_the_fan_out_ratio() {
 
     let video = track(&["acme", "room-42"], "video");
     let upstream = TrackAlias::from(7_u32);
-    let (_served_a, one) = tokio::join!(
+    let (_served, one) = tokio::join!(
         publisher.answer_subscription(upstream),
         first.subscribe(&video),
     );
-    let (_served_b, two) = tokio::join!(
-        publisher.answer_subscription(upstream),
-        second.subscribe(&video),
-    );
+    let two = second.subscribe(&video).await;
     let _one = one.expect("subscribed");
     let _two = two.expect("subscribed");
 
@@ -225,6 +183,9 @@ async fn egress_exceeds_ingress_by_the_fan_out_ratio() {
         ),
         0
     );
+    // Two subscribers, one subscription upstream. The split between the two
+    // outcomes is what the amplification above costs the publisher, and reading
+    // them together is the only way to see that it cost nothing.
     assert_eq!(
         series(
             &scrape,
@@ -232,7 +193,16 @@ async fn egress_exceeds_ingress_by_the_fan_out_ratio() {
             "outcome",
             "established"
         ),
-        2
+        1
+    );
+    assert_eq!(
+        series(
+            &scrape,
+            "moqom_relay_subscriptions_total",
+            "outcome",
+            "shared"
+        ),
+        1
     );
 }
 

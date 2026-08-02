@@ -39,9 +39,9 @@ use std::time::{Instant, SystemTime};
 use bytes::{Buf, Bytes, BytesMut};
 use moqom_proto::control::{
     ControlFrame, DoneReason, Fetch, FetchKind, FetchOk, MessageBody, MessageType, Namespace,
-    NamespaceDone, PublishNamespace, ReasonPhrase, RequestError, RequestErrorCode, RequestId,
-    RequestIdGenerator, Role, Setup, Subscribe, SubscribeNamespace, SubscribeOk, setup,
-    write_message,
+    NamespaceDone, PublishDone, PublishDoneStatus, PublishNamespace, ReasonPhrase, RequestError,
+    RequestErrorCode, RequestId, RequestIdGenerator, Role, Setup, StreamCount, Subscribe,
+    SubscribeNamespace, SubscribeOk, setup, write_message,
 };
 use moqom_proto::data::{
     FetchHeader, FetchRecord, FetchWriter, GroupOrder, SubgroupHeader, SubgroupReader,
@@ -51,12 +51,13 @@ use moqom_proto::model::{
     FetchEnd, FullTrackName, GroupId, Location, ObjectId, TrackAlias, TrackNamespace,
 };
 use moqom_proto::varint::VarInt;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 use web_transport_quinn::{RecvStream, SendStream};
 
-use crate::fabric::{Command, Fabric, NamespaceEvent, Route, SessionId, UpstreamError};
+use crate::fabric::{Command, Fabric, NamespaceEvent, Pulling, Route, SessionId, UpstreamError};
 use crate::metrics::{Ending, Fetched, Flowing, Metrics, Subscribed};
 use crate::quota::{Lease, Principal, Refusal, Resource};
+use crate::scope::{Denial, Permission};
 use crate::{cache, metrics};
 
 /// Identifies this build in Setup Options, for the other end's logs.
@@ -254,6 +255,52 @@ async fn send<M: MessageBody>(stream: &mut SendStream, message: &M) -> Result<()
 /// its subgroup headers. A track can have several subscribers, hence the list.
 type Routes = Arc<Mutex<HashMap<TrackAlias, Vec<Route>>>>;
 
+/// The state of one track's upstream subscription. See [`Session::pulled`].
+///
+/// Two states rather than one because establishing a subscription is a round
+/// trip, and a second subscriber routinely arrives inside it — a room where
+/// four people join at once is four SUBSCRIBEs for one camera in the time the
+/// first answer takes to come back. Without a pending state each of them would
+/// find nothing, and the deduplication would be defeated by exactly the case it
+/// is for.
+#[derive(Clone)]
+enum Pull {
+    /// Being established. Waiters read the outcome from here.
+    ///
+    /// A `watch` rather than a `oneshot` because there may be any number of
+    /// waiters, and rather than a `broadcast` because a late one must still see
+    /// an answer that has already been sent.
+    Pending(watch::Receiver<Option<Result<TrackAlias, UpstreamError>>>),
+    /// Established, and carrying objects under this upstream alias.
+    Ready(Upstream),
+}
+
+/// An upstream subscription that is running.
+#[derive(Clone)]
+struct Upstream {
+    /// The alias the publisher writes in its subgroup headers.
+    alias: TrackAlias,
+    /// Raised to cancel the subscription when the last subscriber has gone.
+    ///
+    /// Cancelling means resetting the request stream the SUBSCRIBE was sent on,
+    /// which is the whole of unsubscribing in this protocol — there is no
+    /// message for it. Worth doing rather than leaving the pull running: a
+    /// publisher on a phone is spending its uplink and its battery on this, and
+    /// a room that empties should stop costing the person who left it.
+    stop: Arc<Notify>,
+}
+
+/// What a new subscriber must do to start receiving a track, decided under the
+/// [`Session::pulled`] lock and carried out after it is released.
+enum Join {
+    /// Attach to an established subscription.
+    Existing(TrackAlias),
+    /// Wait for somebody else's subscription to finish being established.
+    Waiting(watch::Receiver<Option<Result<TrackAlias, UpstreamError>>>),
+    /// Establish it, and tell the waiters how it went.
+    Opening(watch::Sender<Option<Result<TrackAlias, UpstreamError>>>),
+}
+
 /// A live MOQT session with one peer.
 ///
 /// Clonable and cheap to clone: everything shared is behind an `Arc`. The clones
@@ -289,20 +336,28 @@ pub struct Session {
     /// in hand rather than a second lookup in a second map that could disagree
     /// with this one about which tracks exist.
     pulling: Arc<Mutex<HashMap<TrackAlias, Arc<Flowing>>>>,
+    /// Which upstream subscription carries each track, so the second subscriber
+    /// to a track joins the first one's rather than opening another.
+    ///
+    /// The saving this exists for is the reason a relay is worth running. A
+    /// thousand viewers of one camera is one copy uphill and a thousand
+    /// downhill; without this it was a thousand of each, and the publisher — a
+    /// phone, on a domestic uplink — paid for every one of them. It also
+    /// removes a denial of service that needed no bandwidth at all, since a
+    /// subscriber could ask the relay to ask the publisher for the same track
+    /// as many times as it liked.
+    ///
+    /// Keyed by track name rather than by namespace because that is the unit a
+    /// subscription names: two viewers watching different rungs of one
+    /// broadcast are two upstream subscriptions, correctly, and two watching
+    /// the same rung are one.
+    pulled: Arc<Mutex<HashMap<FullTrackName, Pull>>>,
     /// Tracks this peer has subscribed to, by the Request ID it used.
     ///
     /// A joining fetch names a subscription rather than a track, on purpose:
     /// deriving the range's end from the subscription is what makes the fetch and
     /// the subscription provably contiguous. Resolving that reference needs this.
     subscribed: Arc<Mutex<HashMap<RequestId, FullTrackName>>>,
-    /// Quota slots held by established subscriptions.
-    ///
-    /// Separate from `subscribed` because they have different lifetimes in
-    /// principle — a slot is released when the subscription ends, and there is
-    /// no UNSUBSCRIBE here yet, so in practice both end with the session.
-    /// Keyed by request rather than pushed onto a list so that when unsubscribe
-    /// does land, releasing the right slot is a lookup rather than a rewrite.
-    holding: Arc<Mutex<HashMap<RequestId, Lease>>>,
     /// Who this session's limits are charged to.
     ///
     /// Written once, during SETUP, and read by every request afterwards. A
@@ -311,6 +366,13 @@ pub struct Session {
     /// than a `Mutex<Option<_>>` because it genuinely is write-once: a peer that
     /// could change who it is mid-session could shed a limit by doing so.
     principal: Arc<OnceLock<Principal>>,
+
+    /// What the token permitted, written beside the principal during SETUP.
+    ///
+    /// Separate from it for the same reason provenance is: a principal is a
+    /// quota key, compared for equality to find a bucket, and a permission is
+    /// not something anybody is charged for.
+    permission: Arc<OnceLock<Permission>>,
 }
 
 /// Identity and carrier only. The rest is a connection, a lock, and channels,
@@ -360,9 +422,10 @@ impl Session {
             requests: Arc::new(Mutex::new(RequestIdGenerator::new(Role::Server))),
             commands,
             pulling: Arc::default(),
+            pulled: Arc::default(),
             subscribed: Arc::default(),
-            holding: Arc::default(),
             principal: Arc::default(),
+            permission: Arc::default(),
         };
 
         let result = session.run(command_queue).await;
@@ -636,8 +699,11 @@ impl Session {
         if let Some(via) = &admitted.via {
             tracing::debug!(session = %self.id, %via, "session was brought by somebody");
         }
-        // Only ever set once, and this is the only place that sets it.
+        // Only ever set once, and this is the only place that sets either. A
+        // peer that could change who it is mid-session could shed a limit; one
+        // that could change what it may do could shed the checks below.
         let _ = self.principal.set(admitted.who);
+        let _ = self.permission.set(admitted.permission);
         Ok(())
     }
 
@@ -650,6 +716,43 @@ impl Session {
     fn principal(&self) -> &Principal {
         self.principal
             .get_or_init(|| Principal::anonymous(self.connection().remote_address().ip()))
+    }
+
+    /// What this session may publish and reach.
+    ///
+    /// The fallback covers a session that has somehow reached a request before
+    /// SETUP wrote its permission, and it is chosen by the deployment rather
+    /// than fixed: a relay with keys denies, because a request from a session
+    /// whose token has not been read is exactly the case authorisation exists
+    /// for, and a relay without them permits, because it has nothing to check
+    /// against and refusing would leave it unable to relay at all.
+    fn permission(&self) -> &Permission {
+        self.permission.get_or_init(|| {
+            if self.fabric.authenticator().is_enabled() {
+                Permission::Nothing
+            } else {
+                Permission::Unrestricted
+            }
+        })
+    }
+
+    /// Turn a denial into the refusal that goes back on the request stream.
+    ///
+    /// Logged at `info` and counted, because this is the line an operator wants
+    /// when somebody reports that a room will not start, and the series that
+    /// says whether anybody is probing. Not at `warn`: a client still holding
+    /// the token for the room it just left produces these routinely, and a
+    /// level that cries wolf is one people filter.
+    fn denied(&self, denial: Denial, what: &str, name: &TrackNamespace) -> RequestError {
+        tracing::info!(
+            session = %self.id,
+            %name,
+            request = what,
+            reason = denial.name(),
+            "request denied"
+        );
+        self.fabric.metrics().denied(denial.name());
+        RequestError::new(denial.code(), ReasonPhrase::truncating(&denial.to_string()))
     }
 
     /// Take a slot held until the returned lease is dropped.
@@ -820,12 +923,18 @@ impl Session {
         };
 
         let outcome = match frame.message_type {
-            MessageType::PublishNamespace => self.on_publish_namespace(&frame, &mut frames).await,
+            MessageType::PublishNamespace => {
+                self.on_publish_namespace(&frame, &mut send_stream, &mut frames)
+                    .await
+            }
             MessageType::SubscribeNamespace => {
                 self.on_subscribe_namespace(&frame, &mut send_stream, &mut frames)
                     .await
             }
-            MessageType::Subscribe => self.on_subscribe(&frame, &mut send_stream, lease).await,
+            MessageType::Subscribe => {
+                self.on_subscribe(&frame, &mut send_stream, &mut frames, lease)
+                    .await
+            }
             _ => self.on_fetch(&frame, &mut send_stream).await,
         };
 
@@ -845,9 +954,20 @@ impl Session {
     async fn on_publish_namespace(
         &self,
         frame: &ControlFrame,
+        send_stream: &mut SendStream,
         frames: &mut Frames,
     ) -> Result<(), SessionError> {
         let request = PublishNamespace::decode(&mut frame.body.clone())?;
+
+        // Before the fabric hears about it. An announcement is what makes this
+        // session the publisher of a name, and a name claimed by the wrong
+        // session is not undone by refusing the subscriptions afterwards: the
+        // rightful publisher's own announcement is the one that then fails.
+        if let Err(denial) = self.permission().may_announce(&request.namespace) {
+            let refusal = self.denied(denial, "publish_namespace", &request.namespace);
+            return send(send_stream, &refusal).await;
+        }
+
         tracing::info!(
             session = %self.id,
             namespace = %request.namespace,
@@ -896,6 +1016,15 @@ impl Session {
     ) -> Result<(), SessionError> {
         let request = SubscribeNamespace::decode(&mut frame.body.clone())?;
         let prefix = request.prefix.clone();
+
+        // A watch is how a client learns who is in a room, so a prefix reaching
+        // past what this token covers would answer with a roster it may not
+        // have -- names, devices, and the fact that the room exists at all.
+        if let Err(denial) = self.permission().may_read(&prefix) {
+            let refusal = self.denied(denial, "subscribe_namespace", &prefix);
+            return send(send_stream, &refusal).await;
+        }
+
         let (existing, mut events) = self.fabric.watch(self.id, prefix.clone());
         tracing::info!(session = %self.id, %prefix, "watching namespaces");
 
@@ -943,14 +1072,30 @@ impl Session {
     /// `SUBSCRIBE_OK` means objects are actually coming. Answering
     /// optimistically and failing afterwards would leave the subscriber waiting
     /// on a track that was never going to arrive, with no error to explain it.
+    ///
+    /// Then this call stays for the life of the subscription, because the
+    /// request stream does: there is no UNSUBSCRIBE message in this protocol,
+    /// so the subscriber closing the stream is the only way it can say it has
+    /// stopped watching, and something has to be here to hear it.
     async fn on_subscribe(
         &self,
         frame: &ControlFrame,
         send_stream: &mut SendStream,
+        frames: &mut Frames,
         slot: Lease,
     ) -> Result<(), SessionError> {
         let request = Subscribe::decode(&mut frame.body.clone())?;
         let track = request.track.clone();
+
+        // Before the publisher is looked up, so that a refusal cannot be told
+        // apart from a namespace nobody publishes. The two answers are
+        // different codes and the difference is worth hiding: it is how a peer
+        // would map which rooms exist by subscribing to guesses.
+        if let Err(denial) = self.permission().may_read(track.namespace()) {
+            let refusal = self.denied(denial, "subscribe", track.namespace());
+            self.fabric.metrics().subscribed(Subscribed::Refused);
+            return send(send_stream, &refusal).await;
+        }
 
         let Some(publisher) = self.fabric.publisher(track.namespace()) else {
             tracing::debug!(session = %self.id, %track, "no publisher for namespace");
@@ -966,13 +1111,13 @@ impl Session {
         };
 
         let alias = self.allocate_alias();
+        let route = Route::new(self.transport.clone(), self.id, alias);
+        let ending = Arc::clone(&route.done);
+        let streams = Arc::clone(&route.streams);
         let (ready, answered) = oneshot::channel();
         let command = Command::Subscribe {
             track: track.clone(),
-            route: Route {
-                session: self.transport.clone(),
-                alias,
-            },
+            route: Box::new(route),
             ready,
         };
 
@@ -987,20 +1132,28 @@ impl Session {
         };
 
         match upstream {
-            Ok(()) => {
+            Ok(pulling) => {
                 tracing::info!(session = %self.id, %track, %alias, "subscription established");
-                self.fabric.metrics().subscribed(Subscribed::Established);
+                self.fabric.metrics().subscribed(if pulling.shared {
+                    Subscribed::Shared
+                } else {
+                    Subscribed::Established
+                });
                 // Recorded only once established, so a joining fetch cannot name
                 // a subscription that was refused.
                 self.lock_subscribed()
                     .insert(request.request_id, track.clone());
-                // The slot outlives this request stream, because the
-                // subscription does: the stream carries the answer and closes,
-                // while objects keep flowing. Handing the lease to the session
-                // here is what makes the concurrency limit count subscriptions
-                // rather than requests in flight.
-                self.lock_holding().insert(request.request_id, slot);
-                send(send_stream, &SubscribeOk::new(alias)).await
+                send(send_stream, &SubscribeOk::new(alias)).await?;
+
+                // `slot` is held rather than stored, now that the subscription
+                // and its request stream end together: the limit counts
+                // subscriptions because this call lasts as long as one.
+                let outcome = self.hold(send_stream, frames, &ending, &streams).await;
+                drop(slot);
+
+                self.lock_subscribed().remove(&request.request_id);
+                self.release(&track, pulling.upstream, alias).await;
+                outcome
             }
             Err(e) => {
                 tracing::debug!(session = %self.id, %track, error = %e, "upstream refused");
@@ -1012,6 +1165,75 @@ impl Session {
                 .await
             }
         }
+    }
+
+    /// Stay with a subscription until one end or the other finishes it.
+    ///
+    /// Two ways out, and they are not symmetrical. The subscriber closing its
+    /// request stream needs no reply — it has stopped listening, that being
+    /// what closing means. The track ending does: objects merely stopping is
+    /// indistinguishable from a network that has gone quiet, and the two call
+    /// for opposite responses from a player, so `PUBLISH_DONE` is what turns a
+    /// stall into news.
+    async fn hold(
+        &self,
+        send_stream: &mut SendStream,
+        frames: &mut Frames,
+        ending: &Notify,
+        streams: &AtomicU64,
+    ) -> Result<(), SessionError> {
+        loop {
+            tokio::select! {
+                () = ending.notified() => {
+                    // Read after the pull has stopped, so nothing can open
+                    // another stream under it and the count is final rather
+                    // than merely recent — which is the whole use of it: a
+                    // subscriber counts arrivals against this to know whether
+                    // it has everything or is still owed a stream in flight.
+                    let sent = streams.load(Ordering::Relaxed);
+                    let mut done = PublishDone::new(
+                        PublishDoneStatus::TRACK_ENDED,
+                        StreamCount::Exact(sent),
+                    );
+                    done.reason = ReasonPhrase::truncating("publisher stopped the track");
+                    return send(send_stream, &done).await;
+                }
+
+                frame = frames.next() => match frame {
+                    // How unsubscribe is spelled. There is no message for it.
+                    Ok(None) => return Ok(()),
+                    // A subscriber may re-prioritise a subscription it holds.
+                    // Nothing here acts on priorities yet, and answering a hint
+                    // by tearing down the session it was sent on would be a
+                    // wildly disproportionate way to say so.
+                    Ok(Some(frame)) if frame.message_type == MessageType::RequestUpdate => {
+                        tracing::trace!(session = %self.id, "subscription update ignored");
+                    }
+                    Ok(Some(_)) => return Err(SessionError::Protocol(
+                        "unexpected message on a SUBSCRIBE stream",
+                    )),
+                    Err(e) => return Err(e),
+                },
+            }
+        }
+    }
+
+    /// Tell the publisher's session that this subscriber has stopped watching.
+    ///
+    /// Best-effort by nature: every reason the publisher might not hear this is
+    /// a reason it no longer needs to. A session that has ended has already let
+    /// go of every route it held.
+    async fn release(&self, track: &FullTrackName, upstream: TrackAlias, downstream: TrackAlias) {
+        let Some(publisher) = self.fabric.publisher(track.namespace()) else {
+            return;
+        };
+        let released = Command::Release {
+            track: track.clone(),
+            upstream,
+            subscriber: self.id,
+            downstream,
+        };
+        let _ = publisher.send(released).await;
     }
 
     /// Answer a fetch from retained history.
@@ -1043,6 +1265,17 @@ impl Session {
             )
             .await;
         };
+
+        // Checked although a joining fetch can only name a subscription that
+        // was authorised when it was made. The standalone kind names a track
+        // directly, and the cache holds objects from every room on the relay --
+        // so this is the difference between history being private and history
+        // being readable by anyone who can guess a name.
+        if let Err(denial) = self.permission().may_read(track.namespace()) {
+            let refusal = self.denied(denial, "fetch", track.namespace());
+            self.fabric.metrics().fetched(Fetched::Unresolvable, 0);
+            return send(send_stream, &refusal).await;
+        }
 
         let order = GroupOrder::Ascending;
         let records = cache.fetch(&track, start, end, order);
@@ -1177,28 +1410,149 @@ impl Session {
                 track,
                 route,
                 ready,
-            } => {
+            } => self.pull(track, route, ready),
+            Command::Release {
+                track,
+                upstream,
+                subscriber,
+                downstream,
+            } => self.release_route(&track, upstream, subscriber, downstream),
+        }
+    }
+
+    /// Route a subscriber to this track, subscribing upstream only if nobody
+    /// already has.
+    ///
+    /// The decision is made here, synchronously, and that is what makes it
+    /// correct rather than merely usual. Commands are delivered one at a time
+    /// on this session's own loop, so a look-up and the claim that follows it
+    /// cannot interleave with another subscriber's — whereas deciding inside
+    /// the spawned task would put a round trip between the two, which is
+    /// precisely where the simultaneous joins land.
+    fn pull(
+        &self,
+        track: FullTrackName,
+        route: Box<Route>,
+        ready: oneshot::Sender<Result<Pulling, UpstreamError>>,
+    ) {
+        // Resolved in its own scope so the lock is not held across the await
+        // points below, and so the `Vacant` arm can claim the track before
+        // anything is spawned.
+        let joining = {
+            let mut pulled = self.lock_pulled();
+            match pulled.entry(track.clone()) {
+                std::collections::hash_map::Entry::Occupied(entry) => match entry.get() {
+                    Pull::Ready(upstream) => Join::Existing(upstream.alias),
+                    Pull::Pending(outcome) => Join::Waiting(outcome.clone()),
+                },
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    let (announce, outcome) = watch::channel(None);
+                    slot.insert(Pull::Pending(outcome));
+                    Join::Opening(announce)
+                }
+            }
+        };
+
+        match joining {
+            Join::Existing(upstream) => {
+                let _ = ready.send(self.share(upstream, *route, &track));
+            }
+            Join::Waiting(mut outcome) => {
                 let session = self.clone();
                 tokio::spawn(async move {
-                    let result = session.subscribe_upstream(track, route).await;
-                    // A dropped receiver means the downstream subscriber gave up
-                    // while we were asking upstream. Its route was never
-                    // registered, so there is nothing to undo.
-                    let _ = ready.send(result);
+                    // Waits for the first subscriber's round trip rather than
+                    // starting a second one. A sender dropped without an answer
+                    // means that task died, which the subscriber sees the same
+                    // way as any other upstream failure.
+                    let answer = loop {
+                        if let Some(answer) = outcome.borrow_and_update().clone() {
+                            break answer;
+                        }
+                        if outcome.changed().await.is_err() {
+                            break Err(UpstreamError::unavailable());
+                        }
+                    };
+                    let _ = ready.send(match answer {
+                        Ok(upstream) => session.share(upstream, *route, &track),
+                        Err(e) => Err(e),
+                    });
+                });
+            }
+            Join::Opening(announce) => {
+                let session = self.clone();
+                tokio::spawn(async move {
+                    let result = session.subscribe_upstream(track.clone(), *route).await;
+                    if result.is_err() {
+                        // Cleared rather than left pending, so the next
+                        // subscriber tries again instead of inheriting a
+                        // failure that may have been momentary.
+                        session.lock_pulled().remove(&track);
+                    }
+                    // Before the reply, so a waiter woken by it finds the track
+                    // ready rather than still pending.
+                    let _ = announce.send(Some(result.clone()));
+                    // A dropped receiver means the downstream subscriber gave
+                    // up while we were asking upstream. Its route was
+                    // registered anyway, and the fan-out drops routes whose
+                    // session has gone.
+                    let _ = ready.send(result.map(|upstream| Pulling {
+                        upstream,
+                        shared: false,
+                    }));
                 });
             }
         }
     }
 
+    /// Add a route to a subscription somebody else already established, unless
+    /// that subscription has ended in the meantime.
+    ///
+    /// A publisher can stop at any moment, including between a waiter being
+    /// told which alias to join and the waiter acting on it. Attaching anyway
+    /// would answer `SUBSCRIBE_OK` and then deliver nothing — a black tile with
+    /// no error to explain it, which is the worst failure available here. So
+    /// the record is checked under the same lock that
+    /// [`stop_pulling`](Self::stop_pulling) clears it under, and a subscriber
+    /// that missed the broadcast is told so and can ask again.
+    fn share(
+        &self,
+        upstream: TrackAlias,
+        route: Route,
+        track: &FullTrackName,
+    ) -> Result<Pulling, UpstreamError> {
+        let pulled = self.lock_pulled();
+        if !matches!(pulled.get(track), Some(Pull::Ready(pull)) if pull.alias == upstream) {
+            return Err(UpstreamError::unavailable());
+        }
+        // Held across this, so the route cannot be added to a subscription that
+        // is being torn down. Every other path takes these two in the same
+        // order, `pulled` before `routes`.
+        self.add_route(upstream, route);
+        drop(pulled);
+
+        tracing::debug!(
+            session = %self.id,
+            %track,
+            %upstream,
+            "subscription shared an existing pull"
+        );
+        Ok(Pulling {
+            upstream,
+            shared: true,
+        })
+    }
+
     /// Subscribe to `track` on this session and route what comes back.
     ///
-    /// Returns once the peer has answered, leaving a task holding the request
-    /// stream open — closing it would cancel the subscription.
+    /// Returns the upstream alias once the peer has answered, leaving a task
+    /// holding the request stream open — closing it would cancel the
+    /// subscription. Callers reach this through [`pull`](Self::pull), which is
+    /// what keeps one track to one subscription.
     async fn subscribe_upstream(
         &self,
         track: FullTrackName,
         route: Route,
-    ) -> Result<(), UpstreamError> {
+    ) -> Result<TrackAlias, UpstreamError> {
         let internal = |context: &str, e: &dyn std::fmt::Display| {
             UpstreamError::new(RequestErrorCode::INTERNAL_ERROR, format!("{context}: {e}"))
         };
@@ -1224,7 +1578,6 @@ impl Session {
             MessageType::SubscribeOk => {
                 let ok = SubscribeOk::decode(&mut frame.body.clone())
                     .map_err(|e| internal("malformed SUBSCRIBE_OK", &e))?;
-                let downstream = route.alias;
                 let upstream = ok.track_alias;
                 self.add_route(upstream, route);
                 self.lock_pulling().insert(
@@ -1232,6 +1585,17 @@ impl Session {
                     self.fabric
                         .metrics()
                         .track_started(track.clone(), self.id, upstream),
+                );
+                let stop = Arc::new(Notify::new());
+                // Published before the reply goes out and before the reading
+                // task exists, so that the teardown below can only ever find a
+                // record it is entitled to remove.
+                self.lock_pulled().insert(
+                    track.clone(),
+                    Pull::Ready(Upstream {
+                        alias: upstream,
+                        stop: Arc::clone(&stop),
+                    }),
                 );
                 tracing::info!(
                     session = %self.id,
@@ -1242,13 +1606,28 @@ impl Session {
 
                 let session = self.clone();
                 tokio::spawn(async move {
-                    // `send_stream` moves in deliberately: dropping it would
-                    // reset the stream and cancel the subscription.
-                    let _hold = send_stream;
-                    while let Ok(Some(_)) = frames.next().await {}
-                    session.remove_route(upstream, downstream);
+                    // `send_stream` moves in deliberately: holding it is what
+                    // keeps the subscription alive, and dropping it resets the
+                    // stream, which is how this end unsubscribes.
+                    let hold = send_stream;
+                    let ended = tokio::select! {
+                        () = stop.notified() => false,
+                        () = async { while let Ok(Some(_)) = frames.next().await {} } => true,
+                    };
+                    drop(hold);
+                    if ended {
+                        tracing::info!(session = %session.id, %track, %upstream, "track ended");
+                    } else {
+                        tracing::info!(
+                            session = %session.id,
+                            %track,
+                            %upstream,
+                            "stopped pulling: nobody is watching"
+                        );
+                    }
+                    session.stop_pulling(&track, upstream, ended);
                 });
-                Ok(())
+                Ok(upstream)
             }
             MessageType::RequestError => {
                 let error = RequestError::decode(&mut frame.body.clone())
@@ -1318,21 +1697,10 @@ impl Session {
         }
         metrics.subgroup_forwarded();
 
-        let mut outputs = Vec::with_capacity(routes.len());
-        for route in routes {
-            let Ok(mut stream) = route.session.open_uni().await else {
-                continue;
-            };
-            let rewritten = SubgroupHeader {
-                track_alias: route.alias,
-                ..header.clone()
-            };
-            let mut buf = BytesMut::with_capacity(rewritten.encoded_len());
-            rewritten.encode(&mut buf);
-            if stream.write_all(&buf).await.is_ok() {
-                outputs.push(stream);
-            }
-        }
+        let mut outlets: Vec<Outlet> = routes
+            .into_iter()
+            .map(|route| Outlet::open(&route, &header, metrics.clone()))
+            .collect();
 
         let leftover = frames.take_buffered();
         if !leftover.is_empty() {
@@ -1340,10 +1708,10 @@ impl Session {
             if let Some(flow) = &flow {
                 flow.carried(leftover.len());
             }
-            fan_out(&mut outputs, &leftover, metrics).await;
             if let Some(tee) = &mut tee {
                 tee.absorb(&leftover);
             }
+            fan_out(&mut outlets, &leftover, metrics);
         }
 
         let mut chunk = [0u8; 8192];
@@ -1351,7 +1719,7 @@ impl Session {
         // the objects still belong in history, and a subscriber arriving a moment
         // later wants them. Only a stream nobody is watching *and* nothing is
         // retaining is abandoned.
-        while !outputs.is_empty() || tee.is_some() {
+        while !outlets.is_empty() || tee.is_some() {
             match frames.stream.read(&mut chunk).await {
                 Ok(Some(0) | None) | Err(_) => break,
                 Ok(Some(n)) => {
@@ -1359,17 +1727,16 @@ impl Session {
                     if let Some(flow) = &flow {
                         flow.carried(n);
                     }
-                    fan_out(&mut outputs, &chunk[..n], metrics).await;
                     if let Some(tee) = &mut tee {
                         tee.absorb(&chunk[..n]);
                     }
+                    fan_out(&mut outlets, &Bytes::copy_from_slice(&chunk[..n]), metrics);
                 }
             }
         }
-
-        for mut stream in outputs {
-            let _ = stream.finish();
-        }
+        // Dropping the outlets closes their queues, and each writer finishes its
+        // stream once it has drained. Nothing is awaited: a subscriber still
+        // taking the last of a subgroup must not hold up the next one.
     }
 
     /// A parser recording this stream into the cache, if it can be attributed to
@@ -1418,14 +1785,14 @@ impl Session {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn lock_subscribed(&self) -> std::sync::MutexGuard<'_, HashMap<RequestId, FullTrackName>> {
-        self.subscribed
+    fn lock_pulled(&self) -> std::sync::MutexGuard<'_, HashMap<FullTrackName, Pull>> {
+        self.pulled
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn lock_holding(&self) -> std::sync::MutexGuard<'_, HashMap<RequestId, Lease>> {
-        self.holding
+    fn lock_subscribed(&self) -> std::sync::MutexGuard<'_, HashMap<RequestId, FullTrackName>> {
+        self.subscribed
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -1434,24 +1801,93 @@ impl Session {
         self.lock_routes().entry(alias).or_default().push(route);
     }
 
-    fn remove_route(&self, alias: TrackAlias, downstream: TrackAlias) {
-        let mut routes = self.lock_routes();
-        if let Some(list) = routes.get_mut(&alias) {
-            list.retain(|r| r.alias != downstream);
-            if list.is_empty() {
-                routes.remove(&alias);
-                // The upstream subscription existed only to feed these routes,
-                // so with the last one gone the alias means nothing. Retained
-                // history stays: it belongs to the track, not to a subscription.
-                drop(routes);
-                self.lock_pulling().remove(&alias);
-                self.fabric.metrics().track_ended(self.id, alias);
+    /// Forget an upstream subscription that has ended, and every route it fed.
+    ///
+    /// One subscription serves many subscribers, so its end is theirs too — the
+    /// alias stops meaning anything the moment the publisher stops sending
+    /// under it. Retained history stays: it belongs to the track, not to a
+    /// subscription.
+    ///
+    /// `ended` distinguishes the publisher stopping from this relay letting go
+    /// because nobody was left watching. Only the first is news to a
+    /// subscriber; in the second there is by definition nobody to tell.
+    fn stop_pulling(&self, track: &FullTrackName, upstream: TrackAlias, ended: bool) {
+        // `pulled` first and held throughout, so that a subscriber joining this
+        // subscription cannot slip between the record going and the routes
+        // going. See [`share`](Self::share).
+        let mut pulled = self.lock_pulled();
+        // Cleared only if the record still names *this* subscription. A track
+        // taken up again after this one ended holds a newer alias, and clearing
+        // it here would strand its subscribers on a pull nothing points at.
+        if matches!(pulled.get(track), Some(Pull::Ready(pull)) if pull.alias == upstream) {
+            pulled.remove(track);
+        }
+        let orphaned = self.lock_routes().remove(&upstream);
+        self.lock_pulling().remove(&upstream);
+        drop(pulled);
+
+        if ended {
+            for route in orphaned.into_iter().flatten() {
+                route.done.notify_one();
             }
+        }
+        self.fabric.metrics().track_ended(self.id, upstream);
+    }
+
+    /// Drop one subscriber's route, and stop the pull if it was the last.
+    ///
+    /// Called from the subscriber's own session when its request stream ends,
+    /// which is how MOQT spells unsubscribe. Reaching across sessions like this
+    /// is what makes the saving real: the point of noticing is not to tidy a
+    /// map, it is to stop asking a publisher for a track that nobody is
+    /// watching any more.
+    fn release_route(
+        &self,
+        track: &FullTrackName,
+        upstream: TrackAlias,
+        subscriber: SessionId,
+        downstream: TrackAlias,
+    ) {
+        // `pulled` before `routes` throughout. See [`share`](Self::share),
+        // which is the operation this races with.
+        let pulled = self.lock_pulled();
+        let mut routes = self.lock_routes();
+        let Some(remaining) = routes.get_mut(&upstream) else {
+            return;
+        };
+        remaining.retain(|route| route.subscriber != subscriber || route.alias != downstream);
+        if !remaining.is_empty() {
+            return;
+        }
+        routes.remove(&upstream);
+        drop(routes);
+
+        tracing::info!(session = %self.id, %track, %upstream, "last subscriber left");
+
+        // Cancelling is left to the task holding the upstream request stream,
+        // which tears the rest down on its way out — one path for a pull
+        // ending, whether the publisher ended it or the audience did.
+        if let Some(Pull::Ready(pull)) = pulled.get(track)
+            && pull.alias == upstream
+        {
+            pull.stop.notify_one();
         }
     }
 
+    /// The routes for `alias`, forgetting any whose session has gone.
+    ///
+    /// Departures are noticed here rather than announced, because MOQT has no
+    /// message for a subscriber losing interest — the connection simply closes.
+    /// Pruning matters more now that one upstream subscription outlives any one
+    /// subscriber: without it a track watched by a thousand people who have
+    /// since left would keep trying to open a thousand streams per subgroup.
     fn routes_for(&self, alias: TrackAlias) -> Vec<Route> {
-        self.lock_routes().get(&alias).cloned().unwrap_or_default()
+        let mut routes = self.lock_routes();
+        let Some(list) = routes.get_mut(&alias) else {
+            return Vec::new();
+        };
+        list.retain(|route| route.session.close_reason().is_none());
+        list.clone()
     }
 }
 
@@ -1532,26 +1968,163 @@ async fn read_header(frames: &mut Frames) -> Result<SubgroupHeader, SessionError
     }
 }
 
-/// Write `bytes` to every output, dropping the ones that fail.
+/// How much of a subgroup may be waiting for one subscriber before the relay
+/// stops keeping it.
 ///
-/// A subscriber whose connection has gone must not stop the others from
-/// receiving, so a failed write removes that output rather than aborting the
-/// forward.
+/// Chunks, of at most eight kilobytes each, so a few tens of kilobytes at the
+/// outside. Small on purpose. The tempting alternative — a generous buffer per
+/// subscriber — turns a bandwidth problem into a latency problem and hides it:
+/// the pictures keep arriving, in order, later and later, and nothing in the
+/// system reports a fault. For live video, bytes that arrive after their moment
+/// are worse than bytes that never arrive, because the second kind at least
+/// lets the subscriber ask for a smaller rung and recover.
+const QUEUE_DEPTH: usize = 4;
+
+/// What a shed subgroup's stream is reset with.
 ///
-/// Egress is counted per surviving copy, so it exceeds ingress by the fan-out
-/// ratio. That ratio is the whole reason a relay exists, and the two counters
-/// together are the only place it is visible.
-async fn fan_out(outputs: &mut Vec<SendStream>, bytes: &[u8], metrics: &Metrics) {
-    let mut surviving = Vec::with_capacity(outputs.len());
-    for mut stream in outputs.drain(..) {
-        if stream.write_all(bytes).await.is_ok() {
-            metrics.egress(bytes.len());
-            surviving.push(stream);
-        } else {
-            metrics.fanout_failed();
+/// The subscriber is told the stream was abandoned rather than left to infer it
+/// from a group that never completes. A dedicated code, so that "you were too
+/// slow for this frame" is distinguishable from a relay or publisher fault.
+const RESET_SHED: u32 = 0x02;
+
+/// One subscriber's copy of one subgroup, and the task writing it.
+///
+/// The queue exists to decouple subscribers from each other. Writing to each in
+/// turn — which is what a straightforward loop does — makes every subscriber
+/// wait for the slowest, because a QUIC write blocks until that connection's
+/// flow control lets it through. One viewer on a bad train connection would set
+/// the pace for the whole room, and worse, would back the pressure all the way
+/// up to the publisher's phone. Deduplicating the pull upstream made that
+/// sharper rather than milder: there is now one read loop feeding everybody.
+struct Outlet {
+    chunks: mpsc::Sender<Bytes>,
+    /// Raised when this copy is abandoned, so the writer resets its stream
+    /// instead of finishing it. Separate from closing the queue because the
+    /// writer is typically blocked mid-write when that decision is made, and
+    /// the point of the decision is not to wait for it.
+    abandon: Arc<Notify>,
+}
+
+/// What became of a chunk offered to a subscriber.
+enum Handoff {
+    /// Queued, and the writer will get to it.
+    Taken,
+    /// The subscriber is too far behind to be worth keeping this subgroup for.
+    Shed,
+    /// The writer has stopped: the stream failed, or the session went away.
+    Gone,
+}
+
+impl Outlet {
+    /// Start writing a subgroup to one subscriber.
+    ///
+    /// The stream is opened by the writer rather than here, so that a
+    /// subscriber sitting at its concurrent stream limit delays only itself.
+    fn open(route: &Route, header: &SubgroupHeader, metrics: Metrics) -> Self {
+        let (chunks, mut queue) = mpsc::channel(QUEUE_DEPTH);
+        let abandon = Arc::new(Notify::new());
+
+        // Counted at the decision rather than at the open, because this is the
+        // point of no return for the subscriber: a stream shed later was still
+        // a stream it saw. Erring high is deliberate. `PUBLISH_DONE` carries
+        // this so a subscriber can tell "everything arrived" from "one is still
+        // in flight", and a count that came in under the truth would have it
+        // conclude the first while a stream was still on its way.
+        route.streams.fetch_add(1, Ordering::Relaxed);
+
+        let session = route.session.clone();
+        // Re-addressed per destination: the alias is the subscriber's own, and
+        // everything after the header is copied verbatim.
+        let header = SubgroupHeader {
+            track_alias: route.alias,
+            ..header.clone()
+        };
+        let abandoned = Arc::clone(&abandon);
+
+        tokio::spawn(async move {
+            let Ok(mut stream) = session.open_uni().await else {
+                metrics.fanout_failed();
+                return;
+            };
+            let mut prologue = BytesMut::with_capacity(header.encoded_len());
+            header.encode(&mut prologue);
+            if stream.write_all(&prologue).await.is_err() {
+                metrics.fanout_failed();
+                return;
+            }
+
+            loop {
+                let chunk: Bytes = tokio::select! {
+                    biased;
+                    () = abandoned.notified() => break,
+                    // A closed queue means every chunk was written and the
+                    // source finished: an orderly end, and the only path that
+                    // finishes the stream cleanly.
+                    chunk = queue.recv() => if let Some(chunk) = chunk {
+                        chunk
+                    } else {
+                        let _ = stream.finish();
+                        return;
+                    },
+                };
+
+                let length = chunk.len();
+                // The write is inside the select because that is where the time
+                // goes. Abandoning a subgroup while its last write is stuck
+                // behind a congestion window is the case this whole mechanism
+                // is for; cancelling a partial write costs nothing, since the
+                // stream is about to be reset.
+                let written = tokio::select! {
+                    biased;
+                    () = abandoned.notified() => break,
+                    written = stream.write_chunk(chunk) => written,
+                };
+                if written.is_err() {
+                    metrics.fanout_failed();
+                    return;
+                }
+                metrics.egress(length);
+            }
+
+            let _ = stream.reset(RESET_SHED);
+        });
+
+        Self { chunks, abandon }
+    }
+
+    /// Hand this subscriber a chunk, or give up on the subgroup for it.
+    fn offer(&self, chunk: Bytes) -> Handoff {
+        match self.chunks.try_send(chunk) {
+            Ok(()) => Handoff::Taken,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.abandon.notify_one();
+                Handoff::Shed
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => Handoff::Gone,
         }
     }
-    *outputs = surviving;
+}
+
+/// Offer `bytes` to every destination, keeping the ones still worth writing to.
+///
+/// Deliberately not `async`. Nothing here waits for a subscriber, which is what
+/// makes a slow one another subscriber's problem — and the reason the publisher
+/// can be read at the speed it sends rather than the speed the room can take.
+///
+/// Egress is counted where the bytes are actually written, so it exceeds
+/// ingress by the fan-out ratio. That ratio is the whole reason a relay exists,
+/// and the two counters together are the only place it is visible.
+fn fan_out(outlets: &mut Vec<Outlet>, bytes: &Bytes, metrics: &Metrics) {
+    outlets.retain(|outlet| match outlet.offer(bytes.clone()) {
+        Handoff::Taken => true,
+        Handoff::Shed => {
+            metrics.subgroup_shed();
+            false
+        }
+        // The writer counted the failure that stopped it, or there was never a
+        // stream to fail. Either way this destination is finished with.
+        Handoff::Gone => false,
+    });
 }
 
 /// The fields of `namespace` after `prefix`, or `None` if it is not under it.

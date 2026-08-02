@@ -20,8 +20,8 @@ use std::sync::Arc;
 use bytes::{Buf, Bytes, BytesMut};
 use moqom_proto::control::{
     ControlFrame, DoneReason, Fetch, FetchKind, FetchOk, MessageBody, MessageType, Namespace,
-    NamespaceDone, PublishNamespace, RequestId, RequestIdGenerator, Role, Setup, Subscribe,
-    SubscribeNamespace, SubscribeOk, write_message,
+    NamespaceDone, PublishDone, PublishNamespace, RequestId, RequestIdGenerator, Role, Setup,
+    Subscribe, SubscribeNamespace, SubscribeOk, write_message,
 };
 use moqom_proto::data::{
     FetchHeader, FetchReader, FetchRecord, GroupOrder, SubgroupHeader, SubgroupSource,
@@ -29,7 +29,7 @@ use moqom_proto::data::{
 use moqom_proto::error::DecodeError;
 use moqom_proto::model::{FullTrackName, GroupId, Location, TrackAlias, TrackNamespace};
 use moqom_relay::admin::Surface;
-use moqom_relay::{Cache, Fabric, Governor, Limits, Metrics, Quotas, Session};
+use moqom_relay::{Authenticator, Cache, Fabric, Governor, Limits, Metrics, Quotas, Session};
 use moqom_transport::{Server, alpn, server::with_moqt_alpn};
 use web_transport_quinn::{RecvStream, SendStream};
 
@@ -47,6 +47,45 @@ pub async fn within<F: Future>(what: &str, future: F) -> F::Output {
     tokio::time::timeout(PATIENCE, future)
         .await
         .unwrap_or_else(|elapsed| panic!("timed out waiting for {what} ({elapsed})"))
+}
+
+/// The value of a single unlabelled metric in an exposition.
+pub fn value(scrape: &str, metric: &str) -> u64 {
+    for line in scrape.lines() {
+        if let Some(rest) = line.strip_prefix(metric) {
+            // Guard against a prefix match: `moqom_relay_sessions` must not read
+            // `moqom_relay_sessions_accepted_total`.
+            if let Some(number) = rest.strip_prefix(' ') {
+                return number.trim().parse().expect("a metric value");
+            }
+        }
+    }
+    panic!("no metric {metric} in:\n{scrape}");
+}
+
+/// The value of one series of a labelled metric.
+pub fn series(scrape: &str, metric: &str, label: &str, label_value: &str) -> u64 {
+    let needle = format!("{metric}{{{label}=\"{label_value}\"}} ");
+    for line in scrape.lines() {
+        if let Some(number) = line.strip_prefix(&needle) {
+            return number.trim().parse().expect("a metric value");
+        }
+    }
+    panic!("no series {needle} in:\n{scrape}");
+}
+
+/// Poll until `check` passes, so a test does not race the relay's bookkeeping.
+pub async fn eventually(what: &str, relay: &Relay, check: impl Fn(&str) -> bool) -> String {
+    within(what, async {
+        loop {
+            let scrape = relay.scrape();
+            if check(&scrape) {
+                return scrape;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
 }
 
 /// A relay listening on a loopback port.
@@ -91,7 +130,25 @@ impl Relay {
         Self::build(limits, Governor::disabled())
     }
 
+    /// Start a relay that verifies tokens, and therefore authorises requests.
+    ///
+    /// The distinction the rest of the harness cannot make. Every other relay
+    /// here has no keys, so every session is anonymous and unrestricted, which
+    /// is right for testing forwarding and useless for testing who may forward
+    /// what.
+    pub fn authenticating() -> Self {
+        Self::assembled(
+            Limits::default(),
+            Governor::disabled(),
+            tokens::authenticator(),
+        )
+    }
+
     fn build(limits: Limits, governor: Governor) -> Self {
+        Self::assembled(limits, governor, Authenticator::disabled())
+    }
+
+    fn assembled(limits: Limits, governor: Governor, authenticator: Authenticator) -> Self {
         install_crypto_provider();
 
         let generated = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
@@ -112,7 +169,9 @@ impl Relay {
         let addr = server.local_addr().expect("bound address");
 
         let metrics = Metrics::new();
-        let fabric = Fabric::observed(Cache::new(limits), metrics.clone()).governed(governor);
+        let fabric = Fabric::observed(Cache::new(limits), metrics.clone())
+            .governed(governor)
+            .authenticated(authenticator);
         let surface = Surface::new(metrics.clone(), fabric.clone());
         let accept = tokio::spawn({
             let fabric = fabric.clone();
@@ -185,6 +244,14 @@ pub struct Client {
     _endpoint: quinn::Endpoint,
 }
 
+/// How much this client's connection will hold for it.
+enum Link {
+    /// Whatever QUIC's defaults allow, which on loopback is everything.
+    Ordinary,
+    /// Barely anything. See [`Client::connect_congested`].
+    Congested,
+}
+
 impl Client {
     /// Go away without saying anything.
     ///
@@ -204,6 +271,13 @@ impl Client {
             .unwrap_or_else(|closed| panic!("the relay refused the session: {closed:?}"))
     }
 
+    /// Connect presenting `token` as a session credential.
+    pub async fn connect_as(relay: &Relay, token: &str) -> Self {
+        Self::establish(relay, Some(token), Link::Ordinary)
+            .await
+            .unwrap_or_else(|closed| panic!("the relay refused the session: {closed:?}"))
+    }
+
     /// Connect, tolerating a relay that refuses before answering.
     ///
     /// A session the limiter turns away never receives a SETUP: the relay
@@ -211,6 +285,24 @@ impl Client {
     /// it has said yes and then hung up. That is the right behaviour and it
     /// means the ordinary [`Client::connect`] cannot observe it.
     pub async fn try_connect(relay: &Relay) -> Result<Self, Closed> {
+        Self::establish(relay, None, Link::Ordinary).await
+    }
+
+    /// Connect as a subscriber whose connection cannot take much.
+    ///
+    /// A few kilobytes of unread data is all it will accept before its flow
+    /// control stops the sender, which is a phone on a bad train connection
+    /// with the constants scaled down until a test can finish. Modelling it
+    /// this way rather than by simply not reading matters: the relay must be
+    /// blocked by the transport, exactly as it would be in the real case, and
+    /// not merely be writing into a buffer nobody drains.
+    pub async fn connect_congested(relay: &Relay) -> Self {
+        Self::establish(relay, None, Link::Congested)
+            .await
+            .unwrap_or_else(|closed| panic!("the relay refused the session: {closed:?}"))
+    }
+
+    async fn establish(relay: &Relay, token: Option<&str>, link: Link) -> Result<Self, Closed> {
         install_crypto_provider();
 
         let mut tls = rustls::ClientConfig::builder()
@@ -225,7 +317,14 @@ impl Client {
             .expect("a TLS 1.3 configuration");
         let mut endpoint = quinn::Endpoint::client(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
             .expect("binding a client socket");
-        endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(crypto)));
+        let mut config = quinn::ClientConfig::new(Arc::new(crypto));
+        if let Link::Congested = link {
+            let mut transport = quinn::TransportConfig::default();
+            transport.receive_window(quinn::VarInt::from_u32(8 * 1024));
+            transport.stream_receive_window(quinn::VarInt::from_u32(4 * 1024));
+            config.transport_config(Arc::new(transport));
+        }
+        endpoint.set_default_client_config(config);
 
         let connection = within("the QUIC handshake", async {
             endpoint
@@ -253,6 +352,14 @@ impl Client {
                 &b"moqom-relay-tests"[..],
             )
             .expect("a short implementation string");
+        if let Some(token) = token {
+            ours.options
+                .set_bytes(
+                    moqom_proto::control::setup::option_type::AUTHORIZATION_TOKEN,
+                    Bytes::copy_from_slice(token.as_bytes()),
+                )
+                .expect("a token within the option's size");
+        }
         write(&mut send, &ours).await;
 
         let mut frames = Frames::new(recv);
@@ -296,6 +403,34 @@ impl Client {
         Announcement { send, _recv: recv }
     }
 
+    /// Announce, expecting the relay to refuse.
+    ///
+    /// A separate call rather than a `Result` from [`Client::announce`],
+    /// because an announcement that succeeds is answered with silence: the
+    /// stream stays open and *is* the announcement. Only the refusal has
+    /// something to read, so only the refusal can be awaited.
+    pub async fn announce_refused(&mut self, namespace: &TrackNamespace) -> u64 {
+        let (mut send, recv) = self
+            .session
+            .open_bi()
+            .await
+            .expect("opening a request stream");
+        let request = PublishNamespace::new(self.next_request(), namespace.clone());
+        write(&mut send, &request).await;
+
+        let mut frames = Frames::new(recv);
+        let frame = within("a refusal of PUBLISH_NAMESPACE", frames.expect()).await;
+        assert_eq!(
+            frame.message_type,
+            MessageType::RequestError,
+            "expected the announcement to be refused"
+        );
+        moqom_proto::control::RequestError::decode(&mut frame.body.clone())
+            .expect("a decodable error")
+            .code
+            .get()
+    }
+
     /// Watch for namespaces under `prefix`.
     pub async fn watch(&mut self, prefix: &TrackNamespace) -> Watch {
         let (send, recv) = self
@@ -311,6 +446,25 @@ impl Client {
             frames: Frames::new(recv),
             _send: send,
         }
+    }
+
+    /// Watch, expecting the relay to refuse.
+    ///
+    /// Same asymmetry as [`Client::announce_refused`]: a permitted watch
+    /// answers with the namespaces that already match, which may be none, so
+    /// there is nothing to distinguish it from silence.
+    pub async fn watch_refused(&mut self, prefix: &TrackNamespace) -> u64 {
+        let mut watch = self.watch(prefix).await;
+        let frame = within("a refusal of SUBSCRIBE_NAMESPACE", watch.frames.expect()).await;
+        assert_eq!(
+            frame.message_type,
+            MessageType::RequestError,
+            "expected the watch to be refused"
+        );
+        moqom_proto::control::RequestError::decode(&mut frame.body.clone())
+            .expect("a decodable error")
+            .code
+            .get()
     }
 
     /// Wait for the relay to close this session, and report how.
@@ -354,7 +508,7 @@ impl Client {
                     alias: ok.track_alias,
                     request_id: request.request_id,
                     _send: send,
-                    _frames: frames,
+                    frames,
                 })
             }
             MessageType::RequestError => Err(moqom_proto::control::RequestError::decode(
@@ -390,7 +544,24 @@ impl Client {
         Served {
             track: request.track,
             _send: send,
-            _frames: frames,
+            frames,
+        }
+    }
+
+    /// Assert the relay asks this publisher for nothing further.
+    ///
+    /// The claim deduplication makes is a negative — a SUBSCRIBE that does
+    /// *not* happen — and a negative can only be waited for. Short, because the
+    /// wait is spent on every passing run, and long enough that the request
+    /// would have arrived: everything else in these tests is loopback and
+    /// answered in microseconds.
+    pub async fn asked_nothing_further(&self) {
+        let quiet = std::time::Duration::from_millis(300);
+        if tokio::time::timeout(quiet, self.session.accept_bi())
+            .await
+            .is_ok()
+        {
+            panic!("the relay opened a second request stream to the publisher");
         }
     }
 
@@ -507,15 +678,31 @@ impl Client {
         records
     }
 
+    /// Take the next forwarded subgroup and report whether the relay abandoned
+    /// it rather than completing it.
+    ///
+    /// The distinction is the point of shedding: a reset stream tells the
+    /// subscriber this subgroup is not coming, where a stream left to dangle
+    /// would have it waiting for objects nobody intends to send.
+    pub async fn subgroup_was_abandoned(&self) -> bool {
+        let mut recv = within("a forwarded subgroup", self.session.accept_uni())
+            .await
+            .expect("the relay opens a data stream");
+        recv.read_to_end(1024 * 1024).await.is_err()
+    }
+
     /// Read one forwarded subgroup: its header, and every payload on it.
     pub async fn read_subgroup(&self) -> (SubgroupHeader, Vec<Bytes>) {
         let recv = within("a forwarded subgroup", self.session.accept_uni())
             .await
             .expect("the relay opens a data stream");
 
+        // A megabyte, which is a bound against a runaway test rather than a
+        // statement about subgroups. The congestion tests deliberately send
+        // more than a comfortable amount.
         let bytes = within("the subgroup body", async move {
             let mut recv = recv;
-            recv.read_to_end(64 * 1024)
+            recv.read_to_end(1024 * 1024)
                 .await
                 .expect("reading a subgroup")
         })
@@ -545,7 +732,20 @@ pub struct Subscription {
     /// The ID this subscription was requested with, which a joining fetch names.
     pub request_id: RequestId,
     _send: SendStream,
-    _frames: Frames,
+    frames: Frames,
+}
+
+impl Subscription {
+    /// Wait for the relay to say the track has ended.
+    ///
+    /// A subscriber cannot infer this: objects stopping is what a stalled
+    /// network looks like too, and the two want opposite responses — wait, or
+    /// tear the tile down and say why. `PUBLISH_DONE` is the difference.
+    pub async fn ended(&mut self) -> PublishDone {
+        let frame = within("the track to be declared over", self.frames.expect()).await;
+        assert_eq!(frame.message_type, MessageType::PublishDone);
+        PublishDone::decode(&mut frame.body.clone()).expect("a decodable PUBLISH_DONE")
+    }
 }
 
 /// An answered fetch: the range delivered, and the records on its data stream.
@@ -581,7 +781,45 @@ pub struct Served {
     /// The track the relay asked for.
     pub track: FullTrackName,
     _send: SendStream,
-    _frames: Frames,
+    frames: Frames,
+}
+
+impl Served {
+    /// Wait for the relay to stop wanting this track.
+    ///
+    /// Unsubscribing is a stream reset in this protocol, so what the publisher
+    /// sees is its request stream failing rather than a message arriving. That
+    /// makes the assertion indirect and worth stating plainly: a relay that
+    /// forgot to let go looks exactly like one whose subscribers are all still
+    /// watching, and the difference is a phone uploading video to nobody.
+    pub async fn released(&mut self) {
+        within("the relay to stop pulling", async {
+            match self.frames.next().await {
+                None => (),
+                Some(frame) => panic!(
+                    "unexpected {:?} on a served subscription",
+                    frame.message_type
+                ),
+            }
+        })
+        .await;
+    }
+
+    /// Assert the relay keeps this subscription for a little while yet.
+    ///
+    /// The negative half of [`released`](Self::released), and the one that
+    /// catches over-eagerness: a relay that let go the moment *any* viewer left
+    /// would pass every test above and cut the broadcast off for everyone who
+    /// stayed.
+    pub async fn kept(&mut self) {
+        let quiet = std::time::Duration::from_millis(300);
+        if tokio::time::timeout(quiet, self.frames.next())
+            .await
+            .is_ok()
+        {
+            panic!("the relay dropped a subscription that still has viewers");
+        }
+    }
 }
 
 /// A live announcement. Dropping it withdraws the namespace.
@@ -777,4 +1015,118 @@ pub fn namespace(fields: &[&str]) -> TrackNamespace {
 pub fn track(fields: &[&str], name: &str) -> FullTrackName {
     FullTrackName::new(namespace(fields), Bytes::copy_from_slice(name.as_bytes()))
         .expect("a valid track name")
+}
+
+/// Session credentials, minted the way the Go control plane mints them.
+///
+/// Written out here rather than imported from the relay's own test module for
+/// the reason the client is: a token this harness produced with the relay's
+/// own code would prove the two agree with each other and nothing about the
+/// format. `tests/interop_tokens.rs` is what pins the format against Go; this
+/// is what puts a token through a socket.
+pub mod tokens {
+    use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair};
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use moqom_relay::{Authenticator, VerificationKey};
+
+    const KID: &str = "test-key";
+    const ISSUER: &str = "https://api.moqom.cloud";
+
+    /// A thumbprint whose first sixteen characters are the device field a
+    /// client announces under. The relay derives one from the other, so these
+    /// two constants are one fact and have to be written as one.
+    const THUMBPRINT: &str = "OuXpLpEHW7dCPqjKWm8Zq1TfBb2nQ4Zt";
+    pub const DEVICE: &str = "OuXpLpEHW7dCPqjK";
+
+    /// A deterministic key, so a failing test fails the same way twice.
+    fn signer() -> Ed25519KeyPair {
+        Ed25519KeyPair::from_seed_unchecked(&[7u8; 32]).expect("a valid Ed25519 seed")
+    }
+
+    /// An authenticator that trusts [`signer`] and nothing else.
+    pub fn authenticator() -> Authenticator {
+        Authenticator::new(
+            ISSUER,
+            vec![VerificationKey {
+                id: KID.to_owned(),
+                bytes: signer().public_key().as_ref().to_vec(),
+            }],
+        )
+    }
+
+    /// What a token says its holder may do.
+    ///
+    /// Mirrors the `moqt` claim rather than the relay's parsed form, because
+    /// what these tests need to vary is the thing on the wire.
+    pub struct Grant {
+        pub user: &'static str,
+        pub room: Option<&'static str>,
+        /// Audio and video, as the bitmask the control plane mints.
+        pub publish: u8,
+        pub capabilities: u32,
+        pub owner: bool,
+        pub backstage: bool,
+    }
+
+    impl Default for Grant {
+        /// A cohost: on stage in `room-42`, with a camera and stage powers.
+        fn default() -> Self {
+            Self {
+                user: "ada",
+                room: Some("room-42"),
+                publish: 0b11,
+                capabilities: 0x0000_7F00,
+                owner: false,
+                backstage: false,
+            }
+        }
+    }
+
+    impl Grant {
+        /// Somebody with nothing but a seat in the room.
+        pub fn viewer() -> Self {
+            Self {
+                publish: 0,
+                capabilities: 0,
+                ..Self::default()
+            }
+        }
+
+        /// The token itself, valid for ten minutes from now.
+        pub fn token(&self) -> String {
+            let issued = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("after the epoch")
+                .as_secs();
+            let claims = serde_json::json!({
+                "iss": ISSUER,
+                "sub": self.user,
+                "aud": "acme",
+                "iat": issued,
+                "exp": issued + 600,
+                "cnf": { "jkt": THUMBPRINT },
+                "moqt": {
+                    "room": self.room.unwrap_or_default(),
+                    "pub": self.publish,
+                    "cap": self.capabilities,
+                    "own": self.owner,
+                    "bs": self.backstage,
+                },
+            });
+            mint(
+                &serde_json::json!({ "alg": "EdDSA", "typ": "MOQT", "kid": KID }),
+                &claims,
+            )
+        }
+    }
+
+    fn mint(header: &serde_json::Value, claims: &serde_json::Value) -> String {
+        let segment = |value: &serde_json::Value| {
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(value).expect("serialisable"))
+        };
+        let signing = format!("{}.{}", segment(header), segment(claims));
+        let signature = signer().sign(signing.as_bytes());
+        format!("{signing}.{}", URL_SAFE_NO_PAD.encode(signature.as_ref()))
+    }
 }

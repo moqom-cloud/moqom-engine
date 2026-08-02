@@ -1,18 +1,19 @@
-//! Establishing who a peer is, so that a limit can be charged to them.
+//! Establishing who a peer is, so that a limit can be charged to them and a
+//! permission decided for them.
 //!
-//! # This is authentication, and deliberately not authorisation
+//! # This is authentication, and the line to authorisation runs through here
 //!
-//! What this module answers is "who signed this session's token", and nothing
-//! else. It does not check that the holder may publish under the namespace they
-//! announce, that they belong to the room they name, or that they have not been
-//! banned. Those are authorisation, they are still missing, and this module
-//! landing must not be read as their having arrived — a relay running this is
-//! still one where anyone with any valid token can publish under any namespace.
+//! What this module answers is "who signed this session's token". Whether that
+//! holder may publish under the namespace they announce is a separate question,
+//! asked and answered in [`scope`] — this module's part is to
+//! hand it a [`Permission`] built from a signature that verified, and never
+//! from anything a peer merely claimed.
 //!
-//! The distinction is worth keeping sharp because the two are usually built
-//! together. They are separated here because rate limiting needs exactly the
-//! first half: to charge a limit to a person you must know which person, and
-//! you need not yet know what they are allowed to do.
+//! The distinction is worth keeping sharp because the two are usually built as
+//! one thing. Rate limiting needs only the first half: to charge a limit to a
+//! person you must know which person, and you need not know what they may do.
+//! Keeping them apart is also what lets a relay run with limits and without
+//! authorisation, which is what a relay with no keys configured is.
 //!
 //! # Why a claimed identity is not usable and a verified one is
 //!
@@ -47,6 +48,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::Deserialize;
 
 use crate::quota::Principal;
+use crate::scope::{self, Permission, Publish, capability};
 
 /// The one algorithm accepted.
 ///
@@ -156,16 +158,14 @@ struct Header {
 
 /// The claims this relay reads.
 ///
-/// A subset. Unknown fields are ignored rather than refused, which is the
-/// opposite of what the Go verifier does, and the difference is deliberate:
-/// there, the claims decide what somebody may do, so a claim the build does not
-/// understand may be withholding something and guessing is unsafe. Here they
-/// decide only *who* somebody is, and no unrecognised field can make the
-/// subject or the thumbprint wrong.
-///
-/// That reasoning expires the moment this struct is used for authorisation. If
-/// a scope field is ever read from here to decide a permission, this must
-/// become strict at the same time.
+/// A subset, and unknown top-level fields are ignored rather than refused. That
+/// was once safe because these claims decided only *who* somebody is, and it is
+/// no longer the whole story: [`Claims::moqt`] now decides what they may do. So
+/// the strictness lives where the decision does — see [`Scope`], which refuses
+/// a field or a capability bit it does not recognise. A claim beside it that
+/// this build has never heard of still cannot make the subject wrong, and
+/// refusing those would mean a control plane could not add one without
+/// upgrading every relay first.
 #[derive(Deserialize)]
 struct Claims {
     #[serde(default)]
@@ -195,12 +195,63 @@ struct Claims {
     /// nobody brought rather than a session with unknown rights.
     #[serde(default)]
     via: String,
+
+    /// What the holder may do. See [`Scope`].
+    ///
+    /// Defaulted rather than required, and the default is the least permission
+    /// there is: no room, nothing publishable, no powers. A token minted before
+    /// this claim existed therefore reaches its holder's own personal channel
+    /// and nothing else, which is the failure a missing grant should have.
+    #[serde(default)]
+    moqt: Scope,
 }
 
 #[derive(Deserialize, Default)]
 struct Confirmation {
     #[serde(default)]
     jkt: String,
+}
+
+/// The `moqt` claim, as the Go control plane mints it.
+///
+/// Strict, unlike the claims around it, and this is the struct the note there
+/// refers to. Two rules, both fail-closed and both matching the minter:
+///
+/// - An unrecognised **capability bit** is refused, exactly as `Scope.Grants`
+///   does in Go. Dropping it would mean a token from a newer control plane
+///   quietly granting less than it says, which presents as a moderator whose
+///   buttons stopped working and no error anywhere.
+/// - An unrecognised **field** is refused too, which Go does not do. The
+///   asymmetry is deliberate: this is the enforcement point, and a field added
+///   later is at least as likely to narrow a grant as to widen one. Ignoring a
+///   narrowing is the failure that matters, so a scope this build cannot fully
+///   read is not one it will act on. The cost is an ordering constraint on
+///   rollouts — relays learn a new field before the control plane mints it —
+///   which the capability rule already imposed.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct Scope {
+    #[serde(default)]
+    room: String,
+    /// Media kinds, as a bitmask. See [`scope::Publish`](crate::scope::Publish).
+    #[serde(default, rename = "pub")]
+    publish: u8,
+    #[serde(default)]
+    cap: u32,
+    #[serde(default)]
+    own: bool,
+    #[serde(default)]
+    bs: bool,
+    /// Whether the holder passed an age check.
+    ///
+    /// Declared so the claim parses — the struct refuses fields it does not
+    /// know — and deliberately not read. An age gate is a decision about
+    /// whether to admit somebody to a room at all, and the control plane makes
+    /// it when it mints the token; by the time a session is announcing
+    /// namespaces the question has already been answered.
+    #[serde(default)]
+    #[allow(dead_code)]
+    age: bool,
 }
 
 /// A public key this relay will accept tokens from.
@@ -328,6 +379,16 @@ impl Authenticator {
         self.inner.is_some()
     }
 
+    /// Whether this relay checks credentials at all.
+    ///
+    /// Read by the session to decide what an unauthenticated request means: on
+    /// a relay with keys it is a request to deny, and on one without it is the
+    /// only kind of request there is.
+    #[must_use]
+    pub const fn is_enabled(&self) -> bool {
+        self.inner.is_some()
+    }
+
     /// Who this peer is.
     ///
     /// `tokens` is every `AUTHORIZATION_TOKEN` Setup Option, in the order sent;
@@ -389,11 +450,15 @@ impl Authenticator {
     }
 }
 
-/// What a verified token said: who the holder is, and who brought them.
+/// What a verified token said: who the holder is, what they may do, and who
+/// brought them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Admission {
     /// Who they are, and the only part of this a limit or a ban may read.
     pub who: Principal,
+
+    /// What they may publish and reach. See [`crate::scope`].
+    pub permission: Permission,
 
     /// The username whose following brought them, from the `via` claim.
     ///
@@ -407,10 +472,17 @@ pub struct Admission {
 impl Admission {
     /// An unauthenticated peer, who by definition arrived through nobody: there
     /// is no signed claim, and an unsigned one is worth less than nothing here.
+    ///
+    /// Unrestricted, because there is no verified tenant or room to compare a
+    /// namespace against. This is only ever reached on a relay with no keys
+    /// configured -- where one token that failed to verify ends the session
+    /// rather than landing here -- and that relay is documented, and logs at
+    /// startup, as one that authorises nothing.
     #[must_use]
     pub const fn anonymous(address: std::net::IpAddr) -> Self {
         Self {
             who: Principal::anonymous(address),
+            permission: Permission::Unrestricted,
             via: None,
         }
     }
@@ -489,8 +561,29 @@ impl Keys {
         let via = Some(claims.via)
             .filter(|via| !via.is_empty() && *via != claims.sub)
             .map(Arc::from);
+
+        // Refused rather than masked, matching the Go minter bit for bit. A
+        // relay that dropped the bits it did not know would enforce a narrower
+        // grant than the one that was issued, silently.
+        if claims.moqt.cap & !capability::KNOWN != 0 {
+            return Err(AuthError::Unsupported);
+        }
+        let permission = Permission::scoped(scope::Scope {
+            tenant: Arc::from(claims.aud.as_str()),
+            user: Arc::from(claims.sub.as_str()),
+            device: Arc::from(device),
+            room: Some(claims.moqt.room)
+                .filter(|room| !room.is_empty())
+                .map(Arc::from),
+            publish: Publish::from_bits(claims.moqt.publish),
+            capabilities: claims.moqt.cap,
+            owner: claims.moqt.own,
+            backstage: claims.moqt.bs,
+        });
+
         Ok(Admission {
             who: Principal::verified(&claims.aud, &claims.sub, device),
+            permission,
             via,
         })
     }

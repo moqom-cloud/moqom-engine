@@ -253,21 +253,16 @@ async fn every_subscriber_gets_the_objects_under_its_own_alias() {
     let video = track(&["acme", "room-42"], "video");
     let upstream = moqom_proto::model::TrackAlias::from(7_u32);
 
-    // Each downstream subscription causes its own upstream SUBSCRIBE, and the
-    // publisher answers both with the same alias — one track, one stream of
-    // objects, as far as it is concerned.
-    let (served_a, one) = tokio::join!(
+    // One upstream SUBSCRIBE serves both: the publisher is asked once, and the
+    // second subscriber joins what the first started.
+    let (served, one) = tokio::join!(
         publisher.answer_subscription(upstream),
         first.subscribe(&video),
     );
-    let (served_b, two) = tokio::join!(
-        publisher.answer_subscription(upstream),
-        second.subscribe(&video),
-    );
+    let two = second.subscribe(&video).await;
     let one = one.expect("the first subscription is accepted");
     let two = two.expect("the second subscription is accepted");
-    assert_eq!(served_a.track, video);
-    assert_eq!(served_b.track, video);
+    assert_eq!(served.track, video);
 
     publisher.publish_subgroup(upstream, &[b"shared"]).await;
 

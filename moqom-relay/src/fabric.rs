@@ -35,7 +35,7 @@ use std::sync::{Arc, Mutex};
 
 use moqom_proto::control::{DoneReason, RequestErrorCode};
 use moqom_proto::model::{FullTrackName, TrackAlias, TrackNamespace};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 
 use crate::cache::Cache;
 use crate::clock;
@@ -109,8 +109,50 @@ impl UpstreamError {
 pub struct Route {
     /// The subscriber's session, used to open a stream per forwarded subgroup.
     pub session: moqom_transport::Session,
+    /// Which session that is.
+    ///
+    /// Aliases are numbered per session and start from the same place, so two
+    /// subscribers routinely hold the same one. Carried so that a subscriber
+    /// letting go of a track names its own route and not a namesake's.
+    pub subscriber: SessionId,
     /// The alias this subscriber knows the track by.
     pub alias: TrackAlias,
+    /// Raised when the track this route carries has ended.
+    ///
+    /// The two halves of a subscription live on opposite sides of the relay:
+    /// the request stream belongs to the subscriber's session and the pull
+    /// belongs to the publisher's, and neither holds the other. This is how the
+    /// news crosses. Without it a publisher going away is silence — the objects
+    /// simply stop, and every viewer waits indefinitely for a frame that is
+    /// never coming, which is the same thing they would see on a stalled
+    /// network and calls for the opposite response.
+    pub done: Arc<Notify>,
+    /// How many data streams have been opened to this subscriber for this
+    /// track, for `PUBLISH_DONE` to report.
+    ///
+    /// The draft has the subscriber use it to know when everything sent has
+    /// arrived; streams already in flight when the subscription ends are the
+    /// reason a count is needed at all rather than an assumption that the last
+    /// one seen was the last one sent.
+    pub streams: Arc<AtomicU64>,
+}
+
+impl Route {
+    /// A route to `alias` on `session`, with nothing yet delivered.
+    #[must_use]
+    pub fn new(
+        session: moqom_transport::Session,
+        subscriber: SessionId,
+        alias: TrackAlias,
+    ) -> Self {
+        Self {
+            session,
+            subscriber,
+            alias,
+            done: Arc::new(Notify::new()),
+            streams: Arc::new(AtomicU64::new(0)),
+        }
+    }
 }
 
 /// `moqom_transport::Session` has no useful `Debug`, and a connection is not
@@ -118,6 +160,7 @@ pub struct Route {
 impl std::fmt::Debug for Route {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Route")
+            .field("subscriber", &self.subscriber)
             .field("alias", &self.alias)
             .finish_non_exhaustive()
     }
@@ -136,10 +179,54 @@ pub enum Command {
         /// The track to pull.
         track: FullTrackName,
         /// Where to send what comes back.
-        route: Route,
+        ///
+        /// Boxed because a route carries a transport handle, which is most of
+        /// the size of this enum; every other command would otherwise be
+        /// padded out to match it.
+        route: Box<Route>,
         /// Completed once upstream has answered.
-        ready: oneshot::Sender<Result<(), UpstreamError>>,
+        ready: oneshot::Sender<Result<Pulling, UpstreamError>>,
     },
+    /// A subscriber has gone. Stop routing this track to it, and stop pulling
+    /// the track altogether if it was the last one watching.
+    ///
+    /// Sent when the subscriber's request stream ends, which is how MOQT says
+    /// unsubscribe — there is no message for it, so the transport event is the
+    /// whole signal and this is what carries it across to the publisher's
+    /// session.
+    Release {
+        /// The track being let go of.
+        track: FullTrackName,
+        /// Which upstream subscription it was being served from.
+        upstream: TrackAlias,
+        /// The departing subscriber, which with its alias names one route.
+        subscriber: SessionId,
+        /// The alias it knew the track by.
+        downstream: TrackAlias,
+    },
+}
+
+/// What a subscriber was attached to.
+///
+/// Reported back to the subscriber's session rather than kept where it is
+/// decided, because both fields are things only that side can use: it accounts
+/// for how the SUBSCRIBE turned out, and it names the subscription so it can
+/// let go of it later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pulling {
+    /// The alias the publisher's session knows this track by.
+    ///
+    /// Meaningless to the subscriber, whose own alias is a different number,
+    /// and carried anyway: it is what [`Command::Release`] names, and asking
+    /// the publisher's session to work it out again would be asking it to
+    /// re-derive something it has already decided.
+    pub upstream: TrackAlias,
+    /// Whether this joined a subscription that was already running.
+    ///
+    /// Worth counting apart from the ones that opened a subscription, because
+    /// the ratio between them is the relay's whole economic argument: the
+    /// second viewer of a track should cost the publisher nothing.
+    pub shared: bool,
 }
 
 /// A namespace appearing or going away.
