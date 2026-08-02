@@ -13,7 +13,7 @@ end-to-end encryption our decisions instead of someone else's.
 | --- | --- | --- |
 | `moqom-proto` | Apache-2.0 | The draft-19 object model, all eighteen control messages, and the data plane |
 | `moqom-transport` | Apache-2.0 | QUIC and WebTransport sessions on one UDP port |
-| `moqom-relay` | BUSL-1.1 | The relay: announcement, subscription, fan-out, retention |
+| `moqom-relay` | BUSL-1.1 | The relay: announcement, subscription, fan-out, retention, authorisation |
 | `fuzz` | Apache-2.0 | Coverage-guided harnesses for the decoders |
 
 Two licences in one workspace is deliberate and [LICENSING.md](LICENSING.md)
@@ -30,6 +30,10 @@ accepts sessions over both QUIC and WebTransport on one UDP port, and
 withdrawal, prefix watching, subscription, and subgroup fan-out with alias
 rewriting.
 
+Two iPhones on a home network, through a relay in Los Angeles, measure 56–57ms
+glass to glass at the median and 70ms at the 95th percentile: 720p at thirty
+frames a second, both directions at once, every frame delivered.
+
 History is retained and fetchable, which is what makes a reconnection
 survivable. A client that dropped its connection asks for the range it missed; a
 client joining a live track asks for the group already in progress rather than
@@ -38,6 +42,34 @@ and by byte budget, evicting whole groups because half a group is undecodable,
 and can be turned off entirely for operators who must not store media. Caching
 is a tee off the forward path rather than a stage in it — forwarding still never
 parses an object, so end-to-end encryption and retention stay compatible.
+
+One track is pulled once. However many people watch a broadcast the publisher is
+asked for it a single time, and every copy after the first is made here — the
+arithmetic a relay is bought for, and `moqom_relay_subscriptions_total` reports
+it directly, `established` counting the copies the publisher paid for and
+`shared` the ones it did not. Each copy is then written by its own task behind a
+short bounded queue, so a viewer that cannot keep up has that subgroup abandoned
+— its stream reset, and the shed counted — instead of holding up the room or
+backing pressure up into the publisher's phone. What the relay will not do is
+pick a smaller rung on that viewer's behalf: the layers belong to the publisher
+and the choice to the subscriber, and shedding is what turns the condition into
+something the subscriber can see and act on.
+
+Subscriptions end at both ends, which sounds like bookkeeping and is not.
+Closing a request stream is how MOQT spells unsubscribe, and when the last
+viewer of a track does it the relay stops pulling that track — the publisher is
+usually a phone, and a room that empties should stop costing the person who
+left it. In the other direction a publisher that stops is announced to every
+viewer with `PUBLISH_DONE`, because objects merely ceasing is also what a bad
+network looks like, and a player is right to wait a bad network out.
+
+Sessions are authenticated and authorised. A token's tenant, room and grants are
+checked against the namespace every request names, so a holder may publish only
+as themselves, in the room they were admitted to, and may read only what that
+room contains; refusals are counted by reason. Note the shape of the default:
+with no keys configured there is no verified tenant to compare anything against,
+and such a relay authorises nothing at all. That is the mode the benchmarks and
+the two-phone rig run in.
 
 The relay can be watched. An admin surface on its own port — off unless
 `MOQOM_RELAY_ADMIN_ADDR` says otherwise — exposes Prometheus metrics for
@@ -56,8 +88,11 @@ connection and an unbroken announcement while its viewers watch a still picture.
 `/tracks` names which track stopped and how long ago; `/metrics` carries only the
 population, bucketed.
 
-**What the relay is not yet:** authorising anything (tokens are parsed and
-ignored), deduplicating upstream subscriptions, or scheduling under congestion.
+**What the relay is not yet:** revoking access during a session — a ban is
+enforced when the next token is minted rather than against the connection
+already open, because no relay has attached to the control plane's link yet —
+scheduling between the rungs of one broadcast under pressure, which is
+`moqom-cc`'s job, or forwarding datagrams; only subgroup streams are carried.
 The admin surface is also unauthenticated, which is why it binds separately and
 defaults off. `moqom-relay/src/lib.rs` lists the gaps and says which matter; none
 of it is ready to face the internet.
