@@ -144,6 +144,15 @@ impl Relay {
         )
     }
 
+    /// Start a relay that verifies tokens against keys from somewhere else.
+    ///
+    /// For `interop_link.rs`, where the keys are the running control plane's and
+    /// the tokens are ones it minted. Everything else here trusts a key this
+    /// harness holds, which cannot tell whether the two implementations agree.
+    pub fn verifying(authenticator: Authenticator) -> Self {
+        Self::assembled(Limits::default(), Governor::disabled(), authenticator)
+    }
+
     fn build(limits: Limits, governor: Governor) -> Self {
         Self::assembled(limits, governor, Authenticator::disabled())
     }
@@ -276,6 +285,15 @@ impl Client {
         Self::establish(relay, Some(token), Link::Ordinary)
             .await
             .unwrap_or_else(|closed| panic!("the relay refused the session: {closed:?}"))
+    }
+
+    /// Connect presenting `token`, tolerating a relay that refuses.
+    ///
+    /// What a banned client sees: the credential verifies and the relay hangs up
+    /// anyway, which is a different outcome from a token that did not verify and
+    /// has to be observable separately.
+    pub async fn try_connect_as(relay: &Relay, token: &str) -> Result<Self, Closed> {
+        Self::establish(relay, Some(token), Link::Ordinary).await
     }
 
     /// Connect, tolerating a relay that refuses before answering.

@@ -57,6 +57,7 @@ use web_transport_quinn::{RecvStream, SendStream};
 use crate::fabric::{Command, Fabric, NamespaceEvent, Pulling, Route, SessionId, UpstreamError};
 use crate::metrics::{Ending, Fetched, Flowing, Metrics, Subscribed};
 use crate::quota::{Lease, Principal, Refusal, Resource};
+use crate::roster::Departure;
 use crate::scope::{Denial, Permission};
 use crate::{cache, metrics};
 
@@ -114,6 +115,17 @@ pub enum SessionError {
     /// when the session is what ran out.
     #[error("over limit: {0:?}")]
     OverLimit(Refusal),
+
+    /// The token verified and the room will not have them.
+    ///
+    /// Separate from [`Self::Unauthenticated`] because the credential is fine
+    /// and the answer is different: a client whose token failed should get a new
+    /// one, and a client that is banned should stop. Separate from the
+    /// authorisation denials in [`crate::scope`] because those refuse a request
+    /// and this refuses the connection — there is no request a banned session
+    /// could make that should succeed.
+    #[error("refused: {0}")]
+    Refused(#[from] crate::policy::Refusal),
 }
 
 impl Ending {
@@ -141,14 +153,54 @@ impl Ending {
                 | SessionError::Write(_)
                 | SessionError::Truncated,
             ) => Self::Transport,
-            Err(SessionError::Unauthenticated(_)) => Self::Rejected,
+            // A verified token refused by the room counts with the rejections:
+            // both are this relay declining somebody, and the difference
+            // between "who are you" and "not you" is carried by the refusal
+            // counters rather than by this one.
+            Err(SessionError::Unauthenticated(_) | SessionError::Refused(_)) => Self::Rejected,
             Err(SessionError::OverLimit(_)) => Self::Throttled,
         }
     }
 }
 
+impl Departure {
+    /// Say why a session ended in the terms the control plane uses.
+    ///
+    /// Coarser than [`Ending`] on purpose: the control plane's question is
+    /// whether to expect this person back, and every way of breaking a
+    /// connection answers it the same way. No catch-all arm here either, for the
+    /// same reason — a new variant should have to be classified rather than
+    /// silently become a departure.
+    ///
+    /// Being ejected does not appear here and cannot: an ejected session sees a
+    /// closed connection, exactly like one that lost the network. The roster
+    /// substitutes it, because only the side that did the closing knows.
+    fn of(result: &Result<(), SessionError>) -> Self {
+        match result {
+            Ok(()) => Self::Clean,
+            Err(SessionError::Protocol(_) | SessionError::Setup(_) | SessionError::Decode(_)) => {
+                Self::Protocol
+            }
+            Err(
+                SessionError::Transport(_)
+                | SessionError::Read(_)
+                | SessionError::Write(_)
+                | SessionError::Truncated,
+            ) => Self::Lost,
+            // Refused at the handshake, so never enrolled and never reported.
+            // Classified rather than left to a catch-all so that this stays true
+            // by construction if one of them ever moves later in the session.
+            Err(
+                SessionError::Unauthenticated(_)
+                | SessionError::Refused(_)
+                | SessionError::OverLimit(_),
+            ) => Self::Protocol,
+        }
+    }
+}
+
 /// Application error codes this relay closes sessions with.
-mod code {
+pub(crate) mod code {
     /// The peer did something the protocol forbids.
     pub const PROTOCOL_VIOLATION: u32 = 0x01;
     /// This relay failed, not the peer.
@@ -373,6 +425,14 @@ pub struct Session {
     /// quota key, compared for equality to find a bucket, and a permission is
     /// not something anybody is charged for.
     permission: Arc<OnceLock<Permission>>,
+
+    /// Whose following brought this session, from the token's `via` claim.
+    ///
+    /// `Option` inside the `OnceLock` because "nobody brought them" is an
+    /// answer and "SETUP has not happened yet" is not: collapsing the two would
+    /// make an unset field look like a session that arrived on its own, and the
+    /// count that comes out the other end is what a cohost is paid on.
+    via: Arc<OnceLock<Option<Arc<str>>>>,
 }
 
 /// Identity and carrier only. The rest is a connection, a lock, and channels,
@@ -426,10 +486,16 @@ impl Session {
             subscribed: Arc::default(),
             principal: Arc::default(),
             permission: Arc::default(),
+            via: Arc::default(),
         };
 
         let result = session.run(command_queue).await;
         fabric.remove_session(id);
+        // Before the log line below, so that a relay reporting upstream says
+        // somebody left at the same moment it says so locally. Harmless for a
+        // session that was never enrolled, which is every session that failed
+        // its handshake and every session on a relay with no keys.
+        fabric.roster().release(id, Departure::of(&result));
         let ending = Ending::of(&result);
         fabric.metrics().session_ended(id, ending);
         // The one lifecycle event that was missing: a session that ends cleanly
@@ -450,6 +516,11 @@ impl Session {
             Err(SessionError::Unauthenticated(e)) => session
                 .transport
                 .close(code::UNAUTHORIZED, e.name().as_bytes()),
+            // The reason phrase is the one the moderator's tool will be asked
+            // about, so it says which rule rather than merely "no".
+            Err(SessionError::Refused(refusal)) => session
+                .transport
+                .close(code::UNAUTHORIZED, refusal.to_string().as_bytes()),
             // The retry-after goes in the close reason, since a session that is
             // being closed has no request stream left to carry it. A client that
             // reads it waits; one that does not is no worse off than before.
@@ -496,6 +567,12 @@ impl Session {
         // slot, and `run` returning is the one thing that happens on every path
         // out of a session.
         let _session = self.handshake(&mut control_send, &mut control).await?;
+
+        // Enrolled only now, with the handshake complete: a session reported
+        // upstream and then refused would have the control plane record a join
+        // and a departure for somebody who never arrived, and a room's event
+        // stream is a thing customers read.
+        self.enrol();
 
         let peer = self.connection().remote_address();
         let live = self
@@ -686,12 +763,9 @@ impl Session {
         if admitted.who.is_verified() {
             tracing::debug!(session = %self.id, "session authenticated");
         }
-        // Logged and not stored, because there is nowhere for it to go yet: what
-        // carries provenance onward is the control-plane session link, and no part
-        // of this relay reports session state to the control plane so far. Until
-        // then this line is the only way to confirm from a running relay that
-        // attribution is reaching it at all, which is worth more than a field
-        // nothing reads.
+        // Kept rather than only logged, now that there is somewhere for it to
+        // go: the control-plane link reports it on the session, and the control
+        // plane attributes the participant to whoever brought them.
         //
         // Deliberately not folded into the principal, which is a quota key: an
         // audience is not something anybody is charged for, and combining them
@@ -699,12 +773,67 @@ impl Session {
         if let Some(via) = &admitted.via {
             tracing::debug!(session = %self.id, %via, "session was brought by somebody");
         }
+        let _ = self.via.set(admitted.via);
         // Only ever set once, and this is the only place that sets either. A
         // peer that could change who it is mid-session could shed a limit; one
         // that could change what it may do could shed the checks below.
         let _ = self.principal.set(admitted.who);
         let _ = self.permission.set(admitted.permission);
-        Ok(())
+
+        self.admissible(address)
+    }
+
+    /// Whether the room will have this session, as distinct from whether its
+    /// token verified.
+    ///
+    /// The whole of ban enforcement against a *new* connection, and the reason
+    /// it is three lines: everything expensive happened earlier, when the
+    /// control plane sent the room's state. Asking it now — at the moment a
+    /// phone is waiting to join — is the design this is arranged to avoid.
+    fn admissible(&self, address: std::net::IpAddr) -> Result<(), SessionError> {
+        let Permission::Scoped(scope) = self.permission() else {
+            // Nothing to check against. Either no keys are configured, in which
+            // case this relay authorises nothing and says so at startup, or the
+            // token has not been verified yet — and no request is served in
+            // that window.
+            return Ok(());
+        };
+        let occupancy = scope.room.as_ref().map_or(0, |room| {
+            self.fabric.roster().occupancy(&scope.tenant, room)
+        });
+        match self.fabric.policy().admits(scope, address, occupancy) {
+            Ok(()) => Ok(()),
+            Err(refusal) => {
+                tracing::info!(
+                    session = %self.id,
+                    %address,
+                    user = %scope.user,
+                    room = scope.room.as_deref().unwrap_or("-"),
+                    reason = refusal.name(),
+                    "session refused by room policy"
+                );
+                self.fabric.metrics().policy_refused(refusal.name());
+                Err(SessionError::Refused(refusal))
+            }
+        }
+    }
+
+    /// Put this session on the roster, so that it can be reported and reached.
+    ///
+    /// Silently does nothing for a session with no verified room, which is the
+    /// correct amount of reporting about somebody the control plane cannot name.
+    fn enrol(&self) {
+        let Permission::Scoped(scope) = self.permission() else {
+            return;
+        };
+        let via = self.via.get().cloned().flatten();
+        self.fabric.roster().admit(
+            self.id,
+            scope,
+            self.connection().remote_address().ip(),
+            via,
+            Arc::new(self.transport.clone()),
+        );
     }
 
     /// Who this session's requests are charged to.

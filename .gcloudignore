@@ -1,0 +1,13 @@
+# What not to upload to Cloud Build.
+#
+# target/ is several gigabytes of build output that the builder rebuilds anyway.
+# Sending it turns a thirty-second upload into a very long one.
+#
+# vendor/ stays. It is only a couple of megabytes and it holds the patched quinn
+# the workspace depends on by path, so a build without it fails to resolve.
+.git
+.gitignore
+target
+fuzz/target
+LICENSES
+**/*.profraw

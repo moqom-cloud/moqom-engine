@@ -41,7 +41,9 @@ use crate::cache::Cache;
 use crate::clock;
 use crate::identity::Authenticator;
 use crate::metrics::Metrics;
+use crate::policy::Policy;
 use crate::quota::Governor;
+use crate::roster::Roster;
 
 /// Identifies a session within one relay process.
 ///
@@ -307,6 +309,15 @@ pub struct Fabric {
     /// bound, and so the health behind it is read once per second rather than
     /// once per session.
     clock: Arc<clock::Host>,
+    /// Who is connected, and how to hang up on them.
+    ///
+    /// Here for the same reason the announcements are: it is state about
+    /// sessions that no session owns. A ban arrives on the control-plane link,
+    /// which is a task with no connection of its own, and this is the only thing
+    /// that can turn it into a closed socket.
+    roster: Roster,
+    /// What the control plane has said about the rooms this relay serves.
+    policy: Policy,
 }
 
 /// Defaults that limit nothing and verify nothing.
@@ -326,6 +337,8 @@ impl Default for Fabric {
             governor: Governor::disabled(),
             authenticator: Authenticator::disabled(),
             clock: Arc::default(),
+            roster: Roster::new(),
+            policy: Policy::new(),
         }
     }
 }
@@ -404,6 +417,18 @@ impl Fabric {
     #[must_use]
     pub const fn authenticator(&self) -> &Authenticator {
         &self.authenticator
+    }
+
+    /// Who is connected.
+    #[must_use]
+    pub const fn roster(&self) -> &Roster {
+        &self.roster
+    }
+
+    /// What the control plane has said about the rooms this relay serves.
+    #[must_use]
+    pub const fn policy(&self) -> &Policy {
+        &self.policy
     }
 
     /// Allocate an identifier for a newly accepted session.

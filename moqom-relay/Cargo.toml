@@ -36,6 +36,23 @@ rcgen = { workspace = true }
 rustls-pemfile = { workspace = true }
 tracing-subscriber = { workspace = true }
 
+# The link to the control plane, which is gRPC because the control plane is Go
+# and the contract is protobuf. It is the one place a relay speaks anything but
+# MOQT, and it is deliberately nowhere near the media path: a session is
+# authorised against state this link delivered earlier, never by asking it
+# during a handshake.
+prost = "0.14"
+prost-types = "0.14"
+tonic = { version = "0.14", default-features = false, features = ["channel", "codegen", "router", "server", "tls-ring", "tls-native-roots"] }
+tonic-prost = "0.14"
+tokio-stream = "0.1"
+http = "1"
+
+[build-dependencies]
+# Only used when MOQOM_REGENERATE_PROTO is set. The output is checked in so that
+# building a relay needs no protoc.
+tonic-prost-build = "0.14"
+
 # Reading the kernel's clock discipline through adjtimex, which std does not
 # expose. Linux only: nothing else is a deployment target, and off Linux the
 # relay reports that it cannot tell rather than guessing.

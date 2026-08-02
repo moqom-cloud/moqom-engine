@@ -28,6 +28,14 @@
 //!   which is a much smaller allowance.
 //! - `MOQOM_RELAY_ISSUER` — the issuer tokens must name. Unset accepts any,
 //!   which is for tests.
+//! - `MOQOM_CONTROL_ENDPOINT` — the control plane's URL. Unset means no
+//!   moderation reaches this relay: it enforces what tokens say and nothing
+//!   else, which is the mode the benches run in and not one to expose.
+//! - `MOQOM_CONTROL_CREDENTIAL` — the relay service account's bearer token.
+//! - `MOQOM_RELAY_ID` — this relay's name to the control plane. Defaults to
+//!   `HOSTNAME`, which in a managed instance group is the instance and is stable
+//!   across its restarts.
+//! - `MOQOM_RELAY_REGION` — where it is, for steering.
 //!
 //! # A caveat about the address tier
 //!
@@ -57,7 +65,8 @@ use std::path::PathBuf;
 use base64::Engine as _;
 use moqom_relay::admin::Surface;
 use moqom_relay::{
-    Authenticator, Cache, Fabric, Governor, Limits, Metrics, Quotas, Session, VerificationKey,
+    Authenticator, Cache, Fabric, Governor, Limits, Link, Metrics, Quotas, Session, Supervisor,
+    VerificationKey,
 };
 use moqom_transport::{Server, server::with_moqt_alpn};
 
@@ -136,6 +145,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let fabric = Fabric::observed(Cache::new(limits), metrics.clone())
         .governed(governor()?)
         .authenticated(authenticator()?);
+    // Held for the life of the process; dropping it detaches. Before the accept
+    // loop so that a relay restarting into a room with a ban in force learns
+    // about it in the same second rather than after somebody rejoins.
+    let _link = control_link(&fabric);
+
     let surface = Surface::new(metrics, fabric.clone());
     if let Some(addr) = admin_addr {
         let serving = surface.clone();
@@ -187,6 +201,25 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+}
+
+/// Attach to the control plane, if this deployment has one.
+///
+/// Without one the relay still runs, and says so loudly: it enforces what tokens
+/// claim and no moderation at all, which is right for a bench on a laptop and
+/// wrong for anything with users on it.
+fn control_link(fabric: &Fabric) -> Option<Link> {
+    let Some(supervisor) = Supervisor::from_env() else {
+        tracing::warn!("no MOQOM_CONTROL_ENDPOINT: this relay enforces tokens and no moderation");
+        return None;
+    };
+    tracing::info!(
+        endpoint = %supervisor.endpoint,
+        relay = %supervisor.relay_id,
+        region = %supervisor.region,
+        "attaching to the control plane"
+    );
+    Some(Link::attach(supervisor, fabric.clone()))
 }
 
 /// Resolve once either signal arrives.

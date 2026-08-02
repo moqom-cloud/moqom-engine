@@ -92,15 +92,23 @@ pub mod cache;
 pub mod clock;
 pub mod fabric;
 pub mod identity;
+pub mod link;
 pub mod metrics;
+pub mod policy;
 pub mod quota;
+pub mod roster;
 pub mod scope;
 pub mod session;
+
+mod generated;
 
 pub use cache::{Cache, Limits};
 pub use fabric::Fabric;
 pub use identity::{Admission, AuthError, Authenticator, VerificationKey};
+pub use link::{Link, Supervisor};
 pub use metrics::Metrics;
+pub use policy::{Ban, Banned, Policy, Rules};
 pub use quota::{Governor, Principal, Quotas, Refusal};
+pub use roster::{Presence, Roster};
 pub use scope::{Denial, Permission, Publish, Scope};
 pub use session::{Session, SessionError};

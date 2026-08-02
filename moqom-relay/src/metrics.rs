@@ -331,6 +331,24 @@ struct Inner {
     /// Requests refused by authorisation, by the fixed set
     /// [`crate::Denial::name`] returns. Same shape and same reasoning.
     denials: Mutex<HashMap<&'static str, u64>>,
+    /// Sessions refused by room policy, by the fixed set
+    /// [`crate::policy::Refusal::name`] returns.
+    ///
+    /// The one number that says a ban is doing anything. A moderation call that
+    /// the control plane records as enforced and that no relay ever acts on
+    /// looks identical from the control plane's side, so this is the counter
+    /// that distinguishes them.
+    policy_refusals: Mutex<HashMap<&'static str, u64>>,
+
+    /// Whether the control-plane link is up, as a gauge.
+    ///
+    /// A relay serving happily with this at zero is the state worth alerting
+    /// on: everything works, and nobody can ban anybody.
+    attached: AtomicU64,
+    /// Directives carried out, by action.
+    directives: Mutex<HashMap<&'static str, u64>>,
+    /// Sessions closed because the control plane said so.
+    ejections: AtomicU64,
 
     subgroups_forwarded: AtomicU64,
     subgroups_dropped: AtomicU64,
@@ -579,6 +597,10 @@ impl Metrics {
                 refusal_reasons: counters(),
                 tokens_refused: Mutex::new(HashMap::new()),
                 denials: Mutex::new(HashMap::new()),
+                policy_refusals: Mutex::new(HashMap::new()),
+                attached: AtomicU64::new(0),
+                directives: Mutex::new(HashMap::new()),
+                ejections: AtomicU64::new(0),
                 subgroups_forwarded: AtomicU64::new(0),
                 subgroups_dropped: AtomicU64::new(0),
                 subgroups_shed: AtomicU64::new(0),
@@ -828,6 +850,49 @@ impl Metrics {
             .entry(reason)
             .and_modify(|count| *count += 1)
             .or_insert(1);
+    }
+
+    /// A session was turned away by the room's policy rather than by its token.
+    ///
+    /// `reason` comes from [`crate::policy::Refusal::name`], a fixed set. No
+    /// room label and no username, for the reason every other refusal counter
+    /// here has neither: both are unbounded, and both would publish who is
+    /// banned from what to anyone who can reach the metrics port.
+    pub fn policy_refused(&self, reason: &'static str) {
+        let Some(inner) = self.inner() else { return };
+        inner
+            .policy_refusals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(reason)
+            .and_modify(|count| *count += 1)
+            .or_insert(1);
+    }
+
+    /// Whether the control-plane link is currently up.
+    pub fn control_attached(&self, attached: bool) {
+        if let Some(inner) = self.inner() {
+            inner.attached.store(u64::from(attached), ORDER);
+        }
+    }
+
+    /// A directive arrived and was acted on. `action` is a fixed set.
+    pub fn directive(&self, action: &'static str) {
+        let Some(inner) = self.inner() else { return };
+        inner
+            .directives
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(action)
+            .and_modify(|count| *count += 1)
+            .or_insert(1);
+    }
+
+    /// Sessions closed on the control plane's instruction.
+    pub fn ejected(&self, sessions: u64) {
+        if let Some(inner) = self.inner() {
+            inner.ejections.fetch_add(sessions, ORDER);
+        }
     }
 
     /// A subgroup stream arrived and had somewhere to go.
@@ -1109,6 +1174,66 @@ impl Metrics {
             "moqom_relay_requests_denied_total",
             "Requests refused by authorisation, by reason.",
             &series,
+        );
+
+        // What moderation is doing, which until the control-plane link existed
+        // was nothing at all. Zero here on a relay that is attached means bans
+        // are being written and not landing.
+        let refused = {
+            let counts = inner
+                .policy_refusals
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut seen: Vec<(&'static str, u64)> =
+                counts.iter().map(|(&reason, &n)| (reason, n)).collect();
+            seen.sort_unstable();
+            seen
+        };
+        let series: Vec<(&str, &str, u64)> = refused
+            .iter()
+            .map(|&(reason, count)| ("reason", reason, count))
+            .collect();
+        counter(
+            &mut out,
+            "moqom_relay_sessions_refused_total",
+            "Sessions turned away by room policy, by reason.",
+            &series,
+        );
+
+        let carried = {
+            let counts = inner
+                .directives
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut seen: Vec<(&'static str, u64)> =
+                counts.iter().map(|(&action, &n)| (action, n)).collect();
+            seen.sort_unstable();
+            seen
+        };
+        let series: Vec<(&str, &str, u64)> = carried
+            .iter()
+            .map(|&(action, count)| ("action", action, count))
+            .collect();
+        counter(
+            &mut out,
+            "moqom_relay_directives_total",
+            "Directives received from the control plane, by action.",
+            &series,
+        );
+        plain(
+            &mut out,
+            "counter",
+            "moqom_relay_sessions_ejected_total",
+            "Sessions closed on the control plane's instruction.",
+            inner.ejections.load(ORDER),
+        );
+        plain(
+            &mut out,
+            "gauge",
+            "moqom_relay_control_attached",
+            "Whether the control-plane link is up. A relay serving with this at zero is \
+             enforcing policy from before it dropped.",
+            inner.attached.load(ORDER),
         );
 
         counter(
