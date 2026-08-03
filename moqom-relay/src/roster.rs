@@ -40,8 +40,9 @@ use std::time::SystemTime;
 
 use tokio::sync::mpsc;
 
-use crate::fabric::SessionId;
-use crate::scope::{Publish, Scope};
+use crate::fabric::{Command, SessionId};
+use crate::policy::Silence;
+use crate::scope::{Publish, Scope, capability};
 
 /// Something that can be hung up on.
 ///
@@ -91,6 +92,15 @@ pub struct Presence {
     /// The connection, held only so it can be closed.
     transport: Arc<dyn Closes>,
 
+    /// This session's own command loop.
+    ///
+    /// The exception to the paragraph above about ejection. Closing a session
+    /// cannot go through a channel the session drains, but restricting one
+    /// must: stopping a track and telling its publisher why are things only
+    /// that session can do, on its own connection, and this is how a directive
+    /// arriving on the control-plane link reaches it.
+    commands: mpsc::Sender<Command>,
+
     /// Set when this relay closed the session on somebody's instruction.
     ///
     /// Read at teardown, where the difference between "ejected" and "the
@@ -122,6 +132,17 @@ impl Presence {
         self.ejected.load(Ordering::Relaxed)
     }
 
+    /// Whether this session runs the room rather than merely appearing in it.
+    ///
+    /// The one distinction an audience-only mute turns on: a host or cohost
+    /// keeps receiving what the audience no longer does. Stage powers count
+    /// because force-muting is one of them, and somebody trusted to impose a
+    /// mute is trusted to hear through it.
+    #[must_use]
+    pub const fn privileged(&self) -> bool {
+        self.owner || self.capabilities & (capability::STAGE | capability::ROOM) != 0
+    }
+
     /// Whether this is `username`, and `device` if one was named.
     ///
     /// An empty device matches every device that person is signed in on, which
@@ -141,6 +162,33 @@ impl Presence {
     pub fn eject(&self, code: u32, reason: &str) {
         self.ejected.store(true, Ordering::Relaxed);
         self.transport.close(code, reason.as_bytes());
+    }
+
+    /// Tell this session what it may no longer publish.
+    ///
+    /// Returns whether the instruction was handed over, which is not whether
+    /// the camera is off: what happens next is a stream to a phone, and a
+    /// directive result that waited for it would hold the control plane's link
+    /// open for as long as one bad connection took to fail.
+    ///
+    /// A full queue is a session already being asked to do 32 things, which in
+    /// practice is one that has stopped draining — so the restriction is
+    /// dropped rather than blocking the link, and said out loud. The policy
+    /// still holds it: nobody will be allowed to subscribe to the tracks it
+    /// names, whatever the phone does.
+    pub fn restrict(&self, silence: Silence) -> bool {
+        match self.commands.try_send(Command::Restrict { silence }) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(
+                    session = %self.id,
+                    user = %self.user,
+                    error = %e,
+                    "could not hand a mute to its session"
+                );
+                false
+            }
+        }
     }
 }
 
@@ -241,6 +289,7 @@ impl Roster {
         address: IpAddr,
         via: Option<Arc<str>>,
         transport: Arc<dyn Closes>,
+        commands: mpsc::Sender<Command>,
     ) -> Option<Arc<Presence>> {
         let room = scope.room.clone()?;
         let presence = Arc::new(Presence {
@@ -257,6 +306,7 @@ impl Roster {
             opened: SystemTime::now(),
             via,
             transport,
+            commands,
             ejected: AtomicBool::new(false),
         });
 
@@ -292,6 +342,17 @@ impl Roster {
                 why,
             });
         }
+    }
+
+    /// One session, if it is still here.
+    ///
+    /// For deciding what a *subscriber* is entitled to, which is a question
+    /// asked on the publisher's session about somebody else's — the fan-out
+    /// knows a route's [`SessionId`] and nothing more about who is on the end
+    /// of it.
+    #[must_use]
+    pub fn find(&self, id: SessionId) -> Option<Arc<Presence>> {
+        self.lock().sessions.get(&id).map(Arc::clone)
     }
 
     /// Everybody here, for the hello that reattaches a broken link.
@@ -390,12 +451,17 @@ mod tests {
         user: &str,
         room: Option<&str>,
     ) -> Option<Arc<Presence>> {
+        // The queue is dropped, which is right for every test here but the one
+        // about restricting: that one builds its own so there is somebody to
+        // receive.
+        let (commands, _queue) = mpsc::channel(4);
         roster.admit(
             id,
             &scope(user, room),
             address(),
             None,
             Arc::new(Hangup::default()),
+            commands,
         )
     }
 
@@ -464,6 +530,61 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn a_restriction_is_handed_to_the_session_that_must_carry_it_out() {
+        let roster = Roster::new();
+        let id = Fabric::new().next_session_id();
+        let (commands, mut queue) = mpsc::channel(4);
+        let presence = roster
+            .admit(
+                id,
+                &scope("ada", Some("r1")),
+                address(),
+                None,
+                Arc::new(Hangup::default()),
+                commands,
+            )
+            .expect("enrolled");
+
+        let silence = Silence {
+            everyone: crate::media::Kinds::VIDEO,
+            audience: crate::media::Kinds::NONE,
+        };
+        assert!(presence.restrict(silence));
+        match queue.try_recv() {
+            Ok(Command::Restrict { silence: got }) => assert_eq!(got, silence),
+            other => panic!("expected a restriction, got {other:?}"),
+        }
+
+        // A session nobody is draining is reported rather than waited for.
+        drop(queue);
+        assert!(!presence.restrict(silence));
+    }
+
+    #[test]
+    fn only_the_people_running_the_room_hear_through_an_audience_mute() {
+        let roster = Roster::new();
+        let ids = Fabric::new();
+        let (commands, _queue) = mpsc::channel(4);
+        let mut host = scope("ada", Some("r1"));
+        host.capabilities = capability::STAGE;
+        let host = roster
+            .admit(
+                ids.next_session_id(),
+                &host,
+                address(),
+                None,
+                Arc::new(Hangup::default()),
+                commands,
+            )
+            .expect("enrolled");
+        let viewer = enrol(&roster, ids.next_session_id(), "bea", Some("r1")).expect("enrolled");
+
+        assert!(host.privileged());
+        assert!(!viewer.privileged());
+        assert_eq!(roster.find(host.id).map(|found| found.id), Some(host.id));
     }
 
     #[test]

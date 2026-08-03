@@ -93,6 +93,7 @@ pub mod clock;
 pub mod fabric;
 pub mod identity;
 pub mod link;
+pub mod media;
 pub mod metrics;
 pub mod policy;
 pub mod quota;

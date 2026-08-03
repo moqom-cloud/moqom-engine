@@ -29,6 +29,7 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::media::Kinds;
 use crate::scope::Scope;
 
 /// A room, named the way everything upstream names one.
@@ -139,6 +140,78 @@ impl Ban {
     }
 }
 
+/// One force-mute, as the control plane issued it.
+///
+/// Separate from a ban rather than folded into it because the two answer
+/// different questions at different moments: a ban is asked about once, when
+/// somebody tries to join, and a mute is asked about on every subscription to
+/// the person it names, for as long as it holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Mute {
+    /// The account.
+    pub user: String,
+    /// Which device, or empty for every device they are signed in on — the
+    /// same convention `ParticipantRef` uses, and the one a moderator means
+    /// when they mute a person rather than a phone.
+    pub device: String,
+    /// What is stopped.
+    pub media: Kinds,
+    /// Whether hosts and cohosts still receive it.
+    pub audience_only: bool,
+    /// When it lifts. `None` holds until somebody lifts it.
+    pub until: Option<SystemTime>,
+}
+
+impl Mute {
+    /// Whether this mute still applies at `now`.
+    #[must_use]
+    pub fn holds(&self, now: SystemTime) -> bool {
+        self.until.is_none_or(|until| now < until)
+    }
+
+    /// Whether this mute names that person, and that device if it names one.
+    #[must_use]
+    pub fn catches(&self, user: &str, device: &str) -> bool {
+        self.user == user && (self.device.is_empty() || self.device == device)
+    }
+}
+
+/// What one participant may not publish, and to whom.
+///
+/// Two sets rather than one because they are enforced in different places and
+/// mean different things to the person holding the phone. `everyone` stops the
+/// track at its source and darkens the hardware indicator; `audience` only
+/// narrows who the relay will forward it to, and the camera stays on because
+/// the hosts are still watching through it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Silence {
+    /// Stopped for everybody, including the hosts.
+    pub everyone: Kinds,
+    /// Stopped for the audience, while hosts and cohosts still receive it.
+    pub audience: Kinds,
+}
+
+impl Silence {
+    /// Whether anything at all is muted.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.everyone.is_empty() && self.audience.is_empty()
+    }
+
+    /// What a subscriber is not allowed to receive.
+    ///
+    /// `privileged` is whether the subscriber runs the room, which is the only
+    /// thing that distinguishes the two scopes on the receiving side.
+    #[must_use]
+    pub const fn withheld_from(self, privileged: bool) -> Kinds {
+        if privileged {
+            self.everyone
+        } else {
+            self.everyone.union(self.audience)
+        }
+    }
+}
+
 /// Everything the relay must know to serve one room without asking again.
 #[derive(Debug, Clone, Default)]
 pub struct Rules {
@@ -148,6 +221,8 @@ pub struct Rules {
     pub bans: Vec<Ban>,
     /// How many sessions the room may hold. Zero means no ceiling.
     pub ceiling: u32,
+    /// Force-mutes in force.
+    pub mutes: Vec<Mute>,
 }
 
 /// Why a session was not let in.
@@ -298,6 +373,54 @@ impl Policy {
     /// Open or close a room.
     pub fn close(&self, room: Where, closed: bool) {
         self.lock().rooms.entry(room).or_default().closed = closed;
+    }
+
+    /// Add or lift one force-mute without disturbing the rest of the room.
+    ///
+    /// Keyed by who it names *and* its scope, because a participant can be
+    /// under an everyone-mute and an audience-mute at once and lifting one must
+    /// not lift the other. Replacing rather than accumulating: a mute that
+    /// arrives for somebody already muted is the moderator changing which media
+    /// they meant, and two rows for one scope would make the narrower one
+    /// unliftable.
+    pub fn mute(&self, room: Where, mute: Mute, active: bool) {
+        let mut inner = self.lock();
+        let rules = inner.rooms.entry(room).or_default();
+        rules.mutes.retain(|held| {
+            held.user != mute.user
+                || held.device != mute.device
+                || held.audience_only != mute.audience_only
+        });
+        if active && !mute.media.is_empty() {
+            rules.mutes.push(mute);
+        }
+    }
+
+    /// What one participant is currently forbidden to publish.
+    ///
+    /// Empty for a room this relay knows nothing about, which is the same
+    /// permissive answer [`Self::admits`] gives and for the same reason: the
+    /// control plane cannot have muted somebody in a room it does not yet know
+    /// this relay is serving.
+    #[must_use]
+    pub fn silenced(&self, room: &Where, user: &str, device: &str) -> Silence {
+        let now = SystemTime::now();
+        let inner = self.lock();
+        let Some(rules) = inner.rooms.get(room) else {
+            return Silence::default();
+        };
+        let mut silence = Silence::default();
+        for mute in &rules.mutes {
+            if !mute.holds(now) || !mute.catches(user, device) {
+                continue;
+            }
+            if mute.audience_only {
+                silence.audience = silence.audience.union(mute.media);
+            } else {
+                silence.everyone = silence.everyone.union(mute.media);
+            }
+        }
+        silence
     }
 
     /// Note a ban that arrived in a form this relay could not read.
@@ -575,6 +698,149 @@ mod tests {
         // A snapshot without that ban is the control plane saying it is gone.
         policy.describe(room(), Rules::default());
         assert!(policy.admits(&scope("ada"), address(4), 0).is_ok());
+    }
+
+    #[test]
+    fn a_mute_names_a_person_or_one_of_their_devices() {
+        let policy = Policy::new();
+        policy.mute(
+            room(),
+            Mute {
+                user: "ada".into(),
+                device: String::new(),
+                media: Kinds::AUDIO,
+                audience_only: false,
+                until: None,
+            },
+            true,
+        );
+
+        assert_eq!(
+            policy.silenced(&room(), "ada", "phone").everyone,
+            Kinds::AUDIO
+        );
+        assert_eq!(
+            policy.silenced(&room(), "ada", "laptop").everyone,
+            Kinds::AUDIO
+        );
+        assert!(policy.silenced(&room(), "adam", "phone").is_empty());
+
+        // A device mute reaches one device.
+        let policy = Policy::new();
+        policy.mute(
+            room(),
+            Mute {
+                user: "ada".into(),
+                device: "phone".into(),
+                media: Kinds::VIDEO,
+                audience_only: false,
+                until: None,
+            },
+            true,
+        );
+        assert_eq!(
+            policy.silenced(&room(), "ada", "phone").everyone,
+            Kinds::VIDEO
+        );
+        assert!(policy.silenced(&room(), "ada", "laptop").is_empty());
+    }
+
+    #[test]
+    fn the_two_scopes_are_held_apart_and_lifted_apart() {
+        let policy = Policy::new();
+        let everyone = Mute {
+            user: "ada".into(),
+            device: String::new(),
+            media: Kinds::AUDIO,
+            audience_only: false,
+            until: None,
+        };
+        let audience = Mute {
+            audience_only: true,
+            media: Kinds::VIDEO,
+            ..everyone.clone()
+        };
+        policy.mute(room(), everyone.clone(), true);
+        policy.mute(room(), audience, true);
+
+        let silence = policy.silenced(&room(), "ada", "phone");
+        assert_eq!(silence.everyone, Kinds::AUDIO);
+        assert_eq!(silence.audience, Kinds::VIDEO);
+
+        // What a host receives, and what everybody else does.
+        assert_eq!(silence.withheld_from(true), Kinds::AUDIO);
+        assert_eq!(
+            silence.withheld_from(false),
+            Kinds::AUDIO.union(Kinds::VIDEO)
+        );
+
+        // Lifting the everyone-mute leaves the audience-mute standing, which is
+        // the mistake the two keys exist to prevent.
+        policy.mute(room(), everyone, false);
+        let silence = policy.silenced(&room(), "ada", "phone");
+        assert!(silence.everyone.is_empty());
+        assert_eq!(silence.audience, Kinds::VIDEO);
+    }
+
+    #[test]
+    fn a_second_mute_replaces_the_first_rather_than_adding_to_it() {
+        let policy = Policy::new();
+        let mute = Mute {
+            user: "ada".into(),
+            device: String::new(),
+            media: Kinds::ALL,
+            audience_only: false,
+            until: None,
+        };
+        policy.mute(room(), mute.clone(), true);
+        // The moderator narrows it to the microphone.
+        policy.mute(
+            room(),
+            Mute {
+                media: Kinds::AUDIO,
+                ..mute
+            },
+            true,
+        );
+        assert_eq!(
+            policy.silenced(&room(), "ada", "phone").everyone,
+            Kinds::AUDIO
+        );
+    }
+
+    #[test]
+    fn an_expired_mute_is_no_mute() {
+        let policy = Policy::new();
+        policy.mute(
+            room(),
+            Mute {
+                user: "ada".into(),
+                device: String::new(),
+                media: Kinds::AUDIO,
+                audience_only: false,
+                until: Some(SystemTime::now() - Duration::from_secs(1)),
+            },
+            true,
+        );
+        assert!(policy.silenced(&room(), "ada", "phone").is_empty());
+    }
+
+    #[test]
+    fn a_snapshot_replaces_the_mutes_it_does_not_mention() {
+        let policy = Policy::new();
+        policy.mute(
+            room(),
+            Mute {
+                user: "ada".into(),
+                device: String::new(),
+                media: Kinds::AUDIO,
+                audience_only: false,
+                until: None,
+            },
+            true,
+        );
+        policy.describe(room(), Rules::default());
+        assert!(policy.silenced(&room(), "ada", "phone").is_empty());
     }
 
     #[test]

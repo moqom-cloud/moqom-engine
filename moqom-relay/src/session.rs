@@ -39,16 +39,17 @@ use std::time::{Instant, SystemTime};
 use bytes::{Buf, Bytes, BytesMut};
 use moqom_proto::control::{
     ControlFrame, DoneReason, Fetch, FetchKind, FetchOk, MessageBody, MessageType, Namespace,
-    NamespaceDone, PublishDone, PublishDoneStatus, PublishNamespace, ReasonPhrase, RequestError,
-    RequestErrorCode, RequestId, RequestIdGenerator, Role, Setup, StreamCount, Subscribe,
-    SubscribeNamespace, SubscribeOk, setup, write_message,
+    NamespaceDone, Publish, PublishDone, PublishDoneStatus, PublishNamespace, ReasonPhrase,
+    RequestError, RequestErrorCode, RequestId, RequestIdGenerator, Role, Setup, StreamCount,
+    Subscribe, SubscribeNamespace, SubscribeOk, setup, write_message,
 };
 use moqom_proto::data::{
-    FetchHeader, FetchRecord, FetchWriter, GroupOrder, SubgroupHeader, SubgroupReader,
+    FetchHeader, FetchRecord, FetchWriter, GroupOrder, SubgroupHeader, SubgroupObject,
+    SubgroupReader, SubgroupSource, SubgroupWriter,
 };
 use moqom_proto::error::DecodeError;
 use moqom_proto::model::{
-    FetchEnd, FullTrackName, GroupId, Location, ObjectId, TrackAlias, TrackNamespace,
+    FetchEnd, FullTrackName, GroupId, Location, ObjectId, ObjectSeq, TrackAlias, TrackNamespace,
 };
 use moqom_proto::varint::VarInt;
 use tokio::sync::{Notify, mpsc, oneshot, watch};
@@ -56,10 +57,11 @@ use web_transport_quinn::{RecvStream, SendStream};
 
 use crate::fabric::{Command, Fabric, NamespaceEvent, Pulling, Route, SessionId, UpstreamError};
 use crate::metrics::{Ending, Fetched, Flowing, Metrics, Subscribed};
+use crate::policy::Silence;
 use crate::quota::{Lease, Principal, Refusal, Resource};
 use crate::roster::Departure;
-use crate::scope::{Denial, Permission};
-use crate::{cache, metrics};
+use crate::scope::{Denial, Permission, Scope};
+use crate::{cache, media, metrics, scope};
 
 /// Identifies this build in Setup Options, for the other end's logs.
 const IMPLEMENTATION: &[u8] = concat!("moqom-relay/", env!("CARGO_PKG_VERSION")).as_bytes();
@@ -215,6 +217,52 @@ pub(crate) mod code {
     /// that cannot tell them apart reconnects immediately in both cases, which
     /// turns a rate limit into a reconnect storm.
     pub const EXCESSIVE_LOAD: u32 = 0x04;
+}
+
+/// The track a relay pushes a participant's own restrictions to.
+///
+/// Reserved, like `.catalog` and `.control`, and named under the participant's
+/// slot in the room rather than under their personal channel because that is
+/// what it describes: the same person in another room is under other rules.
+const POLICY_TRACK: &[u8] = b".policy";
+
+/// Where to publish one session's restrictions, or `None` for a session with
+/// no room to be restricted in.
+///
+/// Backstage is included and deliberately so: somebody muted in the queue must
+/// arrive on stage still muted, and a name that only covered the stage would
+/// let a promotion clear a mute.
+fn policy_track(scope: &Scope) -> Option<FullTrackName> {
+    let room = scope.room.as_ref()?;
+    let marker: &str = if scope.backstage { "bs" } else { "r" };
+    let namespace = TrackNamespace::from_parts([
+        scope.tenant.as_bytes(),
+        marker.as_bytes(),
+        room.as_bytes(),
+        scope.user.as_bytes(),
+        scope.device.as_bytes(),
+    ])
+    .ok()?;
+    FullTrackName::new(namespace, Bytes::from_static(POLICY_TRACK)).ok()
+}
+
+/// One object's worth of "here is what you may not publish".
+///
+/// JSON, matching the room's control log and the catalog, because the client
+/// SDK already reads those with a `JSONDecoder` and a second encoding on a
+/// third track would be a parser to maintain for one small message. The bit
+/// values are `MediaKind`'s, shared by all three languages.
+///
+/// Absolute rather than a delta, and it carries both scopes even when one is
+/// empty: a client that receives this knows the whole of its position, so a
+/// lost object costs a moment of staleness rather than a permanent
+/// disagreement about what is muted.
+fn policy_payload(silence: Silence) -> Bytes {
+    Bytes::from(format!(
+        "{{\"version\":1,\"mutedForEveryone\":{},\"mutedForAudience\":{}}}",
+        silence.everyone.bits(),
+        silence.audience.bits()
+    ))
 }
 
 /// Reads length-delimited control messages off a stream.
@@ -433,6 +481,14 @@ pub struct Session {
     /// make an unset field look like a session that arrived on its own, and the
     /// count that comes out the other end is what a cohost is paid on.
     via: Arc<OnceLock<Option<Arc<str>>>>,
+
+    /// Which group the next `.policy` object goes in.
+    ///
+    /// One group per change rather than one group with a growing object ID,
+    /// because a group boundary is where a subscriber may join: a client that
+    /// reconnects mid-mute wants the current state, and this way the current
+    /// state is always the beginning of a group rather than the middle of one.
+    policy_sequence: Arc<AtomicU64>,
 }
 
 /// Identity and carrier only. The rest is a connection, a lock, and channels,
@@ -487,6 +543,7 @@ impl Session {
             principal: Arc::default(),
             permission: Arc::default(),
             via: Arc::default(),
+            policy_sequence: Arc::new(AtomicU64::new(0)),
         };
 
         let result = session.run(command_queue).await;
@@ -833,7 +890,79 @@ impl Session {
             self.connection().remote_address().ip(),
             via,
             Arc::new(self.transport.clone()),
+            self.commands.clone(),
         );
+
+        // A mute outlives the session it was imposed on, so somebody rejoining
+        // has to be told before they start their camera rather than after. The
+        // policy already refuses subscriptions to what is muted; this is what
+        // stops the phone spending its battery and its indicator light on a
+        // track nobody will be allowed to watch.
+        let silence = self.silence();
+        if !silence.is_empty() {
+            let session = self.clone();
+            tokio::spawn(async move { session.tell_policy(silence).await });
+        }
+    }
+
+    /// Whether a mute keeps this session from receiving `track`.
+    ///
+    /// Asked of the *publisher's* name and answered against *this* session's
+    /// standing, which is the whole of the audience-only case: the same track,
+    /// at the same moment, is withheld from a viewer and forwarded to a host.
+    fn withheld(&self, track: &FullTrackName) -> bool {
+        let Some(slot) = scope::slot(track.namespace()) else {
+            return false;
+        };
+        let (Ok(tenant), Ok(room), Ok(user), Ok(device)) = (
+            std::str::from_utf8(slot.tenant),
+            std::str::from_utf8(slot.room),
+            std::str::from_utf8(slot.user),
+            std::str::from_utf8(slot.device),
+        ) else {
+            // A name this relay cannot read as text cannot be matched against a
+            // mute the control plane wrote as text. It is also a name no client
+            // of ours produces.
+            return false;
+        };
+
+        let silence = self
+            .fabric
+            .policy()
+            .silenced(&(Arc::from(tenant), Arc::from(room)), user, device);
+        if silence.is_empty() {
+            return false;
+        }
+
+        // A privileged subscriber hears through an audience mute. Read from the
+        // roster rather than from this session's token so that it is the same
+        // answer the fan-out gives when it drops routes, and there is only one
+        // place to be wrong.
+        let privileged = self
+            .fabric
+            .roster()
+            .find(self.id)
+            .is_some_and(|presence| presence.privileged());
+        media::stopped(track.name(), silence.withheld_from(privileged))
+    }
+
+    /// What this session is currently forbidden to publish.
+    ///
+    /// Empty for a session with no verified room, which is every session on a
+    /// relay that authorises nothing: there is nobody the control plane could
+    /// have named in a mute.
+    fn silence(&self) -> Silence {
+        let Permission::Scoped(scope) = self.permission() else {
+            return Silence::default();
+        };
+        let Some(room) = scope.room.as_ref() else {
+            return Silence::default();
+        };
+        self.fabric.policy().silenced(
+            &(Arc::clone(&scope.tenant), Arc::clone(room)),
+            &scope.user,
+            &scope.device,
+        )
     }
 
     /// Who this session's requests are charged to.
@@ -1226,6 +1355,23 @@ impl Session {
             return send(send_stream, &refusal).await;
         }
 
+        // After the token and before the publisher, for the same reason: a
+        // muted track and a track nobody publishes must be indistinguishable
+        // from outside, or subscribing to guesses becomes a way to read the
+        // moderation log of a room.
+        if self.withheld(&track) {
+            tracing::info!(session = %self.id, %track, "subscription refused: force-muted");
+            self.fabric.metrics().subscribed(Subscribed::Refused);
+            return send(
+                send_stream,
+                &RequestError::new(
+                    RequestErrorCode::DOES_NOT_EXIST,
+                    ReasonPhrase::truncating("namespace is not published here"),
+                ),
+            )
+            .await;
+        }
+
         let Some(publisher) = self.fabric.publisher(track.namespace()) else {
             tracing::debug!(session = %self.id, %track, "no publisher for namespace");
             self.fabric.metrics().subscribed(Subscribed::NoPublisher);
@@ -1546,7 +1692,180 @@ impl Session {
                 subscriber,
                 downstream,
             } => self.release_route(&track, upstream, subscriber, downstream),
+            Command::Restrict { silence } => self.restrict(silence),
         }
+    }
+
+    // MARK: - Mutes
+
+    /// Stop publishing what a moderator has forbidden, and say so.
+    ///
+    /// Three things happen, in this order, and the order is the point.
+    ///
+    /// The relay stops *asking* for the muted tracks first, because that is
+    /// the part it can guarantee: cancelling the upstream subscription means
+    /// no further object reaches anybody, whatever the peer does next. Then
+    /// the routes belonging to subscribers who are no longer entitled to the
+    /// track are dropped, which is what makes an audience-only mute do
+    /// anything. Only then is the peer told, because telling it is a request
+    /// rather than an enforcement — a client that ignores `.policy` is muted
+    /// exactly as thoroughly as one that obeys it, and the difference is
+    /// whether the indicator light on the phone goes out.
+    fn restrict(&self, silence: Silence) {
+        let stopped = self.stop_muted_pulls(silence.everyone);
+        let dropped = self.drop_withheld_routes(silence);
+        tracing::info!(
+            session = %self.id,
+            everyone = %silence.everyone,
+            audience = %silence.audience,
+            tracks = stopped,
+            routes = dropped,
+            "mute applied"
+        );
+        self.fabric.metrics().muted();
+
+        let session = self.clone();
+        tokio::spawn(async move { session.tell_policy(silence).await });
+    }
+
+    /// Cancel every upstream subscription a mute stops, and report how many.
+    ///
+    /// Cancelling rather than filtering as objects arrive. A relay that pulled
+    /// a muted camera and dropped the frames would still have the phone
+    /// encoding and sending them, which is the battery, the uplink and the
+    /// indicator light all still running for something nobody may watch.
+    fn stop_muted_pulls(&self, muted: media::Kinds) -> usize {
+        if muted.is_empty() {
+            return 0;
+        }
+        let stopping: Vec<Arc<Notify>> = self
+            .lock_pulled()
+            .iter()
+            .filter(|(track, _)| media::stopped(track.name(), muted))
+            .filter_map(|(_, pull)| match pull {
+                Pull::Ready(upstream) => Some(Arc::clone(&upstream.stop)),
+                // Not yet established. The subscription that is being set up
+                // will find the mute when it checks, and a `Pending` entry has
+                // nothing to cancel.
+                Pull::Pending(_) => None,
+            })
+            .collect();
+
+        for stop in &stopping {
+            stop.notify_waiters();
+        }
+        stopping.len()
+    }
+
+    /// Drop the routes a mute withholds, and report how many.
+    ///
+    /// A subscriber that keeps its subscription open would otherwise keep
+    /// receiving from an upstream pull that the everyone-mute did not stop,
+    /// which is the whole of the audience-only case: the track is still
+    /// flowing, for the hosts, and the audience must stop being a copy of it.
+    fn drop_withheld_routes(&self, silence: Silence) -> usize {
+        if silence.is_empty() {
+            return 0;
+        }
+
+        let mut dropped = 0;
+        let pulling = self.lock_pulling();
+        let mut routes = self.lock_routes();
+        for (alias, destinations) in routes.iter_mut() {
+            let Some(flowing) = pulling.get(alias) else {
+                continue;
+            };
+            if media::classify(flowing.track.name()).is_none() {
+                continue;
+            }
+            destinations.retain(|route| {
+                let privileged = self
+                    .fabric
+                    .roster()
+                    .find(route.subscriber)
+                    .is_some_and(|presence| presence.privileged());
+                let withheld = silence.withheld_from(privileged);
+                if media::stopped(flowing.track.name(), withheld) {
+                    // Closed rather than merely forgotten, so the subscriber
+                    // learns its subscription is over instead of watching a
+                    // track that has quietly stopped arriving.
+                    route.done.notify_waiters();
+                    dropped += 1;
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        dropped
+    }
+
+    /// Offer this peer its `.policy` track and write the current state to it.
+    ///
+    /// A server-initiated PUBLISH, which is draft-19's answer to exactly this:
+    /// the relay has something the client needs and the client cannot know to
+    /// ask for it. One object per change, on its own group, so a client that
+    /// joins late or reconnects gets the current state rather than a diff
+    /// against something it never saw.
+    ///
+    /// Failures are logged and dropped. Every one of them is a connection that
+    /// is going away, and the mute does not depend on this arriving: it is
+    /// already enforced by the pulls that were cancelled and by the policy that
+    /// will refuse the next subscription.
+    async fn tell_policy(&self, silence: Silence) {
+        let Permission::Scoped(scope) = self.permission() else {
+            return;
+        };
+        let Some(track) = policy_track(scope) else {
+            return;
+        };
+
+        if let Err(e) = self.publish_policy(&track, silence).await {
+            tracing::debug!(
+                session = %self.id,
+                error = %e,
+                "could not tell a session about its mute"
+            );
+        }
+    }
+
+    /// PUBLISH `.policy` and write one object to it.
+    async fn publish_policy(
+        &self,
+        track: &FullTrackName,
+        silence: Silence,
+    ) -> Result<(), SessionError> {
+        let alias = self.allocate_alias();
+        let offer = Publish::new(self.allocate_request_id(), track.clone(), alias);
+        let (mut request, _answer) = self.transport.open_bi().await?;
+        send(&mut request, &offer).await?;
+
+        // The answer is not waited for. Draft-19 lets objects flow before a
+        // PUBLISH is accepted unless FORWARD is zero, and waiting would mean a
+        // client that never answers keeps a task alive per mute. A client that
+        // does not want the track resets the stream, which is the same outcome
+        // as never having sent it.
+        let sequence = self.policy_sequence.fetch_add(1, Ordering::Relaxed);
+        let header = SubgroupHeader::new(
+            alias,
+            GroupId::new(VarInt::new(sequence).unwrap_or(VarInt::MAX)),
+            SubgroupSource::Zero,
+        );
+        let mut buf = BytesMut::new();
+        header.encode(&mut buf);
+        let object = SubgroupObject::new(ObjectSeq::from(0u32), policy_payload(silence));
+        SubgroupWriter::new(&header)
+            .write(&mut buf, &object)
+            .map_err(|_| SessionError::Protocol("could not encode a policy object"))?;
+
+        let mut stream = self.transport.open_uni().await?;
+        stream.write_all(&buf).await?;
+        let _ = stream.finish();
+        // Held until the object is written: dropping the request stream is how
+        // this end withdraws a publication, and withdrawing it before the
+        // object has gone out would race the thing it is announcing.
+        drop(request);
+        Ok(())
     }
 
     /// Route a subscriber to this track, subscribing upstream only if nobody

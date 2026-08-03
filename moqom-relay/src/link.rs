@@ -20,13 +20,18 @@
 //!
 //! # What this will not do
 //!
-//! Mutes and grant overrides arrive and are refused, out loud, with the reason
-//! travelling back in the `DirectiveResult` so a moderator's tool says "not
-//! enforced" rather than "done". Neither is implementable without the relay
-//! filtering a live track by media kind, which is a change to the forwarding
-//! path rather than to this file. Reporting them as carried out would be worse
-//! than refusing them: a force-mute that silently does nothing is how somebody
-//! keeps talking over a moderator who has been told they are muted.
+//! Grant overrides arrive and are refused, out loud, with the reason travelling
+//! back in the `DirectiveResult` so a moderator's tool says "not enforced"
+//! rather than "done". A demotion takes effect when the token is reissued.
+//! Reporting it as carried out would be worse than refusing it: moderation that
+//! silently does nothing is how somebody keeps doing the thing a moderator has
+//! been told they were stopped from doing.
+//!
+//! Mutes were in that paragraph until it turned out the reasoning was wrong.
+//! Enforcing one does not need the relay to read a frame, only to read a track
+//! *name* — see [`crate::media`] — so `ApplyMute` is now carried out here like
+//! any other directive: held in [`crate::policy`], handed to the session it
+//! names, and enforced against every subscription afterwards.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -38,6 +43,7 @@ use crate::fabric::Fabric;
 use crate::generated::admin::v1 as admin;
 use crate::generated::relay::v1 as pb;
 use crate::identity::VerificationKey;
+use crate::media;
 use crate::policy::{self, Banned, Rules};
 use crate::roster::{Departure, Note, Presence};
 use crate::session::code;
@@ -554,18 +560,32 @@ fn apply(fabric: &Fabric, snapshot: &pb::RoomSnapshot) {
             None => fabric.policy().unreadable(),
         }
     }
-    if !snapshot.mutes.is_empty() || !snapshot.grant_overrides.is_empty() {
-        // Said once per snapshot rather than silently dropped. Both are state
-        // this relay cannot act on yet, and a room whose mutes are in every
-        // snapshot and enforced by nobody is worth a line in the log.
+    if !snapshot.grant_overrides.is_empty() {
+        // Said once per snapshot rather than silently dropped. A room whose
+        // overrides are in every snapshot and enforced by nobody is worth a
+        // line in the log.
         tracing::warn!(
             tenant = %snapshot.tenant,
             room = %snapshot.room,
-            mutes = snapshot.mutes.len(),
             overrides = snapshot.grant_overrides.len(),
             "snapshot carries state this relay does not enforce"
         );
     }
+
+    let mutes = snapshot
+        .mutes
+        .iter()
+        .map(|mute| {
+            let identity = mute.identity.clone().unwrap_or_default();
+            policy::Mute {
+                user: identity.username,
+                device: identity.device,
+                media: kinds(&mute.media),
+                audience_only: mute.audience_only,
+                until: mute.expires_at.as_ref().and_then(when),
+            }
+        })
+        .collect();
 
     fabric.policy().describe(
         room.clone(),
@@ -573,11 +593,25 @@ fn apply(fabric: &Fabric, snapshot: &pb::RoomSnapshot) {
             closed: snapshot.closed,
             bans,
             ceiling: snapshot.max_participants,
+            mutes,
         },
     );
 
-    // A snapshot is also how a ban reaches a relay that was not attached when it
-    // was issued, so it has to act on the room and not merely remember it.
+    // A snapshot is also how a mute reaches a relay that was not attached when
+    // it was issued -- or a relay that has just been handed the room by a load
+    // balancer -- so everybody present is told where they now stand. Told
+    // unconditionally, including the people who are not muted: this runs when
+    // the link reattaches, and a client that was force-muted by a relay that
+    // has since forgotten it needs to hear that it may resume.
+    for presence in fabric.roster().in_room(&room.0, &room.1) {
+        let silence = fabric
+            .policy()
+            .silenced(&room, &presence.user, &presence.device);
+        presence.restrict(silence);
+    }
+
+    // The same again for bans, except that a ban is a closed connection rather
+    // than a message.
     let caught = sweep(fabric, &room, "banned");
     let closed = if snapshot.closed {
         clear(fabric, &room, "room closed")
@@ -592,6 +626,57 @@ fn apply(fabric: &Fabric, snapshot: &pb::RoomSnapshot) {
             "snapshot ejected sessions"
         );
     }
+}
+
+/// The media kinds a directive names, or all of them when it names none.
+///
+/// Empty means everything, matching the control plane: a moderator who does
+/// not say which media meant "stop broadcasting", and that is the reading with
+/// the safer failure. See `mediaFromProto` in the Go server, which decides the
+/// same thing on the way in.
+fn kinds(media: &[i32]) -> media::Kinds {
+    if media.is_empty() {
+        return media::Kinds::ALL;
+    }
+    let mut kinds = media::Kinds::NONE;
+    for kind in media {
+        kinds = kinds.union(match admin::MediaKind::try_from(*kind) {
+            Ok(admin::MediaKind::Audio) => media::Kinds::AUDIO,
+            Ok(admin::MediaKind::Video) => media::Kinds::VIDEO,
+            Ok(admin::MediaKind::ScreenShare) => media::Kinds::SCREEN,
+            // A kind this build does not know. Nothing here can be the right
+            // answer -- there is no track it could match -- but it is worth
+            // one line, since it means the control plane can mute something
+            // this relay cannot.
+            Ok(admin::MediaKind::Unspecified) | Err(_) => {
+                tracing::warn!(kind, "mute names a media kind this relay does not know");
+                media::Kinds::NONE
+            }
+        });
+    }
+    kinds
+}
+
+/// Hand the current mute to every session it names, and report how many.
+///
+/// Recomputed from the policy rather than taken from the directive, because a
+/// participant can be under two mutes at once and a session must be told the
+/// sum of them. Sending the difference would leave a client that missed one
+/// directive permanently wrong about the other.
+fn enforce(fabric: &Fabric, room: &policy::Where, target: &admin::ParticipantRef) -> u32 {
+    let mut reached = 0;
+    for presence in fabric.roster().in_room(&room.0, &room.1) {
+        if !presence.is(&target.username, &target.device) {
+            continue;
+        }
+        let silence = fabric
+            .policy()
+            .silenced(room, &presence.user, &presence.device);
+        if presence.restrict(silence) {
+            reached += 1;
+        }
+    }
+    reached
 }
 
 /// Close every session in `room` that the policy now refuses.
@@ -664,11 +749,17 @@ fn carry_out(fabric: &Fabric, directive: pb::Directive) -> pb::DirectiveResult {
             let count = clear(fabric, &room, &reason_for(close.code));
             ("close_room", count, String::new())
         }
-        Some(pb::directive::Action::ApplyMute(_)) => {
-            return refused(
-                id,
-                "this relay does not enforce mutes: it forwards a publisher's tracks or none",
-            );
+        Some(pb::directive::Action::ApplyMute(apply)) => {
+            let target = apply.target.clone().unwrap_or_default();
+            let mute = policy::Mute {
+                user: target.username.clone(),
+                device: target.device.clone(),
+                media: kinds(&apply.media),
+                audience_only: apply.audience_only,
+                until: apply.expires_at.as_ref().and_then(when),
+            };
+            fabric.policy().mute(room.clone(), mute, apply.muted);
+            ("mute", enforce(fabric, &room, &target), String::new())
         }
         Some(pb::directive::Action::ApplyGrants(_)) => {
             return refused(
@@ -732,6 +823,19 @@ fn translate(ban: &pb::Ban) -> Option<policy::Ban> {
         who,
         until: ban.expires_at.and_then(|at| SystemTime::try_from(at).ok()),
     })
+}
+
+/// When a mute lifts, or `None` for one that holds until somebody lifts it.
+///
+/// A timestamp that will not convert is treated as no expiry, which keeps the
+/// mute rather than dropping it. That is the opposite of what
+/// [`translate`](translate) does with an unreadable ban key, and deliberately:
+/// there, the unreadable part is *who*, and enforcing a ban against the wrong
+/// person is worse than missing it. Here the unreadable part is only *how
+/// long*, and holding a mute until a moderator lifts it is the mistake that
+/// can be undone by hand.
+fn when(at: &prost_types::Timestamp) -> Option<SystemTime> {
+    SystemTime::try_from(*at).ok()
 }
 
 /// One session, in the control plane's terms.
@@ -839,11 +943,13 @@ const fn cause_of(why: Departure) -> pb::session_closed::Cause {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::policy::Refusal;
+    use crate::fabric::Command;
+    use crate::policy::{Refusal, Silence};
     use crate::roster::Closes;
     use crate::scope::{Publish, Scope};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::Mutex;
+    use tokio::sync::mpsc;
     use tokio::sync::mpsc::error::TryRecvError;
 
     /// How long a test waits for something that should be immediate.
@@ -1041,6 +1147,18 @@ mod tests {
     #[derive(Debug, Default)]
     struct Hangup {
         closed: Mutex<Vec<String>>,
+        /// The far end of the session's command channel.
+        ///
+        /// Held here rather than by the test so that a directive aimed at a
+        /// session finds somebody to receive it: a dropped receiver is a full
+        /// queue as far as [`Presence::restrict`] is concerned, which would
+        /// make every one of these tests pass for the wrong reason.
+        orders: Mutex<Option<mpsc::Receiver<Command>>>,
+        /// What has been taken off `orders` so far.
+        ///
+        /// Accumulated rather than returned once, so that a test polling for a
+        /// restriction to arrive does not consume the thing it is waiting for.
+        restricted: Mutex<Vec<Silence>>,
     }
 
     impl Hangup {
@@ -1059,6 +1177,26 @@ mod tests {
                 .first()
                 .cloned()
                 .unwrap_or_default()
+        }
+
+        /// Every restriction handed to this session so far.
+        fn restrictions(&self) -> Vec<Silence> {
+            let mut restricted = self
+                .restricted
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut orders = self
+                .orders
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(queue) = orders.as_mut() {
+                while let Ok(command) = queue.try_recv() {
+                    if let Command::Restrict { silence } = command {
+                        restricted.push(silence);
+                    }
+                }
+            }
+            restricted.clone()
         }
     }
 
@@ -1091,7 +1229,11 @@ mod tests {
     /// Put somebody on the roster, and keep the handle that says whether they
     /// were hung up on.
     fn join(fabric: &Fabric, user: &str) -> Arc<Hangup> {
-        let hangup = Arc::new(Hangup::default());
+        let (commands, queue) = mpsc::channel(16);
+        let hangup = Arc::new(Hangup {
+            orders: Mutex::new(Some(queue)),
+            ..Hangup::default()
+        });
         fabric
             .roster()
             .admit(
@@ -1100,6 +1242,7 @@ mod tests {
                 address(),
                 Some("bea".into()),
                 Arc::clone(&hangup) as Arc<dyn Closes>,
+                commands,
             )
             .expect("a session in a room");
         hangup
@@ -1430,9 +1573,9 @@ mod tests {
         );
     }
 
-    /// A relay that cannot do something must say so rather than report success.
+    /// A mute names one person, reaches their session, and does not close it.
     #[tokio::test]
-    async fn a_mute_is_refused_out_loud() {
+    async fn a_mute_reaches_the_session_it_names_and_nobody_else() {
         let control = FakeControl::default();
         control.will_say(directive(pb::directive::Action::ApplyMute(pb::ApplyMute {
             target: Some(admin::ParticipantRef {
@@ -1448,18 +1591,136 @@ mod tests {
 
         let fabric = Fabric::new();
         let ada = join(&fabric, "ada");
+        let bea = join(&fabric, "bea");
         let _link = Link::attach(supervisor(serving.endpoint()), fabric.clone());
 
         let result = control.hears("the directive result", is_result).await;
         let result = result_of(&result);
-        assert_eq!(result.affected_sessions, 0);
-        assert!(
-            result.error.contains("does not enforce mutes"),
-            "the refusal must say what was not done: {:?}",
-            result.error
+        assert_eq!(result.affected_sessions, 1);
+        assert!(result.error.is_empty(), "unexpected: {:?}", result.error);
+
+        assert_eq!(
+            ada.restrictions(),
+            vec![Silence {
+                everyone: media::Kinds::AUDIO,
+                audience: media::Kinds::NONE,
+            }]
         );
-        // And nobody was thrown out as a substitute for muting them.
+        assert!(bea.restrictions().is_empty());
+
+        // Muting somebody is not throwing them out. The distinction is the
+        // feature: a muted host stays in the room and can still moderate it.
+        assert!(!ada.was_closed() && !bea.was_closed());
+        assert_eq!(
+            fabric
+                .policy()
+                .silenced(&("acme".into(), "r1".into()), "ada", "phone")
+                .everyone,
+            media::Kinds::AUDIO
+        );
+    }
+
+    /// Lifting is the same directive with `muted` false, and the session has to
+    /// hear about it: the relay stops enforcing, and only the person holding
+    /// the phone may turn the microphone back on.
+    #[tokio::test]
+    async fn lifting_a_mute_tells_the_session_it_is_free_to_resume() {
+        let control = FakeControl::default();
+        control.will_say(directive(pb::directive::Action::ApplyMute(pb::ApplyMute {
+            target: Some(admin::ParticipantRef {
+                username: "ada".to_owned(),
+                device: String::new(),
+            }),
+            media: vec![admin::MediaKind::Audio as i32],
+            audience_only: false,
+            muted: false,
+            expires_at: None,
+        })));
+        let serving = control.start().await;
+
+        let fabric = Fabric::new();
+        fabric.policy().mute(
+            ("acme".into(), "r1".into()),
+            policy::Mute {
+                user: "ada".to_owned(),
+                device: String::new(),
+                media: media::Kinds::AUDIO,
+                audience_only: false,
+                until: None,
+            },
+            true,
+        );
+        let ada = join(&fabric, "ada");
+        let _link = Link::attach(supervisor(serving.endpoint()), fabric.clone());
+
+        control.hears("the directive result", is_result).await;
+        assert_eq!(ada.restrictions(), vec![Silence::default()]);
+        assert!(
+            fabric
+                .policy()
+                .silenced(&("acme".into(), "r1".into()), "ada", "phone")
+                .is_empty()
+        );
+    }
+
+    /// A mute that arrives in a snapshot is a mute the relay was not attached
+    /// for, and it has to land on the people already in the room.
+    #[tokio::test]
+    async fn a_snapshot_applies_the_mutes_it_carries() {
+        let control = FakeControl::default();
+        control.will_say(pb::ControlMessage {
+            body: Some(pb::control_message::Body::RoomSnapshot(pb::RoomSnapshot {
+                tenant: "acme".to_owned(),
+                room: "r1".to_owned(),
+                mutes: vec![pb::Mute {
+                    identity: Some(admin::Identity {
+                        username: "ada".to_owned(),
+                        device: "phone".to_owned(),
+                    }),
+                    media: vec![admin::MediaKind::Video as i32],
+                    audience_only: false,
+                    expires_at: None,
+                }],
+                ..pb::RoomSnapshot::default()
+            })),
+        });
+        let serving = control.start().await;
+
+        let fabric = Fabric::new();
+        let ada = join(&fabric, "ada");
+        let bea = join(&fabric, "bea");
+        let _link = Link::attach(supervisor(serving.endpoint()), fabric.clone());
+
+        until("the snapshot to be applied", || {
+            !ada.restrictions().is_empty() || ada.was_closed()
+        })
+        .await;
         assert!(!ada.was_closed());
+
+        assert_eq!(
+            ada.restrictions(),
+            vec![Silence {
+                everyone: media::Kinds::VIDEO,
+                audience: media::Kinds::NONE,
+            }]
+        );
+        // Bea is told too, and told that nothing is muted: a snapshot is the
+        // whole truth about a room, and a client that was muted by a relay
+        // which has since forgotten needs to hear that it may resume.
+        assert_eq!(bea.restrictions(), vec![Silence::default()]);
+        assert_eq!(
+            fabric
+                .policy()
+                .silenced(&("acme".into(), "r1".into()), "ada", "phone")
+                .everyone,
+            media::Kinds::VIDEO
+        );
+        assert!(
+            fabric
+                .policy()
+                .silenced(&("acme".into(), "r1".into()), "bea", "phone")
+                .is_empty()
+        );
     }
 
     /// A control plane that cannot be reached is not an outage for the room.

@@ -349,6 +349,13 @@ struct Inner {
     directives: Mutex<HashMap<&'static str, u64>>,
     /// Sessions closed because the control plane said so.
     ejections: AtomicU64,
+    /// Force-mutes applied to a session on this relay.
+    ///
+    /// Counted when a mute is *imposed* rather than while it holds, because
+    /// what an operator is asking is how often moderation had to act. A lift
+    /// counts too — it is the same directive with nothing left in it — which
+    /// is why the series is not a gauge of how many people are muted.
+    mutes: AtomicU64,
 
     subgroups_forwarded: AtomicU64,
     subgroups_dropped: AtomicU64,
@@ -601,6 +608,7 @@ impl Metrics {
                 attached: AtomicU64::new(0),
                 directives: Mutex::new(HashMap::new()),
                 ejections: AtomicU64::new(0),
+                mutes: AtomicU64::new(0),
                 subgroups_forwarded: AtomicU64::new(0),
                 subgroups_dropped: AtomicU64::new(0),
                 subgroups_shed: AtomicU64::new(0),
@@ -892,6 +900,13 @@ impl Metrics {
     pub fn ejected(&self, sessions: u64) {
         if let Some(inner) = self.inner() {
             inner.ejections.fetch_add(sessions, ORDER);
+        }
+    }
+
+    /// A force-mute was applied to a session, whatever it left muted.
+    pub fn muted(&self) {
+        if let Some(inner) = self.inner() {
+            inner.mutes.fetch_add(1, ORDER);
         }
     }
 
@@ -1226,6 +1241,13 @@ impl Metrics {
             "moqom_relay_sessions_ejected_total",
             "Sessions closed on the control plane's instruction.",
             inner.ejections.load(ORDER),
+        );
+        plain(
+            &mut out,
+            "counter",
+            "moqom_relay_mutes_total",
+            "Force-mutes applied to a session, including the ones that lifted a mute.",
+            inner.mutes.load(ORDER),
         );
         plain(
             &mut out,

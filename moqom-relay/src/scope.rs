@@ -95,6 +95,45 @@ pub mod capability {
     pub const KNOWN: u32 = CHAT | STAGE | ROOM | META;
 }
 
+/// Whose slot a namespace names, for the questions that are about the
+/// *publisher* rather than about the token asking.
+///
+/// A mute is the case this exists for. Enforcing one means recognising the
+/// muted person's tracks in a subscription made by somebody else entirely, so
+/// the name has to be read on its own terms rather than compared against the
+/// scope of whoever is asking.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Slot<'a> {
+    /// The customer.
+    pub tenant: &'a [u8],
+    /// The room, whether the slot is on stage or backstage.
+    pub room: &'a [u8],
+    /// The person.
+    pub user: &'a [u8],
+    /// Which of their devices.
+    pub device: &'a [u8],
+}
+
+/// Read a participant's slot out of a namespace.
+///
+/// `None` for anything else, including the room's own namespace and a personal
+/// channel: neither belongs to one participant in one room, which is the only
+/// thing a mute can name.
+#[must_use]
+pub fn slot(namespace: &TrackNamespace) -> Option<Slot<'_>> {
+    match namespace.fields() {
+        [tenant, marker, room, user, device] if marker.as_ref() == ROOM || marker == BACKSTAGE => {
+            Some(Slot {
+                tenant,
+                room,
+                user,
+                device,
+            })
+        }
+        _ => None,
+    }
+}
+
 /// Media kinds a holder may publish.
 ///
 /// A bitmask rather than a set because it is read on every announcement and the

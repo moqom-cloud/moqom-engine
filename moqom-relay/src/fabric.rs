@@ -41,7 +41,7 @@ use crate::cache::Cache;
 use crate::clock;
 use crate::identity::Authenticator;
 use crate::metrics::Metrics;
-use crate::policy::Policy;
+use crate::policy::{Policy, Silence};
 use crate::quota::Governor;
 use crate::roster::Roster;
 
@@ -205,6 +205,20 @@ pub enum Command {
         subscriber: SessionId,
         /// The alias it knew the track by.
         downstream: TrackAlias,
+    },
+    /// A moderator has changed what this session may publish.
+    ///
+    /// Sent to the muted participant's own session, from the control-plane
+    /// link, which has no connection of its own. The command channel is the
+    /// right vehicle here in a way it is not for ejection: this asks a session
+    /// to *do* something — stop feeding tracks upstream, and tell its peer why
+    /// — rather than to stop existing, and it is served by the same loop that
+    /// serves every other request the relay originates on that connection.
+    Restrict {
+        /// Everything the room now forbids, not the change to it. A directive
+        /// that arrives twice must land twice identically, and a delta cannot
+        /// promise that.
+        silence: Silence,
     },
 }
 

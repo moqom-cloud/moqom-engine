@@ -735,6 +735,32 @@ impl Client {
         recv.read_to_end(1024 * 1024).await.is_err()
     }
 
+    /// Receive a track the relay offers without being asked, and read it.
+    ///
+    /// The subscriber half of a server-initiated PUBLISH, which is how the
+    /// relay tells a participant what it will no longer carry for them. The
+    /// offer is not answered, deliberately: draft-19 lets objects flow before a
+    /// PUBLISH is accepted, and a client that has to reply first is a client
+    /// that can delay its own mute by not replying.
+    pub async fn accept_publish(&self) -> (FullTrackName, Vec<Bytes>) {
+        let (_send, recv) = within("the relay's PUBLISH", self.session.accept_bi())
+            .await
+            .expect("the relay opens a request stream");
+
+        let mut frames = Frames::new(recv);
+        let frame = within("a PUBLISH", frames.expect()).await;
+        assert_eq!(frame.message_type, MessageType::Publish);
+        let offer = moqom_proto::control::Publish::decode(&mut frame.body.clone())
+            .expect("a decodable PUBLISH");
+
+        let (header, payloads) = self.read_subgroup().await;
+        assert_eq!(
+            header.track_alias, offer.track_alias,
+            "the objects must arrive under the alias the offer named"
+        );
+        (offer.track, payloads)
+    }
+
     /// Read one forwarded subgroup: its header, and every payload on it.
     pub async fn read_subgroup(&self) -> (SubgroupHeader, Vec<Bytes>) {
         let recv = within("a forwarded subgroup", self.session.accept_uni())

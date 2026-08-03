@@ -15,7 +15,10 @@ mod support;
 
 use std::time::Duration;
 
-use moqom_relay::policy::{Ban, Banned, Rules};
+use bytes::Bytes;
+use moqom_proto::model::{FullTrackName, TrackAlias, TrackNamespace};
+use moqom_relay::media::Kinds;
+use moqom_relay::policy::{Ban, Banned, Mute, Rules};
 use moqom_relay::roster::Departure;
 use support::tokens::{DEVICE, Grant};
 use support::{Client, Relay, within};
@@ -235,6 +238,143 @@ async fn a_full_room_refuses_the_next_one_and_never_the_owner() {
         .token(),
     )
     .await;
+}
+
+/// The whole of a force-mute, over a socket: the publisher is told, the track
+/// stops being carried, and nobody is disconnected.
+#[tokio::test]
+async fn a_force_mute_reaches_the_phone_and_stops_the_track() {
+    let relay = Relay::authenticating();
+    let mut ada = Client::connect_as(&relay, &Grant::default().token()).await;
+    let mut bea = Client::connect_as(
+        &relay,
+        &Grant {
+            user: "bea",
+            ..Grant::viewer()
+        }
+        .token(),
+    )
+    .await;
+    enrolled(&relay, 2).await;
+
+    let slot = TrackNamespace::from_parts([
+        b"acme".as_slice(),
+        b"r",
+        b"room-42",
+        b"ada",
+        DEVICE.as_bytes(),
+    ])
+    .expect("a namespace");
+    let camera =
+        FullTrackName::new(slot.clone(), Bytes::from_static(b"video/720p")).expect("a track");
+    let microphone = FullTrackName::new(slot, Bytes::from_static(b"audio")).expect("a track");
+    // Held: dropping an announcement withdraws it.
+    let _slot = ada.announce(&camera.namespace().clone()).await;
+
+    // Before the mute: bea can watch the camera, and the relay pulls it.
+    let watching = {
+        let subscribing = bea.subscribe(&camera);
+        let answering = ada.answer_subscription(TrackAlias::new(
+            moqom_proto::varint::VarInt::from_u32(7),
+        ));
+        let (subscribed, _served) = tokio::join!(subscribing, answering);
+        subscribed.expect("a viewer may watch an unmuted camera")
+    };
+
+    // The moderator stops the camera. This is what the control-plane link does
+    // when an ApplyMute arrives, written out so the test needs no control plane.
+    relay.fabric.policy().mute(
+        room(),
+        Mute {
+            user: "ada".into(),
+            device: String::new(),
+            media: Kinds::VIDEO,
+            audience_only: false,
+            until: None,
+        },
+        true,
+    );
+    let present = relay.fabric.roster().everybody();
+    let target = present
+        .iter()
+        .find(|presence| &*presence.user == "ada")
+        .expect("ada on the roster");
+    assert!(target.restrict(relay.fabric.policy().silenced(
+        &room(),
+        &target.user,
+        &target.device
+    )));
+
+    // Ada's phone is told, by name and by number, which is what lets it stop
+    // the capture device rather than merely stop encoding.
+    let (track, payloads) = ada.accept_publish().await;
+    assert_eq!(track.name().as_ref(), b".policy");
+    assert_eq!(track.namespace(), camera.namespace());
+    let said = String::from_utf8(payloads.concat()).expect("text");
+    assert!(
+        said.contains("\"mutedForEveryone\":2") && said.contains("\"mutedForAudience\":0"),
+        "the object must say what is muted: {said}"
+    );
+
+    // The camera stops being carried, and a new subscription to it is refused
+    // the way a track nobody publishes is -- so a viewer cannot tell a mute
+    // from an absence and read the room's moderation history by guessing.
+    assert_eq!(
+        bea.subscribe(&camera).await.err(),
+        Some(moqom_proto::control::RequestErrorCode::DOES_NOT_EXIST.get())
+    );
+    drop(watching);
+
+    // The microphone was not muted and is unaffected: a mute names media, and
+    // muting the camera must not take the room's audio with it.
+    let listening = {
+        let subscribing = bea.subscribe(&microphone);
+        let answering = ada.answer_subscription(TrackAlias::new(
+            moqom_proto::varint::VarInt::from_u32(9),
+        ));
+        let (subscribed, _served) = tokio::join!(subscribing, answering);
+        subscribed.expect("a mute on the camera must not stop the microphone")
+    };
+    drop(listening);
+
+    // And nobody was thrown out. A muted host is still in the room, and still
+    // able to moderate it.
+    assert_eq!(relay.fabric.roster().count(), 2);
+}
+
+/// Lifting is not resuming. The relay stops enforcing and tells the phone; what
+/// it must not do is put the camera back on, because only the person holding it
+/// may do that.
+#[tokio::test]
+async fn lifting_a_mute_permits_the_track_without_resuming_it() {
+    let relay = Relay::authenticating();
+    let ada = Client::connect_as(&relay, &Grant::default().token()).await;
+    enrolled(&relay, 1).await;
+
+    let mute = Mute {
+        user: "ada".into(),
+        device: String::new(),
+        media: Kinds::AUDIO,
+        audience_only: false,
+        until: None,
+    };
+    relay.fabric.policy().mute(room(), mute.clone(), true);
+    let present = relay.fabric.roster().everybody();
+    let target = present.first().expect("ada on the roster");
+    target.restrict(relay.fabric.policy().silenced(&room(), &target.user, &target.device));
+    let (_, muted) = ada.accept_publish().await;
+    assert!(String::from_utf8_lossy(&muted.concat()).contains("\"mutedForEveryone\":1"));
+
+    relay.fabric.policy().mute(room(), mute, false);
+    target.restrict(relay.fabric.policy().silenced(&room(), &target.user, &target.device));
+
+    let (track, lifted) = ada.accept_publish().await;
+    assert_eq!(track.name().as_ref(), b".policy");
+    let said = String::from_utf8(lifted.concat()).expect("text");
+    assert!(
+        said.contains("\"mutedForEveryone\":0"),
+        "a lift says nothing is muted, and nothing more: {said}"
+    );
 }
 
 /// Refusing a session must refuse it, rather than answer no and serve it.
