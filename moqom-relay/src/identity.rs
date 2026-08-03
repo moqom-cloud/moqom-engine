@@ -39,7 +39,7 @@
 //! bypass, and the theft is bounded by the token's few remaining minutes.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aws_lc_rs::signature::{ED25519, UnparsedPublicKey};
@@ -323,9 +323,38 @@ impl VerificationKey {
 /// new key is published, minting moves to it, and the old one stays verifiable
 /// until the last token it signed has expired. With a single key that sequence
 /// has a window in which every session fails.
+///
+/// # Why the set can change while the relay runs
+///
+/// A relay is given keys two ways, and they answer different problems. What an
+/// operator puts in `MOQOM_RELAY_JWKS` is fixed for the life of the process: it
+/// is an explicit statement, and the only keys a relay with no control plane
+/// has. What the control plane pushes over its link arrives later and again on
+/// every rotation, which is the half that cannot be a startup constant — a
+/// relay that could not follow a rotation would keep working only until the
+/// retiring key was withdrawn, and then refuse every session at once.
+///
+/// So the effective set is the union, recomputed when a push arrives, and a
+/// push cannot remove what the operator configured. Sessions read it through a
+/// lock rather than holding a copy, because a rotation has to reach the
+/// sessions that already exist and not only the next one.
+///
+/// The push is trusted exactly as far as the link it arrives on, and that link
+/// authenticates the relay to the control plane and not the other way around.
+/// Anything that can impersonate the control plane's address can therefore
+/// publish its own keys — but it can already close sessions and rewrite a
+/// room's membership over the same stream, so this widens no door that is not
+/// already open. Closing it properly means mutual TLS on the link.
 #[derive(Clone)]
 pub struct Authenticator {
-    inner: Option<Arc<Keys>>,
+    inner: Arc<Shared>,
+}
+
+struct Shared {
+    /// What the operator configured, kept apart so that a push cannot drop it.
+    configured: HashMap<String, Vec<u8>>,
+    /// The union of the above and the most recent push, which is what verifies.
+    effective: RwLock<Arc<Keys>>,
 }
 
 struct Keys {
@@ -335,14 +364,14 @@ struct Keys {
 
 impl std::fmt::Debug for Authenticator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.inner {
-            None => f.write_str("Authenticator(disabled)"),
-            Some(keys) => f
-                .debug_struct("Authenticator")
-                .field("issuer", &keys.issuer)
-                .field("keys", &keys.by_id.len())
-                .finish(),
+        let keys = self.keys();
+        if keys.by_id.is_empty() {
+            return f.write_str("Authenticator(no keys)");
         }
+        f.debug_struct("Authenticator")
+            .field("issuer", &keys.issuer)
+            .field("keys", &keys.by_id.len())
+            .finish()
     }
 }
 
@@ -352,13 +381,21 @@ impl Authenticator {
     /// An empty issuer accepts any, which is for tests. A deployment that does
     /// not pin the issuer will accept a token minted by any other deployment
     /// that happens to share a key identifier.
+    ///
+    /// An empty `keys` is not the same as [`Self::disabled`] even though it
+    /// verifies nothing yet: it remembers the issuer, so keys arriving later
+    /// from the control plane are checked against the right one.
     #[must_use]
     pub fn new(issuer: impl Into<String>, keys: Vec<VerificationKey>) -> Self {
+        let configured: HashMap<_, _> = keys.into_iter().map(|key| (key.id, key.bytes)).collect();
         Self {
-            inner: Some(Arc::new(Keys {
-                issuer: issuer.into(),
-                by_id: keys.into_iter().map(|key| (key.id, key.bytes)).collect(),
-            })),
+            inner: Arc::new(Shared {
+                effective: RwLock::new(Arc::new(Keys {
+                    issuer: issuer.into(),
+                    by_id: configured.clone(),
+                })),
+                configured,
+            }),
         }
     }
 
@@ -369,14 +406,52 @@ impl Authenticator {
     /// for a test harness, and because the alternative — trusting the token
     /// unverified — is the failure mode this whole module exists to prevent.
     #[must_use]
-    pub const fn disabled() -> Self {
-        Self { inner: None }
+    pub fn disabled() -> Self {
+        Self::new("", Vec::new())
+    }
+
+    /// Take the keys the control plane published, replacing any earlier push.
+    ///
+    /// Wholesale rather than additive, because a rotation that retires a key
+    /// has to be able to withdraw it: merging every push would leave a relay
+    /// trusting a key long after the control plane stopped publishing it, and
+    /// the whole point of a retirement is that it eventually takes effect.
+    ///
+    /// Returns how many keys now verify, which is the union with whatever the
+    /// operator configured and so may be larger than what was pushed.
+    #[must_use]
+    pub fn accept(&self, pushed: Vec<VerificationKey>) -> usize {
+        let mut by_id = self.inner.configured.clone();
+        by_id.extend(pushed.into_iter().map(|key| (key.id, key.bytes)));
+        let count = by_id.len();
+
+        let mut effective = self
+            .inner
+            .effective
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *effective = Arc::new(Keys {
+            issuer: effective.issuer.clone(),
+            by_id,
+        });
+        count
+    }
+
+    /// The set in force right now.
+    fn keys(&self) -> Arc<Keys> {
+        Arc::clone(
+            &self
+                .inner
+                .effective
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
     }
 
     /// Whether tokens are checked at all.
     #[must_use]
-    pub const fn is_verifying(&self) -> bool {
-        self.inner.is_some()
+    pub fn is_verifying(&self) -> bool {
+        !self.keys().by_id.is_empty()
     }
 
     /// Whether this relay checks credentials at all.
@@ -385,8 +460,8 @@ impl Authenticator {
     /// a relay with keys it is a request to deny, and on one without it is the
     /// only kind of request there is.
     #[must_use]
-    pub const fn is_enabled(&self) -> bool {
-        self.inner.is_some()
+    pub fn is_enabled(&self) -> bool {
+        self.is_verifying()
     }
 
     /// Who this peer is.
@@ -400,6 +475,12 @@ impl Authenticator {
     /// it here would make authentication mandatory, which is a policy decision
     /// that belongs to the deployment: the address tier exists precisely so an
     /// unauthenticated peer can be allowed in on a short leash.
+    ///
+    /// The leash is the point. On a relay with keys such a peer is admitted and
+    /// may do nothing at all, because a namespace it announced would have no
+    /// verified tenant to be checked against. On a relay without keys it is
+    /// unrestricted, because there is nothing to check against anywhere and a
+    /// relay that refused would be unable to relay.
     ///
     /// # Errors
     /// [`AuthError`] when tokens were offered and none of them verified. The
@@ -432,9 +513,10 @@ impl Authenticator {
         address: std::net::IpAddr,
         now: SystemTime,
     ) -> Result<Admission, AuthError> {
-        let Some(keys) = &self.inner else {
+        let keys = self.keys();
+        if keys.by_id.is_empty() {
             return Ok(Admission::anonymous(address));
-        };
+        }
 
         let mut last = None;
         for token in tokens {
@@ -445,7 +527,12 @@ impl Authenticator {
         }
         match last {
             Some(e) => Err(e),
-            None => Ok(Admission::anonymous(address)),
+            // Offered nothing, on a relay that can check. Admitted, and
+            // permitted nothing: granting the unrestricted permission here
+            // would mean that saying nothing bought more than saying something
+            // unverifiable, and a relay is easier to use with no token than
+            // with a stolen one.
+            None => Ok(Admission::unauthorised(address)),
         }
     }
 }
@@ -474,15 +561,32 @@ impl Admission {
     /// is no signed claim, and an unsigned one is worth less than nothing here.
     ///
     /// Unrestricted, because there is no verified tenant or room to compare a
-    /// namespace against. This is only ever reached on a relay with no keys
-    /// configured -- where one token that failed to verify ends the session
-    /// rather than landing here -- and that relay is documented, and logs at
+    /// namespace against and nothing anywhere on this relay to compare it with.
+    /// Only reached on a relay with no keys, which is documented, and logs at
     /// startup, as one that authorises nothing.
     #[must_use]
     pub const fn anonymous(address: std::net::IpAddr) -> Self {
         Self {
             who: Principal::anonymous(address),
             permission: Permission::Unrestricted,
+            via: None,
+        }
+    }
+
+    /// The same peer on a relay that does have keys: admitted, and permitted
+    /// nothing until it presents one.
+    ///
+    /// The distinction from [`Self::anonymous`] is the whole of the difference
+    /// between a relay that authorises and one that does not, and it used to be
+    /// missing -- a peer that offered no token at all was handed the
+    /// unrestricted permission on a relay whose entire purpose was to check.
+    /// Sending a token that failed to verify ended the session; sending none
+    /// bought everything.
+    #[must_use]
+    pub const fn unauthorised(address: std::net::IpAddr) -> Self {
+        Self {
+            who: Principal::anonymous(address),
+            permission: Permission::Nothing,
             via: None,
         }
     }
@@ -1006,6 +1110,115 @@ mod tests {
         assert_eq!(
             authenticator.identify([token.as_bytes()], peer(), now),
             Ok(Principal::anonymous(peer()))
+        );
+    }
+
+    #[test]
+    fn offering_no_token_to_a_relay_with_keys_buys_nothing() {
+        // The hole this closes: a peer that said nothing used to be handed the
+        // unrestricted permission, on a relay whose whole purpose was to check.
+        // Presenting a forged token ended the session, and presenting none was
+        // better than presenting a real one.
+        let admitted = authenticator()
+            .admit(std::iter::empty(), peer(), at(0))
+            .expect("a peer that claims nothing is admitted, not refused");
+
+        assert_eq!(admitted.who, Principal::anonymous(peer()));
+        assert_eq!(admitted.permission, Permission::Nothing);
+    }
+
+    #[test]
+    fn a_relay_without_keys_still_relays() {
+        // The other half of the same decision. With nothing to check against,
+        // refusing would leave the relay unable to do the one thing it is for,
+        // and this is the mode a test harness and a laptop run in.
+        let admitted = Authenticator::disabled()
+            .admit(std::iter::empty(), peer(), at(0))
+            .expect("admitted");
+
+        assert_eq!(admitted.permission, Permission::Unrestricted);
+    }
+
+    #[test]
+    fn keys_pushed_by_the_control_plane_start_verifying_sessions() {
+        let now = at(0);
+        let token = mint(&header(), &claims(now));
+
+        // A relay as it is deployed: an issuer, and no keys until the link
+        // brings them.
+        let authenticator = Authenticator::new("https://api.moqom.cloud", Vec::new());
+        assert!(!authenticator.is_verifying());
+        assert_eq!(
+            authenticator.identify([token.as_bytes()], peer(), now),
+            Ok(Principal::anonymous(peer())),
+            "before any key arrives the token is not read, only ignored"
+        );
+
+        let pushed = authenticator.accept(vec![VerificationKey {
+            id: KID.to_owned(),
+            bytes: signer().public_key().as_ref().to_vec(),
+        }]);
+
+        assert_eq!(pushed, 1);
+        assert!(authenticator.is_verifying());
+        assert_eq!(
+            authenticator.identify([token.as_bytes()], peer(), now),
+            Ok(Principal::verified("acme", "ada", "OuXpLpEHW7dCPqjK")),
+            "the same token now names its holder"
+        );
+    }
+
+    #[test]
+    fn a_push_cannot_withdraw_what_the_operator_configured() {
+        // The two sources answer different problems and only one of them is an
+        // explicit statement. A control plane that publishes an empty set, or a
+        // different set, must not be able to strip a relay of the keys its
+        // operator wrote down -- otherwise the operator's copy is decoration.
+        let now = at(0);
+        let token = mint(&header(), &claims(now));
+        let authenticator = authenticator();
+
+        let _ = authenticator.accept(vec![VerificationKey {
+            id: "some-other-key".to_owned(),
+            bytes: vec![7u8; 32],
+        }]);
+
+        assert_eq!(
+            authenticator.identify([token.as_bytes()], peer(), now),
+            Ok(Principal::verified("acme", "ada", "OuXpLpEHW7dCPqjK"))
+        );
+    }
+
+    #[test]
+    fn a_later_push_replaces_an_earlier_one() {
+        // Rotation has to be able to retire a key. If pushes accumulated, a
+        // relay would go on trusting a withdrawn key until it restarted, which
+        // is the one guarantee a retirement is supposed to make.
+        let now = at(0);
+        let token = mint(&header(), &claims(now));
+        let real = VerificationKey {
+            id: KID.to_owned(),
+            bytes: signer().public_key().as_ref().to_vec(),
+        };
+
+        let authenticator = Authenticator::new("https://api.moqom.cloud", Vec::new());
+        let _ = authenticator.accept(vec![real]);
+        assert!(
+            authenticator
+                .identify([token.as_bytes()], peer(), now)
+                .is_ok()
+        );
+
+        let _ = authenticator.accept(vec![VerificationKey {
+            id: "the-only-key-now".to_owned(),
+            bytes: vec![9u8; 32],
+        }]);
+
+        assert!(
+            authenticator
+                .identify([token.as_bytes()], peer(), now)
+                .is_err(),
+            "a token signed by the retired key is refused once it is withdrawn"
         );
     }
 

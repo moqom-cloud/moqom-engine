@@ -37,6 +37,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::fabric::Fabric;
 use crate::generated::admin::v1 as admin;
 use crate::generated::relay::v1 as pb;
+use crate::identity::VerificationKey;
 use crate::policy::{self, Banned, Rules};
 use crate::roster::{Departure, Note, Presence};
 use crate::session::code;
@@ -72,6 +73,41 @@ pub struct Supervisor {
     pub relay_id: String,
     /// Where this relay is, for the director's steering decisions.
     pub region: String,
+    /// How to authenticate the control plane, and this relay to it. `None`
+    /// trusts the platform's roots, which is right for a public endpoint and
+    /// wrong for the private one a deployment uses.
+    pub tls: Option<ControlTls>,
+}
+
+/// The certificates the link is built on.
+///
+/// # Why the relay authenticates the control plane
+///
+/// The credential above proves this relay to the control plane. Nothing proved
+/// the control plane to this relay, and that direction is the one that matters
+/// now: the stream carries the verification keys every session is authenticated
+/// against, so whatever answers to the configured address decides who this relay
+/// believes. On a private network that is a smaller worry than it sounds, right
+/// up until it is not — an address is a routing decision, and routing decisions
+/// are made by things other than the person who wrote the address down.
+///
+/// A private authority rather than the platform's roots, because the endpoint is
+/// an internal address that no public authority will issue for, and because
+/// pinning one authority is stronger than trusting every authority a machine
+/// happens to ship with.
+#[derive(Debug, Clone)]
+pub struct ControlTls {
+    /// PEM for the authority that signed the control plane's certificate.
+    pub authority: Vec<u8>,
+    /// This relay's own certificate and key, in PEM.
+    pub identity: (Vec<u8>, Vec<u8>),
+    /// The name to verify the control plane's certificate against.
+    ///
+    /// Separate from the address because the address is an IP: a certificate
+    /// for `10.20.32.4` would have to be reissued whenever the load balancer's
+    /// address changed, and the address changes for reasons that have nothing
+    /// to do with identity.
+    pub server_name: String,
 }
 
 impl Supervisor {
@@ -92,13 +128,79 @@ impl Supervisor {
                  the control plane will refuse the stream"
             );
         }
+        let tls = match control_tls() {
+            Ok(tls) => tls,
+            Err(e) => {
+                // Refusing to start would be defensible and is the wrong trade.
+                // A relay is a media path: taking it out of service over a
+                // misconfigured link means every call on it ends, to fix a
+                // stream that carries moderation. It attaches without the
+                // certificates instead, and against a control plane that
+                // requires them that is a link which never comes up -- loudly,
+                // in the log, every thirty seconds.
+                tracing::error!(error = %e, "control-plane TLS is configured but unusable");
+                None
+            }
+        };
+        if tls.is_none() && endpoint.starts_with("https://") {
+            tracing::warn!(
+                "attaching over https with no MOQOM_CONTROL_CA, so the control plane is \
+                 authenticated by whatever roots this machine trusts"
+            );
+        }
+
         Some(Self {
             endpoint,
             credential,
             relay_id: std::env::var("MOQOM_RELAY_ID").unwrap_or_else(|_| default_id()),
             region: std::env::var("MOQOM_RELAY_REGION").unwrap_or_default(),
+            tls,
         })
     }
+}
+
+/// Read the link's certificates, or `None` where none are configured.
+///
+/// All three or nothing. A partial set is a mistake rather than a mode: an
+/// authority without an identity is a relay that will be refused by a control
+/// plane asking for a certificate, and an identity without an authority is one
+/// that presents its own and accepts anybody's.
+///
+/// # Errors
+/// A description of what could not be read, for the log.
+fn control_tls() -> Result<Option<ControlTls>, String> {
+    let path = |name: &str| std::env::var(name).ok().filter(|value| !value.is_empty());
+    let read =
+        |name: &str, at: String| std::fs::read(&at).map_err(|e| format!("{name} at {at}: {e}"));
+
+    let (Some(authority), Some(certificate), Some(key)) = (
+        path("MOQOM_CONTROL_CA"),
+        path("MOQOM_CONTROL_CLIENT_CERT"),
+        path("MOQOM_CONTROL_CLIENT_KEY"),
+    ) else {
+        if path("MOQOM_CONTROL_CA").is_some()
+            || path("MOQOM_CONTROL_CLIENT_CERT").is_some()
+            || path("MOQOM_CONTROL_CLIENT_KEY").is_some()
+        {
+            return Err("MOQOM_CONTROL_CA, MOQOM_CONTROL_CLIENT_CERT and \
+                        MOQOM_CONTROL_CLIENT_KEY go together"
+                .to_owned());
+        }
+        return Ok(None);
+    };
+
+    Ok(Some(ControlTls {
+        authority: read("MOQOM_CONTROL_CA", authority)?,
+        identity: (
+            read("MOQOM_CONTROL_CLIENT_CERT", certificate)?,
+            read("MOQOM_CONTROL_CLIENT_KEY", key)?,
+        ),
+        // Defaulted rather than required: a deployment that gets this wrong sees
+        // a handshake fail with a name it can read, which is a better error than
+        // one about a variable it did not know existed.
+        server_name: std::env::var("MOQOM_CONTROL_SERVER_NAME")
+            .unwrap_or_else(|_| "moqom-control".to_owned()),
+    }))
 }
 
 /// An identifier for a relay whose deployment did not give it one.
@@ -171,6 +273,35 @@ async fn serve(supervisor: Supervisor, fabric: Fabric, mut notes: mpsc::Unbounde
     }
 }
 
+/// Open a channel to the control plane, over TLS where it is configured.
+async fn dial(supervisor: &Supervisor) -> Result<tonic::transport::Channel, tonic::Status> {
+    let mut endpoint = tonic::transport::Endpoint::from_shared(supervisor.endpoint.clone())
+        .map_err(|e| tonic::Status::invalid_argument(format!("control endpoint: {e}")))?
+        // Long-lived and mostly idle. Keepalive is what stops a load balancer
+        // silently dropping the stream and leaving both ends believing in it.
+        .http2_keep_alive_interval(HEARTBEAT)
+        .keep_alive_timeout(Duration::from_secs(20));
+
+    if let Some(tls) = &supervisor.tls {
+        let (certificate, key) = &tls.identity;
+        endpoint = endpoint
+            .tls_config(
+                tonic::transport::ClientTlsConfig::new()
+                    .ca_certificate(tonic::transport::Certificate::from_pem(&tls.authority))
+                    .identity(tonic::transport::Identity::from_pem(certificate, key))
+                    // The certificate names the service, and the address is an
+                    // internal one that will outlive several of its own values.
+                    .domain_name(tls.server_name.clone()),
+            )
+            .map_err(|e| tonic::Status::invalid_argument(format!("control-plane TLS: {e}")))?;
+    }
+
+    endpoint
+        .connect()
+        .await
+        .map_err(|e| tonic::Status::unavailable(format!("control plane: {e}")))
+}
+
 /// One attempt: connect, say hello, and pump until something breaks.
 async fn attached(
     supervisor: &Supervisor,
@@ -178,17 +309,7 @@ async fn attached(
     notes: &mut mpsc::UnboundedReceiver<Note>,
     grace: &mut Duration,
 ) -> Result<(), tonic::Status> {
-    let channel = tonic::transport::Endpoint::from_shared(supervisor.endpoint.clone())
-        .map_err(|e| tonic::Status::invalid_argument(format!("control endpoint: {e}")))?
-        // Long-lived and mostly idle. Keepalive is what stops a load balancer
-        // silently dropping the stream and leaving both ends believing in it.
-        .http2_keep_alive_interval(HEARTBEAT)
-        .keep_alive_timeout(Duration::from_secs(20))
-        .connect()
-        .await
-        .map_err(|e| tonic::Status::unavailable(format!("control plane: {e}")))?;
-
-    let mut client = pb::relay_link_client::RelayLinkClient::new(channel);
+    let mut client = pb::relay_link_client::RelayLinkClient::new(dial(supervisor).await?);
 
     let (outbound, sink) = mpsc::channel::<pb::RelayMessage>(64);
 
@@ -361,18 +482,63 @@ fn react(
             ))),
         }),
         pb::control_message::Body::VerificationKeys(keys) => {
-            // Not applied, and this is a real gap rather than a formality: a
-            // relay whose keys come from its own configuration cannot follow a
-            // rotation the control plane performs, so the retiring key must stay
-            // in `MOQOM_RELAY_JWKS` until the last token it signed expires.
-            // Logged so that a rotation is at least visible from here.
-            tracing::warn!(
-                keys = keys.keys.len(),
-                "control plane pushed verification keys; this relay uses its configured JWKS"
-            );
+            adopt(fabric, &keys);
             None
         }
     }
+}
+
+/// Take the verification keys the control plane published.
+///
+/// This is how a deployed relay comes to have keys at all. Distributing a JWK
+/// set to every machine out of band is a second copy of something the control
+/// plane already knows and already sends, and a copy that can be stale is worse
+/// than no copy: it goes wrong at a rotation, which is the one moment the two
+/// have to agree.
+///
+/// Each key arrives as a JWK document of its own, so they are gathered into one
+/// set and parsed together -- by the same parser that reads `MOQOM_RELAY_JWKS`,
+/// so a key the control plane sends and a key an operator writes are held to
+/// the same standard. A malformed set is rejected whole: taking the keys that
+/// happened to parse would mean a rotation could half-apply, and half of a key
+/// set is a relay that refuses an unpredictable subset of its sessions.
+fn adopt(fabric: &Fabric, keys: &pb::VerificationKeys) {
+    let documents: Vec<&str> = keys
+        .keys
+        .iter()
+        .map(|key| key.jwk.trim())
+        .filter(|jwk| !jwk.is_empty())
+        .collect();
+
+    if documents.is_empty() {
+        // Not an error. A control plane with no keys to publish is one that
+        // mints no tokens, and it says so this way.
+        tracing::warn!("control plane published no verification keys");
+        return;
+    }
+
+    let set = format!("{{\"keys\":[{}]}}", documents.join(","));
+    let parsed = match VerificationKey::parse_set(&set) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            tracing::error!(error = %e, "control plane pushed keys this relay cannot read");
+            return;
+        }
+    };
+
+    let verifying = fabric.authenticator().is_verifying();
+    let total = fabric.authenticator().accept(parsed);
+
+    // At info, and worth the line: this is the moment a relay's answer to "may
+    // this session publish" changes, and the transition from verifying nothing
+    // to verifying is the single most consequential thing that happens to one
+    // after it binds its socket.
+    tracing::info!(
+        pushed = documents.len(),
+        verifying = total,
+        first = !verifying,
+        "took the control plane's verification keys"
+    );
 }
 
 /// Replace what is known about a room, and act on anybody it now excludes.
@@ -945,6 +1111,10 @@ mod tests {
             credential: "secret".to_owned(),
             relay_id: "relay-1".to_owned(),
             region: "us-west2".to_owned(),
+            // Plaintext, because the fake control plane here is on a loopback
+            // port. What TLS adds is authentication of a peer across a network,
+            // and there is no network between these two.
+            tls: None,
         }
     }
 
@@ -1152,6 +1322,90 @@ mod tests {
         })
         .await
         .expect("the address ban to reach a live session");
+    }
+
+    /// How a deployed relay comes to authenticate anybody at all.
+    #[tokio::test]
+    async fn keys_pushed_over_the_link_are_what_a_deployed_relay_verifies_with() {
+        // The public half of the key the interop suite's tokens are signed
+        // with, in the shape the control plane publishes: one JWK document per
+        // key, sent as a string.
+        let control = FakeControl::default();
+        control.will_say(pb::ControlMessage {
+            body: Some(pb::control_message::Body::VerificationKeys(
+                pb::VerificationKeys {
+                    keys: vec![admin::VerificationKey {
+                        key_id: "k1".to_owned(),
+                        algorithm: "EdDSA".to_owned(),
+                        jwk: r#"{"kty":"OKP","crv":"Ed25519","kid":"k1","x":"11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"}"#
+                            .to_owned(),
+                        not_before: None,
+                        retires_at: None,
+                    }],
+                },
+            )),
+        });
+        let serving = control.start().await;
+
+        // As the relay is configured in dev: an issuer, no JWKS file, and so
+        // nothing to verify with until the link says otherwise.
+        let fabric = Fabric::new().authenticated(crate::Authenticator::new(
+            "https://api.moqom.cloud",
+            Vec::new(),
+        ));
+        assert!(!fabric.authenticator().is_verifying());
+
+        let _link = Link::attach(supervisor(serving.endpoint()), fabric.clone());
+
+        tokio::time::timeout(PATIENCE, async {
+            while !fabric.authenticator().is_verifying() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the pushed keys to reach the authenticator");
+    }
+
+    #[tokio::test]
+    async fn keys_that_cannot_be_read_leave_the_relay_as_it_was() {
+        // Half a key set is worse than none: it would refuse an unpredictable
+        // subset of sessions, and the subset would depend on which key happened
+        // to parse.
+        let control = FakeControl::default();
+        control.will_say(pb::ControlMessage {
+            body: Some(pb::control_message::Body::VerificationKeys(
+                pb::VerificationKeys {
+                    keys: vec![admin::VerificationKey {
+                        key_id: "rsa".to_owned(),
+                        algorithm: "RS256".to_owned(),
+                        jwk: r#"{"kty":"RSA","crv":"","kid":"rsa","x":"nope"}"#.to_owned(),
+                        not_before: None,
+                        retires_at: None,
+                    }],
+                },
+            )),
+        });
+        let serving = control.start().await;
+
+        let fabric = Fabric::new().authenticated(crate::Authenticator::new(
+            "https://api.moqom.cloud",
+            Vec::new(),
+        ));
+        let _link = Link::attach(supervisor(serving.endpoint()), fabric.clone());
+
+        // Attached, so the message has been delivered and ignored rather than
+        // still being in flight.
+        control
+            .hears("the hello", |message| {
+                matches!(message.body, Some(pb::relay_message::Body::Hello(_)))
+            })
+            .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert!(
+            !fabric.authenticator().is_verifying(),
+            "a key set that cannot be parsed must not half-apply"
+        );
     }
 
     #[tokio::test]

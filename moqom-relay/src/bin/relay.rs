@@ -23,15 +23,26 @@
 //! - `MOQOM_RELAY_LIMIT_SCALE` — multiply every allowance by this. Default 1.
 //! - `MOQOM_RELAY_MAX_PRINCIPALS` — how many identities each tier tracks before
 //!   it refuses new ones. Default 100000. See [`moqom_relay::quota`].
-//! - `MOQOM_RELAY_JWKS` — path to the control plane's verification keys. Unset
-//!   means no session is authenticated and every one is charged to its address,
-//!   which is a much smaller allowance.
+//! - `MOQOM_RELAY_JWKS` — path to verification keys this relay must always
+//!   accept. Usually unset: a relay attached to a control plane is sent the
+//!   current keys over the link and follows every rotation, and a file is for
+//!   the relay that has no control plane to be sent them by. Until either
+//!   happens no session is authenticated and every one is charged to its
+//!   address, which is a much smaller allowance.
 //! - `MOQOM_RELAY_ISSUER` — the issuer tokens must name. Unset accepts any,
 //!   which is for tests.
 //! - `MOQOM_CONTROL_ENDPOINT` — the control plane's URL. Unset means no
 //!   moderation reaches this relay: it enforces what tokens say and nothing
 //!   else, which is the mode the benches run in and not one to expose.
 //! - `MOQOM_CONTROL_CREDENTIAL` — the relay service account's bearer token.
+//! - `MOQOM_CONTROL_CA`, `MOQOM_CONTROL_CLIENT_CERT`, `MOQOM_CONTROL_CLIENT_KEY`
+//!   — the link's certificates, all three or none. The credential above proves
+//!   this relay to the control plane; the authority proves the control plane to
+//!   this relay, which is the direction that decides whose verification keys
+//!   end up here. Unset is for a control plane on the same machine.
+//! - `MOQOM_CONTROL_SERVER_NAME` — the name to verify that certificate against,
+//!   defaulting to `moqom-control`. A name and not the address, because the
+//!   address is a load balancer's and changes for reasons unrelated to identity.
 //! - `MOQOM_RELAY_ID` — this relay's name to the control plane. Defaults to
 //!   `HOSTNAME`, which in a managed instance group is the instance and is stable
 //!   across its restarts.
@@ -43,8 +54,9 @@
 //! sees. Behind a load balancer that does not preserve the client address, that
 //! is one address for everybody, so the address tier becomes a single global
 //! limit and legitimate clients starve each other. Either preserve the client
-//! address at the balancer, or configure `MOQOM_RELAY_JWKS` so sessions are
-//! identified by who they are rather than where they came from.
+//! address at the balancer, or attach this relay to a control plane — the keys
+//! it sends are what let a session be identified by who it is rather than by
+//! where it came from.
 //!
 //! A generated certificate prints its SPKI hash to stdout as
 //! `certificate-hash: <base64>`, which is what a client needs to trust it. That
@@ -342,12 +354,25 @@ fn governor() -> Result<Governor, Box<dyn std::error::Error>> {
 /// believing it without a key — which would key every limit on a string the
 /// peer chose.
 fn authenticator() -> Result<Authenticator, Box<dyn std::error::Error>> {
+    // An unpinned issuer accepts a token minted by any deployment that happens
+    // to share a key identifier, which is a real hazard when identifiers are
+    // derived from the key and two environments restore the same secret.
+    let issuer = env("MOQOM_RELAY_ISSUER").unwrap_or_default();
+    if issuer.is_empty() {
+        tracing::warn!("no MOQOM_RELAY_ISSUER, so tokens from any issuer are accepted");
+    }
+
     let Some(path) = env_path("MOQOM_RELAY_JWKS") else {
+        // Not the end of the matter, and this is the ordinary case rather than
+        // a degraded one: a relay attached to a control plane is sent the keys
+        // over the link and starts verifying when they arrive. What this says
+        // is what is true until then, which for a relay with no control plane
+        // is forever.
         tracing::warn!(
-            "no MOQOM_RELAY_JWKS, so no session is authenticated and every one is \
-             limited by address"
+            "no MOQOM_RELAY_JWKS; until the control plane sends keys, no session is \
+             authenticated and every one is limited by address"
         );
-        return Ok(Authenticator::disabled());
+        return Ok(Authenticator::new(issuer, Vec::new()));
     };
 
     let document = std::fs::read_to_string(&path)
@@ -358,13 +383,6 @@ fn authenticator() -> Result<Authenticator, Box<dyn std::error::Error>> {
         return Err(format!("MOQOM_RELAY_JWKS {} has no keys", path.display()).into());
     }
 
-    // An unpinned issuer accepts a token minted by any deployment that happens
-    // to share a key identifier, which is a real hazard when identifiers are
-    // derived from the key and two environments restore the same secret.
-    let issuer = env("MOQOM_RELAY_ISSUER").unwrap_or_default();
-    if issuer.is_empty() {
-        tracing::warn!("no MOQOM_RELAY_ISSUER, so tokens from any issuer are accepted");
-    }
     tracing::info!(keys = keys.len(), %issuer, "verifying session credentials");
     Ok(Authenticator::new(issuer, keys))
 }

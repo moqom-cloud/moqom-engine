@@ -203,6 +203,10 @@ fn supervisor(control: &ControlPlane) -> Supervisor {
         credential: RELAY.to_owned(),
         relay_id: "interop-relay-1".to_owned(),
         region: "loopback".to_owned(),
+        // A deployment authenticates the control plane with a certificate; this
+        // one is a process on the same machine, reached over a loopback port
+        // that nothing else can be on.
+        tls: None,
     }
 }
 
