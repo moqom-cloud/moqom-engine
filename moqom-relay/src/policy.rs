@@ -377,20 +377,30 @@ impl Policy {
 
     /// Add or lift one force-mute without disturbing the rest of the room.
     ///
-    /// Keyed by who it names *and* its scope, because a participant can be
-    /// under an everyone-mute and an audience-mute at once and lifting one must
-    /// not lift the other. Replacing rather than accumulating: a mute that
-    /// arrives for somebody already muted is the moderator changing which media
-    /// they meant, and two rows for one scope would make the narrower one
-    /// unliftable.
+    /// Keyed by who it names, its scope, *and* the media it names. The scope
+    /// matters because a participant can be under an everyone-mute and an
+    /// audience-mute at once; the media matters for the same reason one step
+    /// down, and it is the part this used to get wrong. Replacing everything
+    /// held against a person made the second mute lift the first: mute their
+    /// microphone, then mute their camera, and the microphone came back on.
+    ///
+    /// So an arriving directive takes its kinds away from whatever is already
+    /// held and then states its own. The kinds it does not name are left where
+    /// they are, with the expiry they were given — which is the other thing a
+    /// single row could not hold, since a ten-minute mute of audio and an
+    /// indefinite mute of video have nothing to merge into.
     pub fn mute(&self, room: Where, mute: Mute, active: bool) {
         let mut inner = self.lock();
         let rules = inner.rooms.entry(room).or_default();
-        rules.mutes.retain(|held| {
-            held.user != mute.user
-                || held.device != mute.device
-                || held.audience_only != mute.audience_only
-        });
+        for held in &mut rules.mutes {
+            if held.user == mute.user
+                && held.device == mute.device
+                && held.audience_only == mute.audience_only
+            {
+                held.media = held.media.without(mute.media);
+            }
+        }
+        rules.mutes.retain(|held| !held.media.is_empty());
         if active && !mute.media.is_empty() {
             rules.mutes.push(mute);
         }
@@ -783,28 +793,96 @@ mod tests {
     }
 
     #[test]
-    fn a_second_mute_replaces_the_first_rather_than_adding_to_it() {
+    fn a_second_mute_of_another_kind_does_not_lift_the_first() {
         let policy = Policy::new();
         let mute = Mute {
             user: "ada".into(),
             device: String::new(),
-            media: Kinds::ALL,
+            media: Kinds::AUDIO,
             audience_only: false,
             until: None,
         };
         policy.mute(room(), mute.clone(), true);
-        // The moderator narrows it to the microphone.
         policy.mute(
             room(),
             Mute {
-                media: Kinds::AUDIO,
-                ..mute
+                media: Kinds::VIDEO,
+                ..mute.clone()
             },
             true,
         );
         assert_eq!(
             policy.silenced(&room(), "ada", "phone").everyone,
+            Kinds::AUDIO.union(Kinds::VIDEO)
+        );
+
+        // And each lifts on its own. Narrowing a mute is lifting the kinds no
+        // longer meant, not restating the ones that are.
+        policy.mute(
+            room(),
+            Mute {
+                media: Kinds::VIDEO,
+                ..mute
+            },
+            false,
+        );
+        assert_eq!(
+            policy.silenced(&room(), "ada", "phone").everyone,
             Kinds::AUDIO
+        );
+    }
+
+    #[test]
+    fn restating_a_kind_replaces_its_expiry_rather_than_holding_two() {
+        let policy = Policy::new();
+        let mute = Mute {
+            user: "ada".into(),
+            device: String::new(),
+            media: Kinds::AUDIO,
+            audience_only: false,
+            until: Some(SystemTime::now() + Duration::from_mins(10)),
+        };
+        policy.mute(room(), mute.clone(), true);
+
+        // The same kind again, this time already lapsed. One entry per kind, so
+        // the new expiry is the one that counts and the microphone is free.
+        policy.mute(
+            room(),
+            Mute {
+                until: Some(SystemTime::now() - Duration::from_secs(1)),
+                ..mute
+            },
+            true,
+        );
+        assert!(policy.silenced(&room(), "ada", "phone").is_empty());
+    }
+
+    #[test]
+    fn kinds_muted_for_different_lengths_expire_on_their_own_schedules() {
+        let policy = Policy::new();
+        let mute = Mute {
+            user: "ada".into(),
+            device: String::new(),
+            media: Kinds::AUDIO,
+            audience_only: false,
+            until: Some(SystemTime::now() - Duration::from_secs(1)),
+        };
+        policy.mute(room(), mute.clone(), true);
+        policy.mute(
+            room(),
+            Mute {
+                media: Kinds::VIDEO,
+                until: None,
+                ..mute
+            },
+            true,
+        );
+
+        // The timed one has lapsed; the indefinite one has not. A single row
+        // per participant could not have said this.
+        assert_eq!(
+            policy.silenced(&room(), "ada", "phone").everyone,
+            Kinds::VIDEO
         );
     }
 
