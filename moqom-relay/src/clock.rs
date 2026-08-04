@@ -168,10 +168,19 @@ pub struct Health {
 
 /// Past this width, a reading stops claiming to be synchronised.
 ///
-/// A healthy machine on a nearby NTP server reports single-digit milliseconds.
-/// A hundred is far outside that and far inside the seconds-level errors that
-/// make a log meaningless, so it separates "slightly noisy" from "something is
-/// wrong" without flapping.
+/// Three frames at 30fps, and the reasoning runs from the frame rather than from
+/// the round number. What these timecodes are for is ordering media captured on
+/// different machines, so the bound that matters is the gap between two frames:
+/// wider than that and the relay cannot say which of two phones' frames came
+/// first, which is the whole question.
+///
+/// One frame would be the tight reading of that and it is the wrong ceiling,
+/// because the kernel's bound is a sawtooth rather than a level. It grows at the
+/// kernel's tolerance of 500ppm between corrections — 32ms across the 64-second
+/// poll interval the relay's chrony is pinned to, measured and confirmed on a
+/// dev node — so a ceiling of one frame would trip on the healthy peak. Three
+/// gives room for two missed polls, which is what separates a slow moment from a
+/// time daemon that has died: past that the bound keeps growing and says so.
 pub const CEILING: Duration = Duration::from_millis(100);
 
 /// How long a health reading is reused.
