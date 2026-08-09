@@ -14,8 +14,14 @@
 # stranger sent a bad frame is the worst available outcome. With unwinding, the
 # catch at the FFI boundary can turn it into an error code instead.
 #
-#   ./build-apple.sh              # device and simulator
+#   ./build-apple.sh              # device, simulator, and Mac
 #   ./build-apple.sh --device     # device only, which is faster
+#
+# The Mac slice is not there for shipping a Mac app. The Swift package's tests run
+# on the host, and the entropy layer above this — which distribution each latent is
+# drawn from, and in what order — is exactly the kind of code that wants a fast test
+# loop rather than a device and a install cycle. Without a host slice the only place
+# it could be proven is on a phone.
 #
 # Output: target/MoqomRans.xcframework
 
@@ -27,7 +33,7 @@ OUT="$ROOT/target/apple"
 FRAMEWORK="$ROOT/target/MoqomRans.xcframework"
 LIB=libmoqom_rans_ffi.a
 
-TARGETS=(aarch64-apple-ios aarch64-apple-ios-sim)
+TARGETS=(aarch64-apple-ios aarch64-apple-ios-sim aarch64-apple-darwin)
 if [[ "${1:-}" == "--device" ]]; then
     TARGETS=(aarch64-apple-ios)
 fi
