@@ -287,10 +287,20 @@ fn cache_limits() -> Result<Limits, Box<dyn std::error::Error>> {
         None => defaults.bytes_total,
     };
 
+    let age = match env("MOQOM_RELAY_CACHE_SECONDS") {
+        Some(value) => std::time::Duration::from_secs(
+            value
+                .parse()
+                .map_err(|e| format!("MOQOM_RELAY_CACHE_SECONDS is not a count: {e}"))?,
+        ),
+        None => defaults.max_age,
+    };
+
     Ok(Limits {
         groups_per_track: groups,
         bytes_per_track: (total / 4).max(1),
         bytes_total: total,
+        max_age: age,
     })
 }
 

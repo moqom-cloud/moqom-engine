@@ -43,6 +43,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use moqom_proto::control::properties::Properties;
@@ -55,11 +56,30 @@ use moqom_proto::varint::VarInt;
 
 /// How much history to keep.
 ///
-/// Three limits rather than one because they fail differently. A group count
+/// Four limits rather than one because they fail differently. A group count
 /// bounds *latency to the oldest usable join point*, which is what a late
 /// joiner cares about. A per-track byte budget stops one high-bitrate track
 /// from crowding out every other. A process budget stops the relay from
-/// answering fetches by running out of memory.
+/// answering fetches by running out of memory. And an age bounds all three in
+/// the dimension they cannot see.
+///
+/// # Why counting groups is not the same as bounding time
+///
+/// A group count only describes a window while somebody is publishing into it.
+/// The moment a track goes quiet its last groups stop ageing out, because
+/// eviction runs on write and there are no more writes. Nothing else expires
+/// them: the byte budgets are shared across a whole process, so on a relay that
+/// is not under memory pressure the final groups of a finished broadcast are
+/// kept until the process restarts.
+///
+/// That was not a theoretical hole. A subscriber joining a track asks for the
+/// group in progress so it has a keyframe rather than waiting for the next
+/// boundary, and it anchors that fetch on [`Cache::largest`]. Rejoin a room
+/// whose publisher has left and the relay hands over the previous session's
+/// final group as though it were the live edge: measured on device, eighty-eight
+/// frames stamped twenty-five minutes in the past, delivered in a twenty
+/// millisecond burst before the first live frame. The subscriber has no way to
+/// tell that from a publisher whose clock jumped, and duly reported one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
     /// Groups retained per track. Two is the useful minimum: the group being
@@ -69,6 +89,11 @@ pub struct Limits {
     pub bytes_per_track: usize,
     /// Bytes retained across every track.
     pub bytes_total: usize,
+    /// How long a group can still be somebody's recent past.
+    ///
+    /// Measured from the first object written to a group, so a group ages from
+    /// when it started rather than from when it was finished.
+    pub max_age: Duration,
 }
 
 impl Default for Limits {
@@ -80,6 +105,10 @@ impl Default for Limits {
             groups_per_track: 8,
             bytes_per_track: 16 * 1024 * 1024,
             bytes_total: 512 * 1024 * 1024,
+            // The same window the group count describes, so the two limits
+            // agree about how far back this cache reaches instead of one of
+            // them quietly outliving the other.
+            max_age: Duration::from_secs(16),
         }
     }
 }
@@ -92,13 +121,17 @@ impl Limits {
             groups_per_track: 0,
             bytes_per_track: 0,
             bytes_total: 0,
+            max_age: Duration::ZERO,
         }
     }
 
     /// Whether these limits allow keeping anything at all.
     #[must_use]
     pub const fn retains_anything(&self) -> bool {
-        self.groups_per_track > 0 && self.bytes_per_track > 0 && self.bytes_total > 0
+        self.groups_per_track > 0
+            && self.bytes_per_track > 0
+            && self.bytes_total > 0
+            && !self.max_age.is_zero()
     }
 }
 
@@ -135,19 +168,39 @@ impl Entry {
 }
 
 /// One retained group.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct Group {
     /// Keyed by Object ID, which is unique within a group across its subgroups.
     objects: BTreeMap<u64, Entry>,
     /// The Object ID of an `EndOfGroup` marker: nothing at or above it exists.
     end: Option<u64>,
     bytes: usize,
+    /// When the group's first object was written.
+    written: Instant,
+}
+
+impl Default for Group {
+    /// A group is only ever default-constructed at the moment it is first
+    /// written to, which is exactly the instant its age is measured from.
+    fn default() -> Self {
+        Self {
+            objects: BTreeMap::new(),
+            end: None,
+            bytes: 0,
+            written: Instant::now(),
+        }
+    }
 }
 
 impl Group {
     /// Whether `object` is known not to exist, as opposed to merely absent.
     fn refutes(&self, object: u64) -> bool {
         self.end.is_some_and(|end| object >= end)
+    }
+
+    /// Whether this group is too old to be anybody's recent past.
+    fn expired(&self, now: Instant, max_age: Duration) -> bool {
+        now.saturating_duration_since(self.written) > max_age
     }
 }
 
@@ -168,6 +221,8 @@ struct State {
     tracks: HashMap<FullTrackName, Track>,
     bytes: usize,
     clock: u64,
+    /// When the age sweep last ran, so it does not run per object.
+    swept: Option<Instant>,
 }
 
 /// Recent objects for every track passing through this relay.
@@ -245,11 +300,24 @@ impl Cache {
         end: FetchEnd,
         order: GroupOrder,
     ) -> Vec<FetchRecord> {
+        self.fetch_at(track, start, end, order, Instant::now())
+    }
+
+    /// [`Cache::fetch`], as of `now`.
+    fn fetch_at(
+        &self,
+        track: &FullTrackName,
+        start: Location,
+        end: FetchEnd,
+        order: GroupOrder,
+        now: Instant,
+    ) -> Vec<FetchRecord> {
+        let max_age = self.limits.max_age;
         let records = self
             .lock()
             .tracks
             .get(track)
-            .map_or_else(Vec::new, |held| read(held, start, end, order));
+            .map_or_else(Vec::new, |held| read(held, start, end, order, now, max_age));
         let counter = if records.is_empty() {
             &self.misses
         } else {
@@ -263,9 +331,22 @@ impl Cache {
     /// ends and a subscription takes over.
     #[must_use]
     pub fn largest(&self, track: &FullTrackName) -> Option<Location> {
+        self.largest_at(track, Instant::now())
+    }
+
+    /// [`Cache::largest`], as of `now`.
+    ///
+    /// An expired newest group means there is no live edge here to join, rather
+    /// than a live edge that happens to be old. Answering `None` sends the
+    /// subscriber to the next real group, which is the only honest place for it
+    /// to start.
+    fn largest_at(&self, track: &FullTrackName, now: Instant) -> Option<Location> {
         let state = self.lock();
         let held = state.tracks.get(track)?;
         let (&group, last) = held.groups.iter().next_back()?;
+        if last.expired(now, self.limits.max_age) {
+            return None;
+        }
         let (&object, _) = last.objects.iter().next_back()?;
         location_of(group, object)
     }
@@ -274,9 +355,17 @@ impl Cache {
     /// reach further back than this.
     #[must_use]
     pub fn oldest_group(&self, track: &FullTrackName) -> Option<GroupId> {
+        self.oldest_group_at(track, Instant::now())
+    }
+
+    /// [`Cache::oldest_group`], as of `now`.
+    fn oldest_group_at(&self, track: &FullTrackName, now: Instant) -> Option<GroupId> {
         let state = self.lock();
         let held = state.tracks.get(track)?;
-        let (&group, _) = held.groups.iter().next()?;
+        let (&group, _) = held
+            .groups
+            .iter()
+            .find(|(_, held)| !held.expired(now, self.limits.max_age))?;
         Some(GroupId::new(VarInt::new(group).ok()?))
     }
 
@@ -372,11 +461,62 @@ impl Cache {
         }
 
         let limits = self.limits;
-        Self::evict(&mut state, track, limits);
+        Self::evict(&mut state, track, limits, Instant::now());
+    }
+
+    /// How often the age sweep walks every track.
+    const SWEEP: Duration = Duration::from_secs(1);
+
+    /// Retire every group past its age, across every track.
+    ///
+    /// Across every track rather than only the one being written, because the
+    /// track that needs this is by definition the one nobody is writing to. The
+    /// other budgets can afford to be lazy — a track that has stopped growing
+    /// has stopped threatening them — but age is the one limit a quiet track
+    /// keeps crossing while doing nothing at all.
+    ///
+    /// Expiry takes no "keep the last group" floor, unlike the byte budget. That
+    /// floor exists so a track over budget still has something to answer with;
+    /// an expired track should have nothing to answer with, which is the point.
+    fn expire(state: &mut State, max_age: Duration, now: Instant) {
+        let mut emptied = Vec::new();
+        for (name, held) in &mut state.tracks {
+            let retired: Vec<u64> = held
+                .groups
+                .iter()
+                .filter(|(_, group)| group.expired(now, max_age))
+                .map(|(&id, _)| id)
+                .collect();
+            for id in retired {
+                if let Some(group) = held.groups.remove(&id) {
+                    held.bytes -= group.bytes;
+                    state.bytes -= group.bytes;
+                }
+            }
+            if held.groups.is_empty() && held.end.is_none() {
+                emptied.push(name.clone());
+            }
+        }
+        for name in emptied {
+            state.tracks.remove(&name);
+        }
     }
 
     /// Bring one track, and then the process, back within budget.
-    fn evict(state: &mut State, track: &FullTrackName, limits: Limits) {
+    fn evict(state: &mut State, track: &FullTrackName, limits: Limits, now: Instant) {
+        // Paced, because this is the one pass that has to visit every track and
+        // it would otherwise run once per stored object. Correctness does not
+        // depend on the cadence — every read checks a group's age exactly — so
+        // all the sweep decides is how long retired bytes are held, and a
+        // second of that against a sixteen second window is not worth the walk.
+        if state
+            .swept
+            .is_none_or(|at| now.saturating_duration_since(at) >= Self::SWEEP)
+        {
+            state.swept = Some(now);
+            Self::expire(state, limits.max_age, now);
+        }
+
         if let Some(held) = state.tracks.get_mut(track) {
             let mut freed = 0;
             while held.groups.len() > limits.groups_per_track
@@ -474,12 +614,20 @@ impl Recorder {
 }
 
 /// Build the records answering a range from one track's history.
-fn read(held: &Track, start: Location, end: FetchEnd, order: GroupOrder) -> Vec<FetchRecord> {
+fn read(
+    held: &Track,
+    start: Location,
+    end: FetchEnd,
+    order: GroupOrder,
+    now: Instant,
+    max_age: Duration,
+) -> Vec<FetchRecord> {
     let mut records = Vec::new();
     let groups: Vec<u64> = {
         let ascending = held
             .groups
             .range(start.group.get()..=end.last_group().get())
+            .filter(|(_, group)| !group.expired(now, max_age))
             .map(|(&group, _)| group);
         match order {
             GroupOrder::Ascending => ascending.collect(),
@@ -664,6 +812,86 @@ mod tests {
         );
     }
 
+    /// The bug this bounds: a track that stops publishing stops being evicted,
+    /// because eviction runs on write. Without an age it keeps its last groups
+    /// for the life of the process and offers them to the next joiner as a live
+    /// edge, which on device meant twenty-five minute old video ahead of the
+    /// first real frame.
+    #[test]
+    fn a_track_that_went_quiet_has_no_live_edge() {
+        let cache = Cache::default();
+        let name = track("video");
+        store(&cache, &name, 1, &[object(0, b"old")]);
+
+        let later = Instant::now() + Limits::default().max_age + Duration::from_secs(1);
+        assert_eq!(
+            cache.largest_at(&name, Instant::now()),
+            Some(Location::new(GroupId::from(1u32), ObjectId::ZERO)),
+            "a group just written is the live edge"
+        );
+        assert_eq!(
+            cache.largest_at(&name, later),
+            None,
+            "an expired group is not a live edge, it is history"
+        );
+        assert!(
+            cache
+                .fetch_at(
+                    &name,
+                    Location::ZERO,
+                    whole_group(1),
+                    GroupOrder::Ascending,
+                    later,
+                )
+                .is_empty(),
+            "and it cannot be fetched either, or the edge check is the only guard"
+        );
+        assert_eq!(cache.oldest_group_at(&name, later), None);
+    }
+
+    /// Expiry has to release the memory too, not merely hide the groups from
+    /// readers, or a quiet relay accumulates every track it ever carried.
+    #[test]
+    fn expiry_releases_what_it_retires() {
+        let cache = Cache::default();
+        let name = track("video");
+        store(&cache, &name, 1, &[object(0, b"old"), object(1, b"older")]);
+        assert_eq!(cache.stats().bytes, 8);
+
+        let later = Instant::now() + Limits::default().max_age + Duration::from_secs(1);
+        Cache::expire(&mut cache.lock(), Limits::default().max_age, later);
+
+        assert_eq!(
+            cache.stats(),
+            Stats::default(),
+            "an expired track should account for nothing, not merely answer nothing"
+        );
+    }
+
+    /// The track that most needs expiring is the one nobody is writing to, so a
+    /// pass that only visits the track being written would never reach it.
+    #[test]
+    fn expiry_reaches_a_track_nobody_is_writing_to() {
+        let cache = Cache::default();
+        let quiet = track("quiet");
+        store(&cache, &quiet, 1, &[object(0, b"old")]);
+
+        // Far enough ahead that the quiet track is stale, then a write to some
+        // other track — the only thing that happens on a relay whose publisher
+        // has left.
+        let busy = track("busy");
+        Cache::expire(
+            &mut cache.lock(),
+            Limits::default().max_age,
+            Instant::now() + Limits::default().max_age + Duration::from_secs(1),
+        );
+        store(&cache, &busy, 1, &[object(0, b"new")]);
+
+        assert_eq!(cache.stats().tracks, 1);
+        assert_eq!(cache.largest(&quiet), None);
+        assert!(cache.largest(&busy).is_some());
+    }
+
     /// Evicting the newest group would leave the cache useless for exactly the
     /// case it exists for, so the direction is worth pinning.
     #[test]
@@ -689,6 +917,7 @@ mod tests {
             groups_per_track: 100,
             bytes_per_track: 10,
             bytes_total: 1_000,
+            ..Limits::default()
         });
         let name = track("video");
         for group in 0..5 {
@@ -715,6 +944,7 @@ mod tests {
             groups_per_track: 4,
             bytes_per_track: 1,
             bytes_total: 1_000_000,
+            ..Limits::default()
         });
         let name = track("video");
         store(
@@ -734,6 +964,7 @@ mod tests {
             groups_per_track: 10,
             bytes_per_track: 1_000_000,
             bytes_total: 12,
+            ..Limits::default()
         });
         let quiet = track("quiet");
         let busy = track("busy");

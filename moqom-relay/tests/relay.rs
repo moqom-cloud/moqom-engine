@@ -501,6 +501,49 @@ async fn a_joining_fetch_resolves_its_subscription() {
     );
 }
 
+/// The same resolution, once the history it would have anchored on has aged out.
+///
+/// This is the whole bug end to end. Eviction runs on write, so a track whose
+/// publisher has left stops ageing; its final group stays, and a joining fetch
+/// takes it for the live edge. On device that meant every rejoin of a room began
+/// with the previous session's last second and a half of video, stamped
+/// twenty-five minutes in the past and delivered in a single burst ahead of the
+/// first live frame — which the subscriber could only read as a publisher whose
+/// clock had jumped.
+///
+/// Refused rather than answered with the newest thing available: there is no
+/// warm start to be had from a publisher who is not publishing, and the next
+/// real group is the only honest place to begin.
+#[tokio::test]
+async fn a_joining_fetch_will_not_resolve_onto_stale_history() {
+    let mut show = broadcast(
+        Relay::retaining(Limits {
+            max_age: std::time::Duration::from_millis(150),
+            ..Limits::default()
+        }),
+        3,
+    )
+    .await;
+
+    // Long enough that everything published above is past it, which on a real
+    // relay is the publisher having gone quiet rather than the clock moving.
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+    let outcome = show
+        .subscriber
+        .fetch(FetchKind::RelativeJoining {
+            request_id: show.subscription.request_id,
+            preceding_groups: VarInt::from(1u32),
+        })
+        .await;
+
+    assert_eq!(
+        outcome.err(),
+        Some(moqom_proto::control::RequestErrorCode::DOES_NOT_EXIST.get()),
+        "stale history is not a live edge"
+    );
+}
+
 /// A joining fetch naming a subscription that does not exist is refused rather
 /// than answered from whatever track happened to be handy.
 #[tokio::test]
