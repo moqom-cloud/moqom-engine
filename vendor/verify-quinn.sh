@@ -31,17 +31,38 @@ fi
 
 rm -rf "$scratch/upstream/.git"
 
+# Local patches are applied to the pristine copy before the comparison, so what is being asserted
+# is "upstream plus exactly these patches and nothing else" rather than "upstream". A patch that
+# no longer applies, or a tree carrying an edit no patch accounts for, both fail here -- which is
+# the property worth keeping. Empty directory, and the check is the original one again.
+shopt -s nullglob
+patches=("$here/patches"/*.patch)
+shopt -u nullglob
+
+for patch in "${patches[@]}"; do
+  echo "applying $(basename "$patch")"
+  if ! patch -p1 -s -d "$scratch/upstream" < "$patch"; then
+    echo "$(basename "$patch") does not apply to $tag." >&2
+    echo "Upstream moved under it. Rebase the patch or drop it if it landed." >&2
+    exit 1
+  fi
+done
+
 # VENDORED.md is ours and is the one file expected to differ.
-if diff -ru --exclude=VENDORED.md "$scratch/upstream" "$vendored"; then
-  echo "vendor/quinn matches $tag exactly"
+if diff -ru --exclude=VENDORED.md --exclude='*.orig' "$scratch/upstream" "$vendored"; then
+  if [[ ${#patches[@]} -eq 0 ]]; then
+    echo "vendor/quinn matches $tag exactly"
+  else
+    echo "vendor/quinn matches $tag plus ${#patches[@]} recorded patch(es)"
+  fi
 else
   cat >&2 <<'EOF'
 
-vendor/quinn has diverged from upstream.
+vendor/quinn has diverged from upstream and from the patches in vendor/patches.
 
-If this was deliberate, VENDORED.md must say so and link the upstream PR --
-see the note there about local patches being small and temporary. If it was
-not, run vendor/update-quinn.sh to restore it.
+If this was deliberate, it belongs in a patch file there, and VENDORED.md must
+say so and link the upstream PR -- see the note there about local patches being
+small and temporary. If it was not, run vendor/update-quinn.sh to restore it.
 EOF
   exit 1
 fi

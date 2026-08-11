@@ -986,10 +986,13 @@ name = "moqom-transport"
 version = "0.0.0"
 dependencies = [
  "bytes",
+ "libc",
  "moqom-proto",
  "quinn",
+ "quinn-udp",
  "rcgen",
  "rustls",
+ "socket2",
  "thiserror 2.0.19",
  "tokio",
  "tracing",
@@ -2082,6 +2085,7 @@ version = "0.1.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100"
 dependencies = [
+ "log",
  "pin-project-lite",
  "tracing-attributes",
  "tracing-core",

@@ -16,6 +16,7 @@ moqom-proto = { path = "../moqom-proto" }
 bytes = { workspace = true }
 quinn = { workspace = true }
 rustls = { workspace = true }
+socket2 = { workspace = true }
 url = { workspace = true }
 web-transport-quinn = { workspace = true }
 thiserror = { workspace = true }
@@ -26,4 +27,8 @@ workspace = true
 
 [dev-dependencies]
 rcgen = { workspace = true }
+# Reading the type-of-service byte off a received datagram, which is the only place the codepoint
+# is observable. See `tests/marking.rs`.
+libc = "0.2"
+quinn-udp = "0.5"
 tokio = { workspace = true, features = ["rt", "macros", "time"] }

@@ -1,0 +1,110 @@
+diff --git a/quinn-udp/src/unix.rs b/quinn-udp/src/unix.rs
+index 6557eac..ac5f82c 100644
+--- a/quinn-udp/src/unix.rs
++++ b/quinn-udp/src/unix.rs
+@@ -80,6 +80,46 @@ pub struct UdpSocketState {
+     /// In particular, we do not use IP_TOS cmsg_type in this case,
+     /// which is not supported on Linux <3.13 and results in not sending the UDP packet at all.
+     sendmsg_einval: AtomicBool,
++
++    /// The differentiated services codepoint the caller set on the socket, if any.
++    ///
++    /// Read once at construction, because it is a property of the socket rather than of a
++    /// packet. Every send pushes an `IP_TOS` control message carrying the ECN codepoint, and a
++    /// control message sets the whole byte — so without this, a socket configured with
++    /// `IP_TOS`/`IPV6_TCLASS` has its codepoint silently replaced by zero on every datagram, and
++    /// the option appears to be accepted while having no effect on the wire.
++    dscp: u8,
++}
++
++/// The DSCP bits currently set on a socket, or zero if they cannot be read.
++///
++/// Failure is not an error worth propagating: the codepoint is an optimisation, the platform may
++/// not support reading it back, and a socket that cannot report one behaves as it does today.
++fn configured_dscp(io: &SockRef<'_>, is_ipv4: bool) -> u8 {
++    let (level, name) = if is_ipv4 {
++        (libc::IPPROTO_IP, libc::IP_TOS)
++    } else {
++        (libc::IPPROTO_IPV6, libc::IPV6_TCLASS)
++    };
++
++    let mut value: libc::c_int = 0;
++    let mut len = mem::size_of::<libc::c_int>() as libc::socklen_t;
++    // SAFETY: `value` and `len` outlive the call, and `len` describes `value` exactly.
++    let rc = unsafe {
++        libc::getsockopt(
++            io.as_raw_fd(),
++            level,
++            name,
++            (&raw mut value).cast::<libc::c_void>(),
++            &raw mut len,
++        )
++    };
++    if rc != 0 {
++        return 0;
++    }
++
++    // The low two bits are ECN's and belong to the transport, not to the caller.
++    (value as u8) & !0b11
+ }
+ 
+ impl UdpSocketState {
+@@ -190,6 +230,7 @@ impl UdpSocketState {
+             gro_segments: gro::gro_segments(),
+             may_fragment,
+             sendmsg_einval: AtomicBool::new(false),
++            dscp: configured_dscp(&io, is_ipv4),
+         })
+     }
+ 
+@@ -327,6 +368,7 @@ fn send(
+         &mut cmsgs,
+         encode_src_ip,
+         state.sendmsg_einval(),
++        state.dscp,
+     );
+ 
+     loop {
+@@ -371,6 +413,7 @@ fn send(
+                         &mut cmsgs,
+                         encode_src_ip,
+                         state.sendmsg_einval(),
++                        state.dscp,
+                     );
+                     continue;
+                 }
+@@ -410,6 +453,7 @@ fn send(state: &UdpSocketState, io: SockRef<'_>, transmit: &Transmit<'_>) -> io:
+             &mut ctrls[i],
+             true,
+             state.sendmsg_einval(),
++            state.dscp,
+         );
+         hdrs[i].msg_datalen = chunk.len();
+         cnt += 1;
+@@ -444,6 +488,7 @@ fn send(state: &UdpSocketState, io: SockRef<'_>, transmit: &Transmit<'_>) -> io:
+         &mut ctrl,
+         cfg!(apple) || cfg!(target_os = "openbsd") || cfg!(target_os = "netbsd"),
+         state.sendmsg_einval(),
++        state.dscp,
+     );
+     loop {
+         let n = unsafe { libc::sendmsg(io.as_raw_fd(), &hdr, 0) };
+@@ -578,6 +623,7 @@ fn prepare_msg(
+     #[allow(unused_variables)] // only used on FreeBSD & macOS
+     encode_src_ip: bool,
+     sendmsg_einval: bool,
++    dscp: u8,
+ ) {
+     iov.iov_base = transmit.contents.as_ptr() as *const _ as *mut _;
+     iov.iov_len = transmit.contents.len();
+@@ -597,7 +643,9 @@ fn prepare_msg(
+     hdr.msg_control = ctrl.0.as_mut_ptr() as _;
+     hdr.msg_controllen = CMSG_LEN as _;
+     let mut encoder = unsafe { cmsg::Encoder::new(hdr) };
+-    let ecn = transmit.ecn.map_or(0, |x| x as libc::c_int);
++    // Both halves of the byte. The control message replaces the whole of it, so sending the ECN
++    // codepoint alone is what discards the socket's configured codepoint.
++    let ecn = transmit.ecn.map_or(0, |x| x as libc::c_int) | libc::c_int::from(dscp);
+     // True for IPv4 or IPv4-Mapped IPv6
+     let is_ipv4 = transmit.destination.is_ipv4()
+         || matches!(transmit.destination.ip(), IpAddr::V6(addr) if addr.to_ipv4_mapped().is_some());

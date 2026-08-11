@@ -72,6 +72,41 @@ impl Server {
         tls: rustls::ServerConfig,
         liveness: Liveness,
     ) -> io::Result<Self> {
+        Self::bound(addr, tls, liveness, None)
+    }
+
+    /// Bind a socket that asks the network for a class of service.
+    ///
+    /// The codepoint is the top six bits of the IP header's second byte, and its whole purpose is
+    /// the last hop rather than the internet: a home access point reads it to choose a WMM queue,
+    /// and an unmarked flow shares the queue and the contention backoff of a background download.
+    /// Marking the client's uplink was measured to be worth 15.6ms at the 95th percentile of link
+    /// latency and 8.2ms of glass-to-glass, and this is the other direction of the same hop --
+    /// every frame crosses it twice and only one crossing was marked.
+    ///
+    /// Expect it to be rewritten. Codepoints are routinely cleared or remapped in transit, so
+    /// whether one set here reaches a phone is a question about a particular path on a particular
+    /// day, and has to be measured rather than assumed. It was, from a relay in GCP to a home
+    /// network, and the answer there was no: the byte arrived as zero on every sample while the
+    /// relay was demonstrably setting it. Measure before believing a deployment is getting
+    /// anything from this.
+    ///
+    /// # Errors
+    /// As [`Server::bind_with`], and if the codepoint cannot be set on the socket.
+    pub fn bind_marked(
+        addr: SocketAddr,
+        tls: rustls::ServerConfig,
+        dscp: Option<u8>,
+    ) -> io::Result<Self> {
+        Self::bound(addr, tls, Liveness::DEFAULT, dscp)
+    }
+
+    fn bound(
+        addr: SocketAddr,
+        tls: rustls::ServerConfig,
+        liveness: Liveness,
+        dscp: Option<u8>,
+    ) -> io::Result<Self> {
         let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
@@ -92,7 +127,37 @@ impl Server {
         // why it is written down rather than inherited.
         config.migration(true);
 
-        Ok(Self::new(quinn::Endpoint::server(config, addr)?))
+        let Some(dscp) = dscp else {
+            return Ok(Self::new(quinn::Endpoint::server(config, addr)?));
+        };
+
+        // Bound here rather than by `Endpoint::server`, which binds its own and offers no way to
+        // configure it first. The codepoint has to be on the socket before the endpoint wraps it,
+        // because `quinn-udp` reads it once and carries it into the control message it attaches
+        // to every datagram -- see the note in `vendor/quinn/VENDORED.md`.
+        let socket = socket2::Socket::new(
+            socket2::Domain::for_address(addr),
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )?;
+        // Shifted into the top six bits: the value names a codepoint, and the two bits below it
+        // are ECN's, which belong to the transport.
+        let tos = u32::from(dscp) << 2;
+        if addr.is_ipv6() {
+            socket.set_tclass_v6(tos)?;
+        } else {
+            socket.set_tos_v4(tos)?;
+        }
+        socket.bind(&addr.into())?;
+
+        let runtime = quinn::default_runtime()
+            .ok_or_else(|| io::Error::other("no async runtime found"))?;
+        Ok(Self::new(quinn::Endpoint::new(
+            quinn::EndpointConfig::default(),
+            Some(config),
+            socket.into(),
+            runtime,
+        )?))
     }
 
     /// Per-stream credit large enough that a media stream never needs a refill,

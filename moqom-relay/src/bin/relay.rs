@@ -126,7 +126,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let server = Server::bind(addr, with_moqt_alpn(tls))?;
+    let dscp = egress_dscp()?;
+    let server = Server::bind_marked(addr, with_moqt_alpn(tls), dscp)?;
+    if let Some(dscp) = dscp {
+        tracing::info!(dscp, "marking egress");
+    }
     let bound = server.local_addr()?;
     // Printed before the first accept so a harness can wait on this line rather
     // than poll the port, and flushed because stdout to a pipe is block
@@ -261,6 +265,29 @@ async fn shutdown() {
 
 fn env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.is_empty())
+}
+
+/// What class of service to ask the network for, from the environment.
+///
+/// Off unless asked for. A codepoint the path ignores is harmless, but one the path honours and
+/// that names the wrong class is not — a flow marked as background gets treated as background —
+/// so this is a deployment's decision rather than a default. AF41, 34, is the usual choice for
+/// interactive video and is what a home access point maps to its video queue.
+///
+/// # Errors
+/// If the value is not a number, or does not fit in the six bits a codepoint has.
+fn egress_dscp() -> Result<Option<u8>, Box<dyn std::error::Error>> {
+    let Some(value) = env("MOQOM_RELAY_DSCP") else {
+        return Ok(None);
+    };
+
+    let dscp: u8 = value
+        .parse()
+        .map_err(|e| format!("MOQOM_RELAY_DSCP is not a codepoint: {e}"))?;
+    if dscp > 63 {
+        return Err("MOQOM_RELAY_DSCP is six bits, so 0 to 63".into());
+    }
+    Ok(Some(dscp))
 }
 
 /// How much history to retain, from the environment.
