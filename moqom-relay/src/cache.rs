@@ -611,6 +611,12 @@ impl Recorder {
     pub const fn is_enabled(&self) -> bool {
         self.enabled
     }
+
+    /// The track these objects belong to.
+    #[must_use]
+    pub const fn track(&self) -> &FullTrackName {
+        &self.track
+    }
 }
 
 /// Build the records answering a range from one track's history.

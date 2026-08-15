@@ -35,7 +35,11 @@ fn tos_of_next_datagram(socket: &UdpSocket) -> u8 {
     hdr.msg_controllen = control.len() as _;
 
     let read = unsafe { libc::recvmsg(socket.as_raw_fd(), &raw mut hdr, 0) };
-    assert!(read > 0, "no datagram arrived: {}", std::io::Error::last_os_error());
+    assert!(
+        read > 0,
+        "no datagram arrived: {}",
+        std::io::Error::last_os_error()
+    );
 
     let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(&raw const hdr) };
     while !cmsg.is_null() {

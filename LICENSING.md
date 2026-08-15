@@ -10,6 +10,8 @@ product is source-available.
 |---|---|---|
 | `moqom-proto` | Apache-2.0 | An implementation of an IETF draft. Nobody should need permission to speak a standard. |
 | `moqom-transport` | Apache-2.0 | QUIC and WebTransport session establishment — the other half of being able to speak it. |
+| `moqom-client` | Apache-2.0 | A MOQT subscriber and publisher. Receiving frames is this crate, not the admin SDK. |
+| `moqom-cli` | Apache-2.0 | The `moqom` binary. It uses only `moqom-client`'s public API. |
 | `moqom-relay` | BUSL-1.1 → Apache-2.0 | The server. This is the product. |
 | `fuzz` | Apache-2.0 | Test harness for the Apache half. |
 | `vendor/quinn` | MIT OR Apache-2.0 | Upstream's, unmodified. See `vendor/quinn-rationale.md`. |
@@ -42,7 +44,7 @@ expires and the Apache crates should be split out.
 
 ## Consuming only the permissive half
 
-`moqom-proto` and `moqom-transport` carry no dependency on `moqom-relay` —
+`moqom-proto`, `moqom-transport`, and `moqom-client` carry no dependency on `moqom-relay` —
 the arrow points the other way. Depending on either of them pulls in no
 BUSL code, and `cargo tree` is the check rather than this sentence.
 

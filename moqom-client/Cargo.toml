@@ -1,0 +1,31 @@
+[package]
+name = "moqom-client"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+license = "Apache-2.0"
+description = "A MOQT subscriber and publisher, for recorders, classifiers, and the CLI"
+
+[dependencies]
+moqom-proto = { path = "../moqom-proto" }
+moqom-transport = { path = "../moqom-transport" }
+bytes = { workspace = true }
+quinn = { workspace = true }
+rustls = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync"] }
+url = { workspace = true }
+web-transport-quinn = { workspace = true }
+webpki-roots = "0.26"
+
+[dev-dependencies]
+moqom-relay = { path = "../moqom-relay" }
+rcgen = { workspace = true }
+rustls = { workspace = true }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time"] }
+
+[lints]
+workspace = true

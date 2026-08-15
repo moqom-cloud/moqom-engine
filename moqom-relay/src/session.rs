@@ -44,8 +44,8 @@ use moqom_proto::control::{
     Subscribe, SubscribeNamespace, SubscribeOk, setup, write_message,
 };
 use moqom_proto::data::{
-    FetchHeader, FetchRecord, FetchWriter, GroupOrder, SubgroupHeader, SubgroupObject,
-    SubgroupReader, SubgroupSource, SubgroupWriter,
+    FetchHeader, FetchRecord, FetchWriter, GroupOrder, SubgroupContent, SubgroupHeader,
+    SubgroupObject, SubgroupReader, SubgroupSource, SubgroupWriter,
 };
 use moqom_proto::error::DecodeError;
 use moqom_proto::model::{
@@ -482,6 +482,10 @@ pub struct Session {
     /// count that comes out the other end is what a cohost is paid on.
     via: Arc<OnceLock<Option<Arc<str>>>>,
 
+    /// Locale last reported from this session's catalog, so a restatement
+    /// does not become a SessionChanged.
+    locale: Arc<Mutex<Option<String>>>,
+
     /// Which group the next `.policy` object goes in.
     ///
     /// One group per change rather than one group with a growing object ID,
@@ -543,6 +547,7 @@ impl Session {
             principal: Arc::default(),
             permission: Arc::default(),
             via: Arc::default(),
+            locale: Arc::default(),
             policy_sequence: Arc::new(AtomicU64::new(0)),
         };
 
@@ -926,10 +931,10 @@ impl Session {
             return false;
         };
 
-        let silence = self
-            .fabric
-            .policy()
-            .silenced(&(Arc::from(tenant), Arc::from(room)), user, device);
+        let silence =
+            self.fabric
+                .policy()
+                .silenced(&(Arc::from(tenant), Arc::from(room)), user, device);
         if silence.is_empty() {
             return false;
         }
@@ -2189,6 +2194,10 @@ impl Session {
 
     /// A parser recording this stream into the cache, if it can be attributed to
     /// a track and the cache is retaining anything.
+    ///
+    /// Catalogs are teed even when retention is off. They are the one payload
+    /// a relay is allowed to read — never encrypted, written so a third party
+    /// can — and the control plane learns a publisher's locale from them.
     fn tee(&self, header: &SubgroupHeader) -> Option<Tee> {
         let track = self
             .lock_pulling()
@@ -2202,8 +2211,30 @@ impl Session {
                 );
                 None
             })?;
+        let catalog = track.name().as_ref() == b".catalog";
         let recorder = self.fabric.cache().record(track, header);
-        recorder.is_enabled().then(|| Tee::new(header, recorder))
+        (recorder.is_enabled() || catalog)
+            .then(|| Tee::new(header, recorder, catalog.then(|| self.clone())))
+    }
+
+    /// Take a locale from a catalog object, if it changed.
+    fn note_catalog(&self, object: &SubgroupObject) {
+        let SubgroupContent::Normal { payload, .. } = &object.content else {
+            return;
+        };
+        let Some(locale) = crate::catalog::locale_in(payload) else {
+            return;
+        };
+        let mut held = self
+            .locale
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if held.as_deref() == Some(locale.as_str()) {
+            return;
+        }
+        *held = Some(locale.clone());
+        drop(held);
+        self.fabric.roster().changed(self.id, locale);
     }
 
     // MARK: - Bookkeeping
@@ -2376,15 +2407,18 @@ struct Tee {
     /// Bytes received but not yet a whole object.
     pending: BytesMut,
     live: bool,
+    /// The session whose catalog this is, when the track is `.catalog`.
+    catalog: Option<Session>,
 }
 
 impl Tee {
-    fn new(header: &SubgroupHeader, recorder: cache::Recorder) -> Self {
+    fn new(header: &SubgroupHeader, recorder: cache::Recorder, catalog: Option<Session>) -> Self {
         Self {
             reader: SubgroupReader::new(header),
             recorder,
             pending: BytesMut::new(),
             live: true,
+            catalog,
         }
     }
 
@@ -2402,6 +2436,9 @@ impl Tee {
                     let consumed = self.pending.len() - cursor.len();
                     self.pending.advance(consumed);
                     self.recorder.push(&object);
+                    if let Some(session) = &self.catalog {
+                        session.note_catalog(&object);
+                    }
                 }
                 Err(DecodeError::Short { .. }) => return,
                 Err(e) => {

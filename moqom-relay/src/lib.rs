@@ -63,9 +63,11 @@
 //!   token's tenant, room, and grants are compared against the namespace every
 //!   request names, so a holder may publish only as themselves, in the room
 //!   they were admitted to, and may reach only what that room contains. What is
-//!   still missing is revocation — a ban is enforced when the next token is
-//!   minted rather than against the session already open, because no relay has
-//!   ever attached to the control plane's link.
+//!   still missing on a relay that has not attached is revocation — a ban is
+//!   then enforced when the next token is minted rather than against the
+//!   session already open. A relay that *has* attached (`MOQOM_CONTROL_ENDPOINT`)
+//!   closes the session when the control plane ejects it; that is the path
+//!   `interop_link` and the admin CLIs exercise.
 //!
 //!   Note the shape of the default: with no keys configured there is no
 //!   verified tenant to compare anything against, and such a relay authorises
@@ -89,6 +91,7 @@
 
 pub mod admin;
 pub mod cache;
+pub mod catalog;
 pub mod clock;
 pub mod fabric;
 pub mod identity;

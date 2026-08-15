@@ -6,6 +6,8 @@ members = [
     "moqom-rans-ffi",
     "moqom-relay",
     "moqom-transport",
+    "moqom-client",
+    "moqom-cli",
 ]
 # cargo-fuzz needs nightly and links libFuzzer, so it cannot build under the
 # pinned stable toolchain the rest of the workspace uses. Excluded rather than
@@ -51,6 +53,8 @@ serde_json = "1"
 # Linux only, and only for `adjtimex`. The relay needs the kernel's own bound on
 # how wrong its clock might be, and there is no way to that number in std.
 libc = "0.2"
+
+clap = { version = "4", features = ["derive"] }
 
 # Dev
 proptest = "1"

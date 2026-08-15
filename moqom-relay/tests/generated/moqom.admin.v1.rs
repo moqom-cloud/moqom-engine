@@ -1162,6 +1162,10 @@ pub struct Participant {
     /// somebody between audiences.
     #[prost(string, tag = "11")]
     pub arrived_via: ::prost::alloc::string::String,
+    /// BCP 47 language tag this participant last published on their catalog.
+    /// Empty until a catalog arrives, and updated when they change it mid-call.
+    #[prost(string, tag = "12")]
+    pub locale: ::prost::alloc::string::String,
 }
 /// How many viewers each cohost brought to a room.
 ///

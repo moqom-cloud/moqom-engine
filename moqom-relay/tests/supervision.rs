@@ -274,9 +274,8 @@ async fn a_force_mute_reaches_the_phone_and_stops_the_track() {
     // Before the mute: bea can watch the camera, and the relay pulls it.
     let watching = {
         let subscribing = bea.subscribe(&camera);
-        let answering = ada.answer_subscription(TrackAlias::new(
-            moqom_proto::varint::VarInt::from_u32(7),
-        ));
+        let answering =
+            ada.answer_subscription(TrackAlias::new(moqom_proto::varint::VarInt::from_u32(7)));
         let (subscribed, _served) = tokio::join!(subscribing, answering);
         subscribed.expect("a viewer may watch an unmuted camera")
     };
@@ -299,11 +298,14 @@ async fn a_force_mute_reaches_the_phone_and_stops_the_track() {
         .iter()
         .find(|presence| &*presence.user == "ada")
         .expect("ada on the roster");
-    assert!(target.restrict(relay.fabric.policy().silenced(
-        &room(),
-        &target.user,
-        &target.device
-    )));
+    assert!(
+        target.restrict(
+            relay
+                .fabric
+                .policy()
+                .silenced(&room(), &target.user, &target.device)
+        )
+    );
 
     // Ada's phone is told, by name and by number, which is what lets it stop
     // the capture device rather than merely stop encoding.
@@ -329,9 +331,8 @@ async fn a_force_mute_reaches_the_phone_and_stops_the_track() {
     // muting the camera must not take the room's audio with it.
     let listening = {
         let subscribing = bea.subscribe(&microphone);
-        let answering = ada.answer_subscription(TrackAlias::new(
-            moqom_proto::varint::VarInt::from_u32(9),
-        ));
+        let answering =
+            ada.answer_subscription(TrackAlias::new(moqom_proto::varint::VarInt::from_u32(9)));
         let (subscribed, _served) = tokio::join!(subscribing, answering);
         subscribed.expect("a mute on the camera must not stop the microphone")
     };
@@ -361,12 +362,22 @@ async fn lifting_a_mute_permits_the_track_without_resuming_it() {
     relay.fabric.policy().mute(room(), mute.clone(), true);
     let present = relay.fabric.roster().everybody();
     let target = present.first().expect("ada on the roster");
-    target.restrict(relay.fabric.policy().silenced(&room(), &target.user, &target.device));
+    target.restrict(
+        relay
+            .fabric
+            .policy()
+            .silenced(&room(), &target.user, &target.device),
+    );
     let (_, muted) = ada.accept_publish().await;
     assert!(String::from_utf8_lossy(&muted.concat()).contains("\"mutedForEveryone\":1"));
 
     relay.fabric.policy().mute(room(), mute, false);
-    target.restrict(relay.fabric.policy().silenced(&room(), &target.user, &target.device));
+    target.restrict(
+        relay
+            .fabric
+            .policy()
+            .silenced(&room(), &target.user, &target.device),
+    );
 
     let (track, lifted) = ada.accept_publish().await;
     assert_eq!(track.name().as_ref(), b".policy");

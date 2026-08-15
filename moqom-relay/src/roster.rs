@@ -228,6 +228,13 @@ pub enum Note {
         /// Why they are gone.
         why: Departure,
     },
+    /// Something about a live session changed without it closing.
+    Changed {
+        /// Which session.
+        id: SessionId,
+        /// BCP 47 tag from their latest catalog, empty when they cleared it.
+        locale: String,
+    },
 }
 
 /// Everybody connected to this relay who can be named in a room.
@@ -341,6 +348,13 @@ impl Roster {
                 room: Arc::clone(&presence.room),
                 why,
             });
+        }
+    }
+
+    /// Report a mid-session change the control plane should store.
+    pub fn changed(&self, id: SessionId, locale: String) {
+        if let Some(reports) = &self.lock().reports {
+            let _ = reports.send(Note::Changed { id, locale });
         }
     }
 

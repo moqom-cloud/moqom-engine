@@ -150,8 +150,8 @@ impl Server {
         }
         socket.bind(&addr.into())?;
 
-        let runtime = quinn::default_runtime()
-            .ok_or_else(|| io::Error::other("no async runtime found"))?;
+        let runtime =
+            quinn::default_runtime().ok_or_else(|| io::Error::other("no async runtime found"))?;
         Ok(Self::new(quinn::Endpoint::new(
             quinn::EndpointConfig::default(),
             Some(config),

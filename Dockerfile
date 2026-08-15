@@ -29,7 +29,9 @@ COPY moqom-rans/Cargo.toml moqom-rans/
 COPY moqom-rans-ffi/Cargo.toml moqom-rans-ffi/
 COPY moqom-relay/Cargo.toml moqom-relay/
 COPY moqom-transport/Cargo.toml moqom-transport/
-RUN for crate in moqom-proto moqom-rans moqom-rans-ffi moqom-relay moqom-transport; do \
+COPY moqom-client/Cargo.toml moqom-client/
+COPY moqom-cli/Cargo.toml moqom-cli/
+RUN for crate in moqom-proto moqom-rans moqom-rans-ffi moqom-relay moqom-transport moqom-client moqom-cli; do \
         mkdir -p "$crate/src" && echo "fn main() {}" > "$crate/src/main.rs" && \
         touch "$crate/src/lib.rs"; \
     done && \
@@ -44,6 +46,8 @@ COPY moqom-rans moqom-rans
 COPY moqom-rans-ffi moqom-rans-ffi
 COPY moqom-relay moqom-relay
 COPY moqom-transport moqom-transport
+COPY moqom-client moqom-client
+COPY moqom-cli moqom-cli
 RUN find target/release -maxdepth 1 -name 'moqom*' -exec rm -rf {} + 2>/dev/null || true
 
 ARG VERSION=dev

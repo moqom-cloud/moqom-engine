@@ -1,0 +1,22 @@
+[package]
+name = "moqom-cli"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+license = "Apache-2.0"
+description = "Command-line MOQT subscriber and publisher, using only moqom-client"
+
+[[bin]]
+name = "moqom"
+path = "src/main.rs"
+
+[dependencies]
+moqom-client = { path = "../moqom-client" }
+clap = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util", "io-std"] }
+
+[lints]
+workspace = true

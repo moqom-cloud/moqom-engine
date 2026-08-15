@@ -438,6 +438,17 @@ fn report(note: Note) -> pb::RelayMessage {
             cause: cause_of(why) as i32,
             at: Some(SystemTime::now().into()),
         }),
+        Note::Changed { id, locale } => {
+            pb::relay_message::Body::SessionChanged(pb::SessionChanged {
+                session_id: id.number().to_string(),
+                track: String::new(),
+                publishing: false,
+                backstage_changed: false,
+                backstage: false,
+                locale_changed: true,
+                locale,
+            })
+        }
     };
     pb::RelayMessage { body: Some(body) }
 }

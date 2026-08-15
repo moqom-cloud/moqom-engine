@@ -13,6 +13,8 @@ end-to-end encryption our decisions instead of someone else's.
 | --- | --- | --- |
 | `moqom-proto` | Apache-2.0 | The draft-19 object model, all eighteen control messages, and the data plane |
 | `moqom-transport` | Apache-2.0 | QUIC and WebTransport sessions on one UDP port |
+| `moqom-client` | Apache-2.0 | A MOQT subscriber and publisher for recorders, classifiers, and the CLI |
+| `moqom-cli` | Apache-2.0 | The `moqom` binary: `subscribe` and `publish`, using only `moqom-client` |
 | `moqom-relay` | BUSL-1.1 | The relay: announcement, subscription, fan-out, retention, authorisation |
 | `fuzz` | Apache-2.0 | Coverage-guided harnesses for the decoders |
 

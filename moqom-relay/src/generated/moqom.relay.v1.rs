@@ -230,6 +230,12 @@ pub struct SessionChanged {
     pub backstage_changed: bool,
     #[prost(bool, tag = "5")]
     pub backstage: bool,
+    /// Set when the session published a catalog that names a locale, or cleared it.
+    /// Distinguished from "no update" by locale_changed, same as backstage.
+    #[prost(bool, tag = "6")]
+    pub locale_changed: bool,
+    #[prost(string, tag = "7")]
+    pub locale: ::prost::alloc::string::String,
 }
 /// Everything the relay must know to serve a room without asking again.
 ///
