@@ -99,6 +99,7 @@ pub mod link;
 pub mod media;
 pub mod metrics;
 pub mod policy;
+pub mod possession;
 pub mod quota;
 pub mod roster;
 pub mod scope;

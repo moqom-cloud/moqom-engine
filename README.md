@@ -68,10 +68,29 @@ network looks like, and a player is right to wait a bad network out.
 Sessions are authenticated and authorised. A token's tenant, room and grants are
 checked against the namespace every request names, so a holder may publish only
 as themselves, in the room they were admitted to, and may read only what that
-room contains; refusals are counted by reason. Note the shape of the default:
-with no keys configured there is no verified tenant to compare anything against,
-and such a relay authorises nothing at all. That is the mode the benchmarks and
-the two-phone rig run in.
+room contains; refusals are counted by reason. A token's lifetime bounds the
+session and not merely the joining of it: the relay closes a session whose
+credential has lapsed, and a client that wants to outlast its token presents a
+fresh one on a stream it already has — draft-19's `REQUEST_UPDATE` carries an
+authorization token, so this costs no reconnection. A renewal may move the
+deadline and nothing else; a token naming a different holder or a different scope
+is refused, and the session carries on under the credential it had.
+
+A token also names the device it was issued to, in `cnf.jkt`, and the relay can
+make that name mean something. Set `MOQOM_RELAY_POSSESSION=required` and every
+place a token is checked — SETUP and each renewal — also demands an ES256
+signature from the key the thumbprint identifies, over the token it accompanies
+and over this relay's certificate, usable once. So a token read off a log or out
+of a capture is worth nothing to anybody without the Secure Enclave it was bound
+to, and one taken from a session here cannot be spent at another relay. The
+default is `observed`, which verifies a proof when one is offered and admits a
+session that offers none, because a fleet is upgraded one build at a time and a
+relay that stopped admitting the old ones would be an outage rather than a
+tightening; `bearer` turns it off. Note the shape of the other default: with no
+keys configured there is no verified tenant to compare anything against, and such
+a relay authorises nothing at all — nor holds anybody to an expiry, nor asks
+anybody to prove anything. That is the mode the benchmarks and the two-phone rig
+run in.
 
 The relay can be watched. An admin surface on its own port — off unless
 `MOQOM_RELAY_ADMIN_ADDR` says otherwise — exposes Prometheus metrics for
@@ -90,11 +109,15 @@ connection and an unbroken announcement while its viewers watch a still picture.
 `/tracks` names which track stopped and how long ago; `/metrics` carries only the
 population, bucketed.
 
-**What the relay is not yet:** revoking access during a session — a ban is
-enforced when the next token is minted rather than against the connection
-already open, because no relay has attached to the control plane's link yet —
-scheduling between the rungs of one broadcast under pressure, which is
-`moqom-cc`'s job, or forwarding datagrams; only subgroup streams are carried.
+Revoking access during a session does work, and against the connection already
+open rather than at the next token: `tests/interop_link.rs` bans a joined client
+through the real Go control plane's admin API and asserts the phone's connection
+closes. Unbanning and ending a room travel the same link. Those need a Go
+toolchain, so they are `#[ignore]`d and run by `moqom/tools/interop.sh`.
+
+**What the relay is not yet:** scheduling between the rungs of one broadcast
+under pressure, which is `moqom-cc`'s job, or forwarding datagrams; only subgroup
+streams are carried.
 The admin surface is also unauthenticated, which is why it binds separately and
 defaults off. `moqom-relay/src/lib.rs` lists the gaps and says which matter; none
 of it is ready to face the internet.

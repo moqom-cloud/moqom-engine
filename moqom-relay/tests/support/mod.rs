@@ -18,10 +18,11 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 use bytes::{Buf, Bytes, BytesMut};
+use moqom_proto::control::params::{Parameter, param_type};
 use moqom_proto::control::{
     ControlFrame, DoneReason, Fetch, FetchKind, FetchOk, MessageBody, MessageType, Namespace,
-    NamespaceDone, PublishDone, PublishNamespace, RequestId, RequestIdGenerator, Role, Setup,
-    Subscribe, SubscribeNamespace, SubscribeOk, write_message,
+    NamespaceDone, PublishDone, PublishNamespace, RequestId, RequestIdGenerator, RequestUpdate,
+    Role, Setup, Subscribe, SubscribeNamespace, SubscribeOk, write_message,
 };
 use moqom_proto::data::{
     FetchHeader, FetchReader, FetchRecord, GroupOrder, SubgroupHeader, SubgroupSource,
@@ -29,6 +30,7 @@ use moqom_proto::data::{
 use moqom_proto::error::DecodeError;
 use moqom_proto::model::{FullTrackName, GroupId, Location, TrackAlias, TrackNamespace};
 use moqom_relay::admin::Surface;
+use moqom_relay::possession::{Enforcement, Possession};
 use moqom_relay::{Authenticator, Cache, Fabric, Governor, Limits, Metrics, Quotas, Session};
 use moqom_transport::{Server, alpn, server::with_moqt_alpn};
 use web_transport_quinn::{RecvStream, SendStream};
@@ -144,6 +146,21 @@ impl Relay {
         )
     }
 
+    /// Start a relay that also requires a session to prove its token is its own.
+    ///
+    /// The difference from [`Self::authenticating`] is the difference between a
+    /// bearer credential and one bound to a device: on that relay a token works
+    /// for whoever holds it, and on this one it works only for the holder of the
+    /// key it names. See [`tokens::device`] for the client's half.
+    pub fn proving() -> Self {
+        Self::configured(
+            Limits::default(),
+            Governor::disabled(),
+            tokens::authenticator(),
+            Enforcement::Required,
+        )
+    }
+
     /// Start a relay that verifies tokens against keys from somewhere else.
     ///
     /// For `interop_link.rs`, where the keys are the running control plane's and
@@ -158,6 +175,19 @@ impl Relay {
     }
 
     fn assembled(limits: Limits, governor: Governor, authenticator: Authenticator) -> Self {
+        // Bearer, which is what every relay here did before proofs existed and
+        // what all but the possession tests still want: those tests are about who
+        // may forward what, and making each of them mint a device key as well
+        // would be ceremony that hid what they were checking.
+        Self::configured(limits, governor, authenticator, Enforcement::Bearer)
+    }
+
+    fn configured(
+        limits: Limits,
+        governor: Governor,
+        authenticator: Authenticator,
+        possession: Enforcement,
+    ) -> Self {
         install_crypto_provider();
 
         let generated = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
@@ -180,7 +210,14 @@ impl Relay {
         let metrics = Metrics::new();
         let fabric = Fabric::observed(Cache::new(limits), metrics.clone())
             .governed(governor)
-            .authenticated(authenticator);
+            .authenticated(authenticator)
+            // The certificate just generated, because that is what a proof is
+            // bound to: a relay's identity for this purpose is the certificate it
+            // presents, so a proof made for this relay is refused by any other.
+            .proving(Possession::new(
+                possession,
+                Some(tokens::device::certificate_identity(&certificate)),
+            ));
         let surface = Surface::new(metrics.clone(), fabric.clone());
         let accept = tokio::spawn({
             let fabric = fabric.clone();
@@ -210,6 +247,15 @@ impl Relay {
     /// The Prometheus exposition this relay would serve right now.
     pub fn scrape(&self) -> String {
         self.surface.respond("/metrics").body
+    }
+
+    /// What a proof of possession must name this relay by.
+    ///
+    /// Computed from the certificate rather than remembered, exactly as both a
+    /// real client and a real relay compute it, so a test cannot accidentally
+    /// agree with the relay on a value neither of them derived.
+    pub fn certificate_identity(&self) -> String {
+        tokens::device::certificate_identity(&self.certificate)
     }
 }
 
@@ -282,7 +328,7 @@ impl Client {
 
     /// Connect presenting `token` as a session credential.
     pub async fn connect_as(relay: &Relay, token: &str) -> Self {
-        Self::establish(relay, Some(token), Link::Ordinary)
+        Self::establish(relay, Some(token), None, Link::Ordinary)
             .await
             .unwrap_or_else(|closed| panic!("the relay refused the session: {closed:?}"))
     }
@@ -293,7 +339,7 @@ impl Client {
     /// anyway, which is a different outcome from a token that did not verify and
     /// has to be observable separately.
     pub async fn try_connect_as(relay: &Relay, token: &str) -> Result<Self, Closed> {
-        Self::establish(relay, Some(token), Link::Ordinary).await
+        Self::establish(relay, Some(token), None, Link::Ordinary).await
     }
 
     /// Connect, tolerating a relay that refuses before answering.
@@ -303,7 +349,7 @@ impl Client {
     /// it has said yes and then hung up. That is the right behaviour and it
     /// means the ordinary [`Client::connect`] cannot observe it.
     pub async fn try_connect(relay: &Relay) -> Result<Self, Closed> {
-        Self::establish(relay, None, Link::Ordinary).await
+        Self::establish(relay, None, None, Link::Ordinary).await
     }
 
     /// Connect as a subscriber whose connection cannot take much.
@@ -315,12 +361,50 @@ impl Client {
     /// blocked by the transport, exactly as it would be in the real case, and
     /// not merely be writing into a buffer nobody drains.
     pub async fn connect_congested(relay: &Relay) -> Self {
-        Self::establish(relay, None, Link::Congested)
+        Self::establish(relay, None, None, Link::Congested)
             .await
             .unwrap_or_else(|closed| panic!("the relay refused the session: {closed:?}"))
     }
 
-    async fn establish(relay: &Relay, token: Option<&str>, link: Link) -> Result<Self, Closed> {
+    /// Connect presenting `token` and a proof that it belongs to this client.
+    ///
+    /// What a real client does against a relay in
+    /// [`Enforcement::Required`](moqom_relay::possession::Enforcement::Required),
+    /// and the only way to establish a session on one.
+    pub async fn connect_proving(relay: &Relay, token: &str, proof: &str) -> Self {
+        Self::try_connect_proving(relay, token, proof)
+            .await
+            .unwrap_or_else(|closed| panic!("the relay refused the session: {closed:?}"))
+    }
+
+    /// The same, tolerating a relay that refuses — which is most of what the
+    /// possession tests are checking.
+    pub async fn try_connect_proving(
+        relay: &Relay,
+        token: &str,
+        proof: &str,
+    ) -> Result<Self, Closed> {
+        Self::establish(relay, Some(token), Some(proof), Link::Ordinary).await
+    }
+
+    /// Why the relay refused this credential, insisting that it did.
+    ///
+    /// Most of the possession tests are about refusals, and a refusal that turns
+    /// out to be an accepted session has to fail the test rather than be
+    /// unwrapped into one — so the assertion is here rather than in each of them.
+    pub async fn refused_proving(relay: &Relay, token: &str, proof: &str) -> Closed {
+        match Self::try_connect_proving(relay, token, proof).await {
+            Err(closed) => closed,
+            Ok(_) => panic!("the relay established a session it should have refused"),
+        }
+    }
+
+    async fn establish(
+        relay: &Relay,
+        token: Option<&str>,
+        proof: Option<&str>,
+        link: Link,
+    ) -> Result<Self, Closed> {
         install_crypto_provider();
 
         let mut tls = rustls::ClientConfig::builder()
@@ -378,6 +462,14 @@ impl Client {
                 )
                 .expect("a token within the option's size");
         }
+        if let Some(proof) = proof {
+            ours.options
+                .set_bytes(
+                    moqom_proto::control::setup::option_type::AUTHORIZATION_PROOF,
+                    Bytes::copy_from_slice(proof.as_bytes()),
+                )
+                .expect("a proof within the option's size");
+        }
         write(&mut send, &ours).await;
 
         let mut frames = Frames::new(recv);
@@ -416,9 +508,14 @@ impl Client {
             .open_bi()
             .await
             .expect("opening a request stream");
-        let request = PublishNamespace::new(self.next_request(), namespace.clone());
+        let id = self.next_request();
+        let request = PublishNamespace::new(id, namespace.clone());
         write(&mut send, &request).await;
-        Announcement { send, _recv: recv }
+        Announcement {
+            send,
+            request: id,
+            _recv: recv,
+        }
     }
 
     /// Announce, expecting the relay to refuse.
@@ -457,12 +554,14 @@ impl Client {
             .await
             .expect("opening a request stream");
         let mut send = send;
-        let request = SubscribeNamespace::new(self.next_request(), prefix.clone());
+        let id = self.next_request();
+        let request = SubscribeNamespace::new(id, prefix.clone());
         write(&mut send, &request).await;
         Watch {
             prefix: prefix.clone(),
+            request: id,
             frames: Frames::new(recv),
-            _send: send,
+            send,
         }
     }
 
@@ -895,6 +994,8 @@ impl Served {
 /// A live announcement. Dropping it withdraws the namespace.
 pub struct Announcement {
     send: SendStream,
+    /// The ID the announcement was made under, which a renewal has to name.
+    request: RequestId,
     _recv: RecvStream,
 }
 
@@ -905,13 +1006,49 @@ impl Announcement {
     pub fn withdraw(mut self) {
         self.send.finish().expect("finishing an announcement");
     }
+
+    /// Hand the relay a fresh credential on this announcement's stream.
+    ///
+    /// A publisher's announcement is its longest-lived stream, so this is where
+    /// one would renew in practice.
+    pub async fn renew(&mut self, token: &str) {
+        write(&mut self.send, &renewal(self.request, token, None)).await;
+    }
+}
+
+/// A `REQUEST_UPDATE` carrying a new authorization token, and optionally a proof
+/// that it belongs to the sender.
+///
+/// The draft's mechanism for renewing a credential without reconnecting: an
+/// update overwrites parameters on an established request, and both a token and
+/// a proof are parameters.
+fn renewal(request: RequestId, token: &str, proof: Option<&str>) -> RequestUpdate {
+    let mut update = RequestUpdate::new(request);
+    update.parameters.push(
+        Parameter::bytes(
+            param_type::AUTHORIZATION_TOKEN,
+            Bytes::copy_from_slice(token.as_bytes()),
+        )
+        .expect("a token within the parameter's size"),
+    );
+    if let Some(proof) = proof {
+        update.parameters.push(
+            Parameter::bytes(
+                param_type::AUTHORIZATION_PROOF,
+                Bytes::copy_from_slice(proof.as_bytes()),
+            )
+            .expect("a proof within the parameter's size"),
+        );
+    }
+    update
 }
 
 /// A live namespace watch.
 pub struct Watch {
     prefix: TrackNamespace,
+    request: RequestId,
     frames: Frames,
-    _send: SendStream,
+    send: SendStream,
 }
 
 /// What a watch reports.
@@ -924,6 +1061,24 @@ pub enum Announced {
 }
 
 impl Watch {
+    /// Hand the relay a fresh credential on this watch's stream.
+    ///
+    /// The likeliest place a real client renews, because a namespace watch is
+    /// the stream every participant has: it is how they learn who else is in
+    /// the room, whether or not they publish or subscribe to anything.
+    pub async fn renew(&mut self, token: &str) {
+        write(&mut self.send, &renewal(self.request, token, None)).await;
+    }
+
+    /// The same, with a proof that the fresh credential is this client's.
+    ///
+    /// What a real client must send against a relay requiring possession: the
+    /// proof from setup commits to the token from setup, so a renewal that
+    /// carried none would be exchanging a proven credential for an unproven one.
+    pub async fn renew_proving(&mut self, token: &str, proof: &str) {
+        write(&mut self.send, &renewal(self.request, token, Some(proof))).await;
+    }
+
     /// The next namespace change, resolved back to a full namespace.
     ///
     /// Resolution is the point: the relay sends a *suffix*, and a relay that
@@ -1165,6 +1320,38 @@ pub mod tokens {
 
         /// The token itself, valid for ten minutes from now.
         pub fn token(&self) -> String {
+            self.token_lasting(600)
+        }
+
+        /// The same token with a chosen lifetime, in seconds from now.
+        ///
+        /// Negative is allowed and is the point: the relay accepts a token up to
+        /// its clock-skew allowance past `exp`, so a lifetime of a few seconds
+        /// *below* zero is admitted at SETUP and then runs out almost
+        /// immediately. That is what makes expiry testable in a second rather
+        /// than in the ten minutes a realistic token would take.
+        pub fn token_lasting(&self, seconds: i64) -> String {
+            self.token_binding(THUMBPRINT, seconds)
+        }
+
+        /// A token committed to `thumbprint` rather than to this module's
+        /// constant.
+        ///
+        /// What a relay requiring proof of possession needs, because there the
+        /// thumbprint has to be the one belonging to a key somebody actually
+        /// holds — see [`device::thumbprint`]. Elsewhere it is a constant because
+        /// nothing has to hold the key it names.
+        pub fn token_bound_to_device(&self) -> String {
+            self.token_bound_to_device_lasting(600)
+        }
+
+        /// The same, with a chosen lifetime. See [`Self::token_lasting`] for why
+        /// a negative one is useful.
+        pub fn token_bound_to_device_lasting(&self, seconds: i64) -> String {
+            self.token_binding(&device::thumbprint(), seconds)
+        }
+
+        fn token_binding(&self, thumbprint: &str, seconds: i64) -> String {
             let issued = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("after the epoch")
@@ -1174,8 +1361,8 @@ pub mod tokens {
                 "sub": self.user,
                 "aud": "acme",
                 "iat": issued,
-                "exp": issued + 600,
-                "cnf": { "jkt": THUMBPRINT },
+                "exp": i64::try_from(issued).expect("a representable clock") + seconds,
+                "cnf": { "jkt": thumbprint },
                 "moqt": {
                     "room": self.room.unwrap_or_default(),
                     "pub": self.publish,
@@ -1188,6 +1375,102 @@ pub mod tokens {
                 &serde_json::json!({ "alg": "EdDSA", "typ": "MOQT", "kid": KID }),
                 &claims,
             )
+        }
+    }
+
+    /// The client's half of proof of possession: a device key, and proofs made
+    /// with it.
+    ///
+    /// Written out here for the reason the token minting above is: a proof built
+    /// with the relay's own verifier would show that the two agree with each
+    /// other. This builds one the way a client must — a compact JWS carrying its
+    /// own public key — so what is being tested is the format.
+    pub mod device {
+        use aws_lc_rs::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair as _};
+        use base64::Engine as _;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+        /// One device key for the whole test process.
+        ///
+        /// Generated once and kept, rather than per call: everything a proving
+        /// test announces sits under a namespace derived from this key, so a key
+        /// that changed between two calls within a test would move the namespace
+        /// out from under it. Which key it is does not matter — nothing here is
+        /// written down against it, because [`id`] derives the device field from
+        /// whatever this turns out to be.
+        fn pair() -> EcdsaKeyPair {
+            static DOCUMENT: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+            let document = DOCUMENT.get_or_init(|| {
+                let rng = aws_lc_rs::rand::SystemRandom::new();
+                EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng)
+                    .expect("generating a device key")
+                    .as_ref()
+                    .to_vec()
+            });
+            EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, document)
+                .expect("a valid P-256 key")
+        }
+
+        /// The public key as the two JWK coordinates a proof carries.
+        fn coordinates() -> (String, String) {
+            let point = pair().public_key().as_ref().to_vec();
+            (
+                URL_SAFE_NO_PAD.encode(&point[1..33]),
+                URL_SAFE_NO_PAD.encode(&point[33..65]),
+            )
+        }
+
+        /// The RFC 7638 thumbprint of the device key, which a token commits to.
+        pub fn thumbprint() -> String {
+            let (x, y) = coordinates();
+            let canonical = format!(r#"{{"crv":"P-256","kty":"EC","x":"{x}","y":"{y}"}}"#);
+            sha256(canonical.as_bytes())
+        }
+
+        /// The device field a client with this key announces under.
+        ///
+        /// Derived rather than written down, unlike [`super::DEVICE`] beside it:
+        /// that one belongs to a token whose thumbprint is a constant, and this
+        /// one belongs to a key, so it is whatever the key says it is.
+        pub fn id() -> String {
+            thumbprint().chars().take(16).collect()
+        }
+
+        /// What a proof made for this relay must name it by.
+        pub fn certificate_identity(der: &rustls::pki_types::CertificateDer<'_>) -> String {
+            sha256(der.as_ref())
+        }
+
+        /// A proof that this device holds the key `token` was issued to.
+        ///
+        /// `id` is the proof's own identifier, which the relay accepts once — so a
+        /// test that wants to be refused as a replay presents the same proof
+        /// twice, and every other test uses a fresh one.
+        pub fn prove(token: &str, relay: &str, id: &str) -> String {
+            let (x, y) = coordinates();
+            let header = format!(
+                r#"{{"alg":"ES256","typ":"MOQT-POP","jwk":{{"kty":"EC","crv":"P-256","x":"{x}","y":"{y}"}}}}"#
+            );
+            let claims = format!(
+                r#"{{"ath":"{}","jti":"{id}","rel":"{relay}"}}"#,
+                sha256(token.as_bytes())
+            );
+            let signing = format!(
+                "{}.{}",
+                URL_SAFE_NO_PAD.encode(header),
+                URL_SAFE_NO_PAD.encode(claims)
+            );
+
+            let rng = aws_lc_rs::rand::SystemRandom::new();
+            let signature = pair()
+                .sign(&rng, signing.as_bytes())
+                .expect("signing a proof");
+            format!("{signing}.{}", URL_SAFE_NO_PAD.encode(signature.as_ref()))
+        }
+
+        fn sha256(bytes: &[u8]) -> String {
+            let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, bytes);
+            URL_SAFE_NO_PAD.encode(digest.as_ref())
         }
     }
 

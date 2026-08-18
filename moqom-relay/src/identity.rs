@@ -29,14 +29,17 @@
 //! # The format
 //!
 //! Ed25519 over JSON claims in the compact JWS serialisation, minted by the Go
-//! control plane's `token` package. The full design target is CAT/CWT with
-//! COSE and `DPoP`; this is the subset that exists on both sides today, and the
-//! gap that matters here is that a token is still a bearer credential — the
-//! `cnf.jkt` thumbprint records the device it was issued to but nothing proves
-//! the holder has that device's key. Short lifetimes are the mitigation, and
-//! for rate limiting specifically the consequence is mild: a stolen token lets
-//! the thief spend the victim's allowance, which is a nuisance rather than a
-//! bypass, and the theft is bounded by the token's few remaining minutes.
+//! control plane's `token` package. The full design target is CAT/CWT with COSE;
+//! this is the subset that exists on both sides today.
+//!
+//! What the `cnf.jkt` thumbprint means depends on the relay's configuration, and
+//! this module is where that is decided. It names the device the token was issued
+//! to, and [`crate::possession`] is what turns naming into proving — a session
+//! that must show a signature from that device is holding a credential nobody can
+//! steal by copying, and one that need not is holding a bearer token whose short
+//! life is the only thing limiting a copy. Both are reachable; see
+//! [`Enforcement`](crate::possession::Enforcement) for why the weaker one still
+//! exists.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -47,6 +50,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::Deserialize;
 
+use crate::possession::Possession;
 use crate::quota::Principal;
 use crate::scope::{self, Permission, Publish, capability};
 
@@ -115,6 +119,14 @@ pub enum AuthError {
     /// Verified, but does not name a tenant, user, and device.
     #[error("token does not name a complete identity")]
     Incomplete,
+    /// The token verified, but the holder did not prove it is theirs.
+    ///
+    /// A separate category from the failures above, because everything above is
+    /// a statement about the token and this is a statement about who is holding
+    /// it. A token that reaches here is perfectly good; it is being presented by
+    /// somebody who cannot show the key it was issued to.
+    #[error("{0}")]
+    Unproven(#[from] crate::possession::ProofError),
 }
 
 impl AuthError {
@@ -129,7 +141,13 @@ impl AuthError {
         match self {
             Self::Expired | Self::NotYetValid => Code::EXPIRED_AUTH_TOKEN,
             Self::Malformed(_) | Self::Unsupported | Self::Incomplete => Code::MALFORMED_AUTH_TOKEN,
-            Self::UnknownKey | Self::BadSignature | Self::WrongIssuer => Code::UNAUTHORIZED,
+            // `Unproven` belongs here rather than with the malformed cases, even
+            // when the proof itself is what was malformed: the token is fine, and
+            // a client told its token was malformed goes and fetches another one,
+            // which will not help it.
+            Self::UnknownKey | Self::BadSignature | Self::WrongIssuer | Self::Unproven(_) => {
+                Code::UNAUTHORIZED
+            }
         }
     }
 
@@ -145,6 +163,7 @@ impl AuthError {
             Self::NotYetValid => "not_yet_valid",
             Self::WrongIssuer => "wrong_issuer",
             Self::Incomplete => "incomplete",
+            Self::Unproven(e) => e.name(),
         }
     }
 }
@@ -496,6 +515,73 @@ impl Authenticator {
             .map(|admitted| admitted.who)
     }
 
+    /// Who this peer is, and whether it can show that the credential is its own.
+    ///
+    /// The entry point a session uses. [`Self::admit`] beside it checks the
+    /// token and nothing else, which is what a rate limit needs and not what an
+    /// admission decision needs; the two are separate so that this one can be the
+    /// only thing on the connect path.
+    ///
+    /// `proof` is the accompanying `AUTHORIZATION_PROOF`, and it decides between
+    /// tokens as well as validating one. A client mid-rotation offers an old
+    /// credential and a new one, so several may verify, and a proof commits to
+    /// exactly one of them — so a token is accepted here when its signature is
+    /// good *and* the proof is for that token. Checking the proof against only
+    /// the first token that verified would refuse a rotation that was entirely
+    /// correct.
+    ///
+    /// Nothing is proven where there is nothing to prove: a relay holding no keys
+    /// admits everybody anonymously without reaching this, and a peer that
+    /// offered no token has nothing for a proof to be bound to and is admitted
+    /// with the permission to do nothing.
+    ///
+    /// # Errors
+    /// As [`Self::admit`], plus [`AuthError::Unproven`] when a token verified but
+    /// its holder could not show the key it names. The distinction matters to
+    /// whoever reads the log: the credential was genuine and the session was
+    /// still refused.
+    pub fn admit_presented(
+        &self,
+        tokens: &[&[u8]],
+        proof: Option<&[u8]>,
+        possession: &Possession,
+        address: std::net::IpAddr,
+        now: SystemTime,
+    ) -> Result<Admission, AuthError> {
+        let keys = self.keys();
+        if keys.by_id.is_empty() {
+            return Ok(Admission::anonymous(address));
+        }
+
+        let mut last = None;
+        for token in tokens {
+            let admitted = match keys.verify(token, now) {
+                Ok(admitted) => admitted,
+                Err(e) => {
+                    last = Some(e);
+                    continue;
+                }
+            };
+
+            // A verified token always names a device and always has an expiry —
+            // `Keys::verify` refuses one that does not — so the fallbacks here
+            // are unreachable rather than lenient. They are written as fallbacks
+            // because the alternative is an `expect` on the connect path, and a
+            // relay that panics on a malformed credential is a relay anybody can
+            // stop.
+            let thumbprint = admitted.thumbprint.as_deref().unwrap_or_default();
+            let expires = admitted.expires.unwrap_or(now);
+            match possession.check(token, proof, thumbprint, expires, now) {
+                Ok(()) => return Ok(admitted),
+                Err(e) => last = Some(AuthError::Unproven(e)),
+            }
+        }
+        match last {
+            Some(e) => Err(e),
+            None => Ok(Admission::unauthorised(address)),
+        }
+    }
+
     /// The same check, keeping what the token said beyond who it names.
     ///
     /// Separate from [`Self::identify`] rather than replacing it because the two
@@ -504,6 +590,11 @@ impl Authenticator {
     /// equality to find the bucket -- so folding provenance into it would make
     /// two sessions of one user distinct whenever they arrived by different
     /// routes, which is a rate limit anybody could escape by joining twice.
+    ///
+    /// Checks the token and not its holder, which is the right amount for
+    /// charging a limit: the worst a stolen token does to a quota is spend
+    /// somebody else's allowance. An admission decision needs more, and belongs
+    /// in [`Self::admit_presented`].
     ///
     /// # Errors
     /// As [`Self::identify`].
@@ -554,6 +645,33 @@ pub struct Admission {
     /// cohort of their own, and the size of it is how a cohost's contribution is
     /// judged.
     pub via: Option<Arc<str>>,
+
+    /// When the credential stops being valid, from the `exp` claim.
+    ///
+    /// Kept rather than discarded once checked, which it used to be. A token's
+    /// expiry was verified at setup and then forgotten, so a lifetime capped at
+    /// minutes bounded only the act of joining: the session it admitted ran for
+    /// as long as the connection did. Since a token here is a bearer credential
+    /// whose short life is the only thing limiting a stolen one, that made the
+    /// mitigation apply to the wrong event.
+    ///
+    /// `None` where there is nothing to enforce, which is a relay holding no
+    /// keys — see [`Self::anonymous`].
+    pub expires: Option<SystemTime>,
+
+    /// The device key this token was issued to, from `cnf.jkt`, untruncated.
+    ///
+    /// Distinct from the device in [`Self::who`], which is the first sixteen
+    /// characters and is what a ban and a namespace are keyed on. The whole
+    /// thumbprint is kept because a proof of possession is checked against it,
+    /// and comparing a proof's key to a truncated commitment would leave a peer
+    /// free to present any key whose thumbprint shared a prefix — ninety-six
+    /// bits is ample to tell one person's phones apart and is not a value to
+    /// hang a signature check on.
+    ///
+    /// `None` where no token said, which is an anonymous or unauthorised
+    /// session.
+    pub thumbprint: Option<Arc<str>>,
 }
 
 impl Admission {
@@ -570,6 +688,8 @@ impl Admission {
             who: Principal::anonymous(address),
             permission: Permission::Unrestricted,
             via: None,
+            expires: None,
+            thumbprint: None,
         }
     }
 
@@ -588,7 +708,27 @@ impl Admission {
             who: Principal::anonymous(address),
             permission: Permission::Nothing,
             via: None,
+            expires: None,
+            thumbprint: None,
         }
+    }
+
+    /// The instant a session admitted on this credential must be closed.
+    ///
+    /// [`Self::expires`] plus the same [`CLOCK_SKEW`] the verifier allows, and
+    /// the tolerance is not optional. Admission accepts a token up to that far
+    /// past its `exp`, so enforcing the bare claim would close a session the
+    /// handshake had just let in — and the symptom would be a client that
+    /// connects and is dropped instantly whenever the relay's clock happens to
+    /// run ahead of the minter's.
+    ///
+    /// `None` where there is nothing to enforce, and that has to stay
+    /// distinguishable from a deadline in the past: a relay with no keys admits
+    /// everybody, and turning "no expiry" into "expired" would close every
+    /// session on it at once.
+    #[must_use]
+    pub fn deadline(&self) -> Option<SystemTime> {
+        self.expires.map(|expires| expires + CLOCK_SKEW)
     }
 }
 
@@ -689,6 +829,8 @@ impl Keys {
             who: Principal::verified(&claims.aud, &claims.sub, device),
             permission,
             via,
+            expires: Some(expires),
+            thumbprint: Some(Arc::from(claims.cnf.jkt.as_str())),
         })
     }
 }

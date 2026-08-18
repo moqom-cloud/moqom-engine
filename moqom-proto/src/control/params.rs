@@ -19,6 +19,38 @@ use crate::varint::VarInt;
 /// Largest permitted byte value: `2^16 - 1`.
 pub const MAX_VALUE_LEN: usize = (1 << 16) - 1;
 
+/// Request parameter types from draft-19's registry.
+///
+/// Distinct from the setup option registry in
+/// [`setup::option_type`](crate::control::setup::option_type), which numbers its
+/// own space. The two happen to agree on the authorization token, and the point
+/// of naming it twice is that nothing guarantees they keep agreeing: a future
+/// draft could move one and not the other, and a single shared constant would
+/// make that a silent misparse rather than a compile error.
+pub mod param_type {
+    /// An authorization token, as a byte string. May repeat.
+    ///
+    /// Valid on any request, and on `REQUEST_UPDATE` — which is what makes a
+    /// credential renewable without reconnecting, since the update overwrites
+    /// the parameter on a request that is already established.
+    pub const AUTHORIZATION_TOKEN: u64 = 0x03;
+
+    /// A proof that the sender holds the key the accompanying token is bound to.
+    ///
+    /// The same private-use number as the setup option, and for once that is a
+    /// single decision rather than two that agree: both registries are extended
+    /// here by the same implementation, so there is nothing to drift.
+    /// [`setup::PRIVATE_USE`](crate::control::setup::PRIVATE_USE) explains the
+    /// choice of value.
+    ///
+    /// Needed on `REQUEST_UPDATE` for the same reason the token is. A renewal
+    /// carries a *different* token, and a proof is bound to the token it
+    /// accompanies, so the proof presented at setup says nothing about the new
+    /// one — a renewal without a fresh proof would be a way to trade a proven
+    /// credential for an unproven one.
+    pub const AUTHORIZATION_PROOF: u64 = crate::control::setup::PRIVATE_USE;
+}
+
 /// A parameter could not be constructed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ParamError {
@@ -286,6 +318,31 @@ impl Parameters {
     #[must_use]
     pub fn get(&self, type_value: u64) -> Option<&Parameter> {
         self.0.iter().find(|p| p.type_value == type_value)
+    }
+
+    /// Every authorization token carried here, in the order sent.
+    ///
+    /// The counterpart of [`setup::Options::authorization_tokens`], for the
+    /// request parameter registry rather than the setup option one. Draft-19
+    /// keeps those registries separate and assigns the same value in both, which
+    /// is convenient and worth naming rather than relying on: see
+    /// [`param_type::AUTHORIZATION_TOKEN`].
+    ///
+    /// [`setup::Options::authorization_tokens`]: crate::control::setup::Options::authorization_tokens
+    pub fn authorization_tokens(&self) -> impl Iterator<Item = &Bytes> {
+        self.0
+            .iter()
+            .filter(|p| p.type_value == param_type::AUTHORIZATION_TOKEN)
+            .filter_map(Parameter::as_bytes)
+    }
+
+    /// The proof of possession accompanying those tokens, if any.
+    ///
+    /// See [`param_type::AUTHORIZATION_PROOF`] for why a renewal needs its own.
+    #[must_use]
+    pub fn authorization_proof(&self) -> Option<&Bytes> {
+        self.get(param_type::AUTHORIZATION_PROOF)
+            .and_then(Parameter::as_bytes)
     }
 
     /// Whether any type appears more than once.

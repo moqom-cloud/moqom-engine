@@ -38,7 +38,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::fabric::{Command, SessionId};
 use crate::policy::Silence;
@@ -92,6 +92,16 @@ pub struct Presence {
     /// The connection, held only so it can be closed.
     transport: Arc<dyn Closes>,
 
+    /// When the credential holding this session open lapses, as the session
+    /// itself sees it.
+    ///
+    /// A borrow of the session's own deadline rather than a copy of it, because
+    /// the deadline moves: a session renews its token mid-call and the relay
+    /// pushes the expiry out. A copy taken at admission would be right for a few
+    /// minutes and then quietly wrong, and what reads this reports it upstream as
+    /// when the session will be closed.
+    credential: watch::Receiver<Option<SystemTime>>,
+
     /// This session's own command loop.
     ///
     /// The exception to the paragraph above about ejection. Closing a session
@@ -109,6 +119,30 @@ pub struct Presence {
     /// failure would have the control plane hold a place open for somebody it
     /// just threw out.
     ejected: AtomicBool,
+}
+
+/// What a joining session brings with it, beyond the identity in its scope.
+///
+/// A struct rather than five more parameters on [`Roster::admit`], which is what
+/// they were until the credential deadline joined them. The list had reached the
+/// length where two arguments of the same type sit next to each other and a
+/// caller can transpose them without the compiler minding.
+pub struct Arrival {
+    /// Where they connected from, for address bans and abuse investigation.
+    pub address: IpAddr,
+
+    /// Whose following brought them, from the token's `via` claim.
+    pub via: Option<Arc<str>>,
+
+    /// The connection, held only so it can be closed.
+    pub transport: Arc<dyn Closes>,
+
+    /// The session's own command loop, which is how a directive reaches it.
+    pub commands: mpsc::Sender<Command>,
+
+    /// A view of when the session's credential lapses. See
+    /// [`Presence::credential_expires`].
+    pub credential: watch::Receiver<Option<SystemTime>>,
 }
 
 /// Who and where, which is all a log line wants. The connection is a handle and
@@ -130,6 +164,19 @@ impl Presence {
     #[must_use]
     pub fn was_ejected(&self) -> bool {
         self.ejected.load(Ordering::Relaxed)
+    }
+
+    /// When this session will be closed for want of a valid credential.
+    ///
+    /// Read at the moment of asking rather than remembered, so a session that has
+    /// renewed reports the deadline it is actually being held to.
+    ///
+    /// `None` means there is nothing to enforce, which is a relay holding no
+    /// verification keys — and that has to stay distinguishable from a deadline
+    /// in the past, since such a relay admits everybody and closes nobody.
+    #[must_use]
+    pub fn credential_expires(&self) -> Option<SystemTime> {
+        *self.credential.borrow()
     }
 
     /// Whether this session runs the room rather than merely appearing in it.
@@ -289,15 +336,11 @@ impl Roster {
     /// Returns the presence for the caller to keep, or `None` for a session the
     /// control plane could not name — no verified scope, or a scope with no
     /// room.
-    pub fn admit(
-        &self,
-        id: SessionId,
-        scope: &Scope,
-        address: IpAddr,
-        via: Option<Arc<str>>,
-        transport: Arc<dyn Closes>,
-        commands: mpsc::Sender<Command>,
-    ) -> Option<Arc<Presence>> {
+    // Enrolling is the point and the presence is a convenience: the roster keeps
+    // its own copy, so a caller with no use for the handle — the session that has
+    // just been admitted — is not discarding anything.
+    #[allow(clippy::must_use_candidate)]
+    pub fn admit(&self, id: SessionId, scope: &Scope, arrival: Arrival) -> Option<Arc<Presence>> {
         let room = scope.room.clone()?;
         let presence = Arc::new(Presence {
             id,
@@ -309,11 +352,12 @@ impl Roster {
             capabilities: scope.capabilities,
             owner: scope.owner,
             backstage: scope.backstage,
-            address,
+            address: arrival.address,
             opened: SystemTime::now(),
-            via,
-            transport,
-            commands,
+            via: arrival.via,
+            transport: arrival.transport,
+            credential: arrival.credential,
+            commands: arrival.commands,
             ejected: AtomicBool::new(false),
         });
 
@@ -459,6 +503,16 @@ mod tests {
         IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7))
     }
 
+    /// A session with no credential deadline, which is what a relay holding no
+    /// verification keys gives everybody it admits.
+    ///
+    /// The sender goes out of scope at once and nothing here minds: a closed
+    /// `watch` still reads back the value it was closed on, and the roster only
+    /// ever reads.
+    fn no_deadline() -> watch::Receiver<Option<SystemTime>> {
+        watch::channel(None).1
+    }
+
     fn enrol(
         roster: &Roster,
         id: SessionId,
@@ -469,14 +523,19 @@ mod tests {
         // about restricting: that one builds its own so there is somebody to
         // receive.
         let (commands, _queue) = mpsc::channel(4);
-        roster.admit(
-            id,
-            &scope(user, room),
-            address(),
-            None,
-            Arc::new(Hangup::default()),
+        roster.admit(id, &scope(user, room), arrival(commands))
+    }
+
+    /// The rest of what a joining session brings, for a test that cares about
+    /// none of it.
+    fn arrival(commands: mpsc::Sender<Command>) -> Arrival {
+        Arrival {
+            address: address(),
+            via: None,
+            transport: Arc::new(Hangup::default()),
             commands,
-        )
+            credential: no_deadline(),
+        }
     }
 
     #[test]
@@ -552,14 +611,7 @@ mod tests {
         let id = Fabric::new().next_session_id();
         let (commands, mut queue) = mpsc::channel(4);
         let presence = roster
-            .admit(
-                id,
-                &scope("ada", Some("r1")),
-                address(),
-                None,
-                Arc::new(Hangup::default()),
-                commands,
-            )
+            .admit(id, &scope("ada", Some("r1")), arrival(commands))
             .expect("enrolled");
 
         let silence = Silence {
@@ -585,14 +637,7 @@ mod tests {
         let mut host = scope("ada", Some("r1"));
         host.capabilities = capability::STAGE;
         let host = roster
-            .admit(
-                ids.next_session_id(),
-                &host,
-                address(),
-                None,
-                Arc::new(Hangup::default()),
-                commands,
-            )
+            .admit(ids.next_session_id(), &host, arrival(commands))
             .expect("enrolled");
         let viewer = enrol(&roster, ids.next_session_id(), "bea", Some("r1")).expect("enrolled");
 

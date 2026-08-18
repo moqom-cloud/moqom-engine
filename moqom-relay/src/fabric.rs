@@ -42,6 +42,7 @@ use crate::clock;
 use crate::identity::Authenticator;
 use crate::metrics::Metrics;
 use crate::policy::{Policy, Silence};
+use crate::possession::Possession;
 use crate::quota::Governor;
 use crate::roster::Roster;
 
@@ -317,6 +318,13 @@ pub struct Fabric {
     /// How a session's credential is checked, which is what makes the governor
     /// able to charge anybody in particular.
     authenticator: Authenticator,
+    /// Whether a session must show that its credential is its own, and which
+    /// proofs have already been spent.
+    ///
+    /// Shared for the same reason the governor is, and it is the same kind of
+    /// reason: a per-session record of spent proofs is one a replay escapes by
+    /// opening a second connection, which is precisely what a replay is.
+    possession: Arc<Possession>,
     /// The host clock, and the kernel's opinion of how good it is.
     ///
     /// Shared so that every record this relay writes carries the same error
@@ -350,6 +358,7 @@ impl Default for Fabric {
             metrics: Metrics::default(),
             governor: Governor::disabled(),
             authenticator: Authenticator::disabled(),
+            possession: Arc::new(Possession::bearer()),
             clock: Arc::default(),
             roster: Roster::new(),
             policy: Policy::new(),
@@ -403,6 +412,21 @@ impl Fabric {
         }
     }
 
+    /// The same fabric, holding sessions to proving their credential is theirs.
+    ///
+    /// Separate from [`Self::authenticated`] rather than folded into it because
+    /// the two are configured separately and deployed separately: verifying
+    /// tokens is on as soon as a relay has keys, and requiring proofs cannot be
+    /// until the clients dialling it send them. See
+    /// [`Enforcement`](crate::possession::Enforcement).
+    #[must_use]
+    pub fn proving(self, possession: Possession) -> Self {
+        Self {
+            possession: Arc::new(possession),
+            ..self
+        }
+    }
+
     /// The shared object cache.
     #[must_use]
     pub const fn cache(&self) -> &Cache {
@@ -431,6 +455,12 @@ impl Fabric {
     #[must_use]
     pub const fn authenticator(&self) -> &Authenticator {
         &self.authenticator
+    }
+
+    /// Whether a credential's holder must prove it is theirs.
+    #[must_use]
+    pub fn possession(&self) -> &Possession {
+        &self.possession
     }
 
     /// Who is connected.

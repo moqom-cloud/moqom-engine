@@ -40,8 +40,8 @@ use bytes::{Buf, Bytes, BytesMut};
 use moqom_proto::control::{
     ControlFrame, DoneReason, Fetch, FetchKind, FetchOk, MessageBody, MessageType, Namespace,
     NamespaceDone, Publish, PublishDone, PublishDoneStatus, PublishNamespace, ReasonPhrase,
-    RequestError, RequestErrorCode, RequestId, RequestIdGenerator, Role, Setup, StreamCount,
-    Subscribe, SubscribeNamespace, SubscribeOk, setup, write_message,
+    RequestError, RequestErrorCode, RequestId, RequestIdGenerator, RequestUpdate, Role, Setup,
+    StreamCount, Subscribe, SubscribeNamespace, SubscribeOk, setup, write_message,
 };
 use moqom_proto::data::{
     FetchHeader, FetchRecord, FetchWriter, GroupOrder, SubgroupContent, SubgroupHeader,
@@ -59,7 +59,7 @@ use crate::fabric::{Command, Fabric, NamespaceEvent, Pulling, Route, SessionId, 
 use crate::metrics::{Ending, Fetched, Flowing, Metrics, Subscribed};
 use crate::policy::Silence;
 use crate::quota::{Lease, Principal, Refusal, Resource};
-use crate::roster::Departure;
+use crate::roster::{Arrival, Departure};
 use crate::scope::{Denial, Permission, Scope};
 use crate::{cache, media, metrics, scope};
 
@@ -118,6 +118,16 @@ pub enum SessionError {
     #[error("over limit: {0:?}")]
     OverLimit(Refusal),
 
+    /// The credential this session was admitted on ran out, and was not renewed.
+    ///
+    /// Distinct from [`Self::Unauthenticated`], which is a token that never
+    /// verified: this one did, and the session it opened outlived it. The
+    /// difference matters to whoever reads the close reason, because the answer
+    /// is different — a token that failed needs a correct one, and a token that
+    /// lapsed needs a client that renews before it does.
+    #[error("credential expired")]
+    CredentialExpired,
+
     /// The token verified and the room will not have them.
     ///
     /// Separate from [`Self::Unauthenticated`] because the credential is fine
@@ -159,7 +169,15 @@ impl Ending {
             // both are this relay declining somebody, and the difference
             // between "who are you" and "not you" is carried by the refusal
             // counters rather than by this one.
-            Err(SessionError::Unauthenticated(_) | SessionError::Refused(_)) => Self::Rejected,
+            // A credential that lapsed counts here too, and it is the arm most
+            // worth watching: a run of these is not people being turned away
+            // but clients failing to renew, which looks like a network fault to
+            // everybody experiencing it and like a rejection from here.
+            Err(
+                SessionError::Unauthenticated(_)
+                | SessionError::Refused(_)
+                | SessionError::CredentialExpired,
+            ) => Self::Rejected,
             Err(SessionError::OverLimit(_)) => Self::Throttled,
         }
     }
@@ -183,11 +201,20 @@ impl Departure {
             Err(SessionError::Protocol(_) | SessionError::Setup(_) | SessionError::Decode(_)) => {
                 Self::Protocol
             }
+            // A lapsed credential belongs here rather than with the refusals,
+            // and it is the one case where these two classifications genuinely
+            // disagree. `Ending` calls it a rejection because this relay did the
+            // closing; the room should expect them back, because a client whose
+            // token ran out gets another one and reconnects inside the window.
+            // Calling it `Protocol` would evict somebody who is already dialling
+            // back, and the participant would vanish from the roster and
+            // reappear rather than never having left.
             Err(
                 SessionError::Transport(_)
                 | SessionError::Read(_)
                 | SessionError::Write(_)
-                | SessionError::Truncated,
+                | SessionError::Truncated
+                | SessionError::CredentialExpired,
             ) => Self::Lost,
             // Refused at the handshake, so never enrolled and never reported.
             // Classified rather than left to a catch-all so that this stays true
@@ -474,6 +501,26 @@ pub struct Session {
     /// not something anybody is charged for.
     permission: Arc<OnceLock<Permission>>,
 
+    /// When the credential behind that permission lapses, and a way to be woken
+    /// when it moves.
+    ///
+    /// A `watch` rather than a `Mutex<Option<_>>` because the reader wants both
+    /// halves of what this type is: the current deadline, and notification that
+    /// it changed. The watcher sleeps until the deadline it read and races that
+    /// sleep against a change, so a renewal that arrives during the sleep pushes
+    /// it out instead of being noticed a lifetime late.
+    ///
+    /// Mutable where [`Self::principal`] and [`Self::permission`] are write-once,
+    /// and the asymmetry is the point. Who somebody is and what they may do must
+    /// not change under an established session — a peer that could restate
+    /// either would shed a quota bucket or a scope check. When their credential
+    /// runs out is the one part a peer may legitimately move, and only forward,
+    /// by presenting a fresh token for the same principal.
+    ///
+    /// `None` means nothing to enforce: a relay holding no keys, which
+    /// authorises everything and has no expiry to hold anybody to.
+    credential: watch::Sender<Option<SystemTime>>,
+
     /// Whose following brought this session, from the token's `via` claim.
     ///
     /// `Option` inside the `OnceLock` because "nobody brought them" is an
@@ -483,7 +530,7 @@ pub struct Session {
     via: Arc<OnceLock<Option<Arc<str>>>>,
 
     /// Locale last reported from this session's catalog, so a restatement
-    /// does not become a SessionChanged.
+    /// does not become a `SessionChanged`.
     locale: Arc<Mutex<Option<String>>>,
 
     /// Which group the next `.policy` object goes in.
@@ -546,6 +593,7 @@ impl Session {
             subscribed: Arc::default(),
             principal: Arc::default(),
             permission: Arc::default(),
+            credential: watch::Sender::new(None),
             via: Arc::default(),
             locale: Arc::default(),
             policy_sequence: Arc::new(AtomicU64::new(0)),
@@ -583,6 +631,16 @@ impl Session {
             Err(SessionError::Refused(refusal)) => session
                 .transport
                 .close(code::UNAUTHORIZED, refusal.to_string().as_bytes()),
+            // `UNAUTHORIZED` like the two above, because there is no separate
+            // code for it, so the reason phrase is what tells a client which of
+            // the three this was — and the right response differs: a credential
+            // that never verified should stop a client, and one that merely got
+            // old should send it back with a fresh token. Reconnecting with the
+            // same token is the one thing that cannot work.
+            Err(SessionError::CredentialExpired) => session.transport.close(
+                code::UNAUTHORIZED,
+                b"credential expired; renew and reconnect",
+            ),
             // The retry-after goes in the close reason, since a session that is
             // being closed has no request stream left to carry it. A client that
             // reads it waits; one that does not is no worse off than before.
@@ -661,11 +719,75 @@ impl Session {
         // would need its own shutdown signal, and the failure mode of getting
         // that wrong is a task per dead connection, polling a closed one
         // forever.
+        // The credential watcher is a fifth arm for the same reason, and it is
+        // the only one that ends a healthy session on purpose.
         tokio::select! {
             result = self.serve_control(control_send, control, commands) => result,
             result = self.accept_requests() => result,
             result = self.accept_data() => result,
             result = self.sample_transport(live.as_deref()) => result,
+            result = self.outlive_credential() => result,
+        }
+    }
+
+    /// End the session when its credential does, unless a renewal moves the
+    /// deadline first.
+    ///
+    /// This is what makes a short token lifetime a property of the session
+    /// rather than only of the handshake. Without it `exp` bounded the act of
+    /// joining and nothing else: a stolen bearer token bought a connection that
+    /// lasted as long as the thief kept it open, and since these tokens *are*
+    /// bearer credentials, their short life was the only thing limiting the
+    /// damage. It was being applied to the wrong event.
+    ///
+    /// Returns rather than closing the connection itself, so that expiry leaves
+    /// by the same door as every other ending and is logged, counted and
+    /// reported upstream by the code that already does that.
+    ///
+    /// Parks forever when there is no deadline, which is a relay holding no
+    /// verification keys. Such a relay authorises everything, so there is
+    /// nothing here to enforce and a session on it is never closed by this arm.
+    async fn outlive_credential(&self) -> Result<(), SessionError> {
+        let mut deadline = self.credential.subscribe();
+        loop {
+            // Read first, then wait for a change. `borrow_and_update` marks the
+            // value seen, so a renewal that lands while this task is sleeping is
+            // seen by the `changed()` below rather than missed — which is the
+            // whole reason the deadline lives in a `watch` and not a mutex.
+            let current = *deadline.borrow_and_update();
+
+            let Some(until) = current else {
+                if deadline.changed().await.is_err() {
+                    return std::future::pending().await;
+                }
+                continue;
+            };
+
+            let remaining = until
+                .duration_since(SystemTime::now())
+                .unwrap_or(std::time::Duration::ZERO);
+
+            tokio::select! {
+                () = tokio::time::sleep(remaining) => {
+                    // Re-read the clock rather than trusting the sleep. These
+                    // are different clocks: the sleep is monotonic and the
+                    // deadline is wall time, so a wall clock that stepped
+                    // backwards during the sleep would otherwise expire a
+                    // credential that has time left. Looping re-arms against
+                    // whatever the deadline is now, and cannot spin, because a
+                    // deadline already past yields a zero sleep and expires.
+                    if SystemTime::now() >= until {
+                        tracing::info!(
+                            session = %self.id,
+                            "credential expired without renewal, closing"
+                        );
+                        return Err(SessionError::CredentialExpired);
+                    }
+                }
+                changed = deadline.changed() => if changed.is_err() {
+                    return std::future::pending().await;
+                },
+            }
         }
     }
 
@@ -800,16 +922,20 @@ impl Session {
     /// through [`crate::Quotas`] how far that gets it.
     fn establish_identity(&self, peer: &Setup) -> Result<(), SessionError> {
         let address = self.connection().remote_address().ip();
-        let tokens = peer
+        let tokens: Vec<&[u8]> = peer
             .options
             .authorization_tokens()
-            .map(bytes::Bytes::as_ref);
+            .map(bytes::Bytes::as_ref)
+            .collect();
+        let proof = peer.options.authorization_proof().map(bytes::Bytes::as_ref);
 
-        let admitted = match self
-            .fabric
-            .authenticator()
-            .admit(tokens, address, SystemTime::now())
-        {
+        let admitted = match self.fabric.authenticator().admit_presented(
+            &tokens,
+            proof,
+            self.fabric.possession(),
+            address,
+            SystemTime::now(),
+        ) {
             Ok(admitted) => admitted,
             Err(e) => {
                 // Logged at info rather than warn: an expired token during a
@@ -835,14 +961,159 @@ impl Session {
         if let Some(via) = &admitted.via {
             tracing::debug!(session = %self.id, %via, "session was brought by somebody");
         }
+        let deadline = admitted.deadline();
         let _ = self.via.set(admitted.via);
         // Only ever set once, and this is the only place that sets either. A
         // peer that could change who it is mid-session could shed a limit; one
         // that could change what it may do could shed the checks below.
         let _ = self.principal.set(admitted.who);
         let _ = self.permission.set(admitted.permission);
+        // The expiry, on the other hand, is kept in something a renewal can
+        // move. Enforcing it is what makes the token's short life mean anything
+        // after the handshake; see `outlive_credential`.
+        //
+        // `send_replace` rather than `send`, and the difference is not cosmetic:
+        // `send` fails when nothing is subscribed yet, and nothing is — the
+        // watcher starts with the rest of the session, after this. It would
+        // discard the deadline and report it in a `Result` that there is no
+        // sensible way to handle here, which is exactly how this came to be
+        // written once with the expiry silently never stored.
+        self.credential.send_replace(deadline);
 
         self.admissible(address)
+    }
+
+    /// Take a renewed credential from a `REQUEST_UPDATE` and move the session's
+    /// deadline out to match.
+    ///
+    /// The other half of [`Self::outlive_credential`], and neither is any use
+    /// alone: enforcing an expiry without a way to renew would end every call at
+    /// the token's lifetime, which for a ten-minute token is a ten-minute call.
+    ///
+    /// `REQUEST_UPDATE` is the carrier because draft-19 already defines it as
+    /// one — an update overwrites parameters on a request that is established,
+    /// and an authorization token is a parameter. There is no session-level
+    /// message for this and inventing one was not available: the message
+    /// registry here is the draft's, and an unknown type is required to close
+    /// the session, so a private extension would be a code every other
+    /// implementation must fail on. Any request stream will do, which matters
+    /// because which streams a session has depends on what it is doing: a
+    /// publisher renews on its announcement, a viewer on its namespace watch or
+    /// on any subscription.
+    ///
+    /// Updates that carry no token are left alone. Most do not carry one — the
+    /// message's ordinary job is re-prioritising a subscription — so a renewal is
+    /// the exception here rather than the rule.
+    ///
+    /// A renewal this relay will not accept leaves the deadline alone and is
+    /// logged. It does not end the session, and it does not end the stream it
+    /// arrived on, which is the part worth being deliberate about: that stream is
+    /// a publisher's announcement or a viewer's roster feed, and withdrawing a
+    /// namespace because a token was stale would turn a recoverable client
+    /// mistake into everybody in the room watching a still picture.
+    ///
+    /// Nor is the refusal silent, which was the alternative worry. The session
+    /// carries on under the credential it already had and is closed when *that*
+    /// runs out, with a close reason that says so — so a client whose renewals
+    /// are being refused has until its current token expires to get one right,
+    /// and finds out either way. There is nowhere better to put the denial: a
+    /// `REQUEST_ERROR` on a subscription accepted ten minutes ago is a reply to a
+    /// request the client has long since finished with.
+    ///
+    /// # Errors
+    /// Only [`SessionError::Decode`], for a body that is not a `REQUEST_UPDATE`.
+    /// That is a malformed message rather than a rejected credential, and it is
+    /// handled where every other malformed message on a request stream is.
+    fn renew_credential(&self, frame: &ControlFrame) -> Result<(), SessionError> {
+        let update = RequestUpdate::decode(&mut frame.body.clone())?;
+        let tokens: Vec<&[u8]> = update
+            .parameters
+            .authorization_tokens()
+            .map(bytes::Bytes::as_ref)
+            .collect();
+        if tokens.is_empty() {
+            return Ok(());
+        }
+        // Its own proof, not the one presented at setup. That proof commits to
+        // the token it accompanied, so it says nothing about this one, and
+        // accepting a renewal without a fresh proof would be a way to exchange a
+        // proven credential for an unproven one — which is the whole guarantee,
+        // undone by the mechanism that exists to keep sessions alive.
+        let proof = update
+            .parameters
+            .authorization_proof()
+            .map(bytes::Bytes::as_ref);
+
+        let address = self.connection().remote_address().ip();
+        let admitted = match self.fabric.authenticator().admit_presented(
+            &tokens,
+            proof,
+            self.fabric.possession(),
+            address,
+            SystemTime::now(),
+        ) {
+            Ok(admitted) => admitted,
+            Err(e) => {
+                tracing::warn!(
+                    session = %self.id,
+                    error = %e,
+                    "a renewed credential did not verify; the session keeps its old deadline"
+                );
+                self.fabric.metrics().token_refused(e.name());
+                return Ok(());
+            }
+        };
+
+        // Who they are and what they may do must survive a renewal unchanged.
+        // Both are write-once on this session for good reasons — a principal is
+        // the key a rate limit is charged against, and a permission is what
+        // every announce and subscribe is checked against — so a token
+        // disagreeing with either could not take effect even if it were
+        // accepted. It would leave the relay enforcing one credential while
+        // holding another, which is worse than refusing.
+        //
+        // So a promotion, a move between rooms, or a change of publishable media
+        // needs a new session rather than a renewal. That is not a limitation
+        // this adds: a mid-session change of powers already travels as a
+        // directive from the control plane, and it does not travel in a token.
+        if self.principal.get().is_some_and(|who| admitted.who != *who) {
+            tracing::warn!(
+                session = %self.id,
+                "a renewed credential named a different holder; ignored"
+            );
+            return Ok(());
+        }
+        if self
+            .permission
+            .get()
+            .is_some_and(|held| admitted.permission != *held)
+        {
+            tracing::warn!(
+                session = %self.id,
+                "a renewed credential carried a different scope; ignored"
+            );
+            return Ok(());
+        }
+
+        let deadline = admitted.deadline();
+        // Forward only. A token with an earlier expiry than the one in hand is
+        // accepted and changes nothing, rather than being refused: it is a
+        // client renewing from a stale cache, which is a harmless mistake, and
+        // it must not be able to shorten a session it is entitled to.
+        self.credential.send_if_modified(|current| {
+            match (*current, deadline) {
+                (Some(held), Some(fresh)) if fresh <= held => false,
+                // A keyless relay has nothing to enforce, and a renewal there
+                // must not install a deadline out of nowhere.
+                (_, None) => false,
+                _ => {
+                    *current = deadline;
+                    true
+                }
+            }
+        });
+        tracing::debug!(session = %self.id, "credential renewed");
+        Ok(())
     }
 
     /// Whether the room will have this session, as distinct from whether its
@@ -892,10 +1163,13 @@ impl Session {
         self.fabric.roster().admit(
             self.id,
             scope,
-            self.connection().remote_address().ip(),
-            via,
-            Arc::new(self.transport.clone()),
-            self.commands.clone(),
+            Arrival {
+                address: self.connection().remote_address().ip(),
+                via,
+                transport: Arc::new(self.transport.clone()),
+                commands: self.commands.clone(),
+                credential: self.credential.subscribe(),
+            },
         );
 
         // A mute outlives the session it was imposed on, so somebody rejoining
@@ -1245,15 +1519,30 @@ impl Session {
         // withdrawing on purpose -- draft-19 has no `UNANNOUNCE`, so closing
         // this stream *is* the withdrawal. Anything else is the announcement
         // outliving the thing that made it.
-        let (result, reason) = match frames.next().await {
-            Ok(None) => (Ok(()), DoneReason::Stopped),
-            Ok(Some(_)) => (
-                Err(SessionError::Protocol(
-                    "unexpected message on a PUBLISH_NAMESPACE stream",
-                )),
-                DoneReason::Vanished,
-            ),
-            Err(e) => (Err(e), DoneReason::Vanished),
+        //
+        // A loop rather than a single read because a credential renewal arrives
+        // here too, and must not be mistaken for the end of the announcement: a
+        // publisher's announcement is its longest-lived stream, so it is the
+        // natural place for it to renew, and reading one frame and stopping
+        // would have withdrawn the namespace on the first attempt.
+        let (result, reason) = loop {
+            match frames.next().await {
+                Ok(None) => break (Ok(()), DoneReason::Stopped),
+                Ok(Some(frame)) if frame.message_type == MessageType::RequestUpdate => {
+                    if let Err(e) = self.renew_credential(&frame) {
+                        break (Err(e), DoneReason::Vanished);
+                    }
+                }
+                Ok(Some(_)) => {
+                    break (
+                        Err(SessionError::Protocol(
+                            "unexpected message on a PUBLISH_NAMESPACE stream",
+                        )),
+                        DoneReason::Vanished,
+                    );
+                }
+                Err(e) => break (Err(e), DoneReason::Vanished),
+            }
         };
 
         tracing::info!(
@@ -1317,6 +1606,15 @@ impl Session {
                 // the only place that close is observable.
                 frame = frames.next() => match frame {
                     Ok(None) => break Ok(()),
+                    // The likeliest place a renewal arrives, because this is the
+                    // stream a session is likeliest to have: every participant
+                    // watches a namespace to learn who else is in the room,
+                    // whether or not it publishes or subscribes to anything.
+                    Ok(Some(frame)) if frame.message_type == MessageType::RequestUpdate => {
+                        if let Err(e) = self.renew_credential(&frame) {
+                            break Err(e);
+                        }
+                    }
                     Ok(Some(_)) => break Err(SessionError::Protocol(
                         "unexpected message on a SUBSCRIBE_NAMESPACE stream",
                     )),
@@ -1482,12 +1780,13 @@ impl Session {
                 frame = frames.next() => match frame {
                     // How unsubscribe is spelled. There is no message for it.
                     Ok(None) => return Ok(()),
-                    // A subscriber may re-prioritise a subscription it holds.
-                    // Nothing here acts on priorities yet, and answering a hint
-                    // by tearing down the session it was sent on would be a
-                    // wildly disproportionate way to say so.
+                    // A subscriber may re-prioritise a subscription it holds, or
+                    // renew the session's credential. Nothing here acts on
+                    // priorities yet, and answering a hint by tearing down the
+                    // session it was sent on would be a wildly disproportionate
+                    // way to say so.
                     Ok(Some(frame)) if frame.message_type == MessageType::RequestUpdate => {
-                        tracing::trace!(session = %self.id, "subscription update ignored");
+                        self.renew_credential(&frame)?;
                     }
                     Ok(Some(_)) => return Err(SessionError::Protocol(
                         "unexpected message on a SUBSCRIBE stream",

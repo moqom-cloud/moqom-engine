@@ -867,12 +867,16 @@ fn state_of(presence: &Presence) -> pb::SessionState {
         backstage: presence.backstage,
         remote_address: presence.address.to_string(),
         opened_at: Some(presence.opened.into()),
-        // Deliberately unset. The field says the relay closes the session when
-        // the token expires, and this relay does not: a session is authorised at
-        // setup and runs until it ends. Sending an expiry would be a promise
-        // about behaviour that does not exist, and the control plane would have
-        // no way to tell.
-        token_expires_at: None,
+        // The deadline as it stands now, not as it stood at admission: a session
+        // that renews its token mid-call has this pushed out, and the next
+        // snapshot says so. Sending the original would be a promise the relay
+        // stopped keeping the moment the renewal landed.
+        //
+        // Unset on a relay holding no verification keys, which authorises
+        // everything and holds nobody to an expiry. That has to read as "no
+        // deadline" rather than as one in the past, or the control plane would
+        // expect every session on such a relay to be closed at once.
+        token_expires_at: presence.credential_expires().map(Into::into),
         arrived_via: presence.via.as_deref().unwrap_or_default().to_owned(),
     }
 }
@@ -956,7 +960,7 @@ mod tests {
     use super::*;
     use crate::fabric::Command;
     use crate::policy::{Refusal, Silence};
-    use crate::roster::Closes;
+    use crate::roster::{Arrival, Closes};
     use crate::scope::{Publish, Scope};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::Mutex;
@@ -1250,10 +1254,13 @@ mod tests {
             .admit(
                 fabric.next_session_id(),
                 &scope(user),
-                address(),
-                Some("bea".into()),
-                Arc::clone(&hangup) as Arc<dyn Closes>,
-                commands,
+                Arrival {
+                    address: address(),
+                    via: Some("bea".into()),
+                    transport: Arc::clone(&hangup) as Arc<dyn Closes>,
+                    commands,
+                    credential: tokio::sync::watch::channel(None).1,
+                },
             )
             .expect("a session in a room");
         hangup
@@ -1340,6 +1347,44 @@ mod tests {
 
         // And the relay now believes it is supervised.
         assert!(fabric.policy().supervised());
+    }
+
+    /// The control plane is told when a session will be closed for want of a
+    /// credential, and a renewal moves that. Reporting the deadline as it stood
+    /// at admission would be right until the first renewal and a lie afterwards
+    /// — and the lie is the expensive direction, since it would have the control
+    /// plane expect a place to free up while the call is still going.
+    #[test]
+    fn the_reported_expiry_follows_a_renewal() {
+        let fabric = Fabric::new();
+        let (commands, _queue) = mpsc::channel(16);
+        let (deadline, watcher) = tokio::sync::watch::channel(None);
+        let presence = fabric
+            .roster()
+            .admit(
+                fabric.next_session_id(),
+                &scope("ada"),
+                Arrival {
+                    address: address(),
+                    via: None,
+                    transport: Arc::new(Hangup::default()) as Arc<dyn Closes>,
+                    commands,
+                    credential: watcher,
+                },
+            )
+            .expect("a session in a room");
+
+        // Nothing to enforce reads as no deadline rather than as one already
+        // past: a relay holding no keys closes nobody.
+        assert_eq!(state_of(&presence).token_expires_at, None);
+
+        let until = SystemTime::now() + Duration::from_mins(10);
+        deadline.send_replace(Some(until));
+        assert_eq!(
+            state_of(&presence).token_expires_at,
+            Some(until.into()),
+            "the report is stuck on the deadline the session started with"
+        );
     }
 
     #[tokio::test]

@@ -31,6 +31,11 @@
 //!   address, which is a much smaller allowance.
 //! - `MOQOM_RELAY_ISSUER` — the issuer tokens must name. Unset accepts any,
 //!   which is for tests.
+//! - `MOQOM_RELAY_POSSESSION` — whether a session must prove that the credential
+//!   it presents is its own: `required`, `observed` (the default) or `bearer`.
+//!   See [`possession`] for why the default is the middle one and not the strict
+//!   one. Without keys this decides nothing, since there is no token to be the
+//!   owner of.
 //! - `MOQOM_CONTROL_ENDPOINT` — the control plane's URL. Unset means no
 //!   moderation reaches this relay: it enforces what tokens say and nothing
 //!   else, which is the mode the benches run in and not one to expose.
@@ -76,6 +81,7 @@ use std::path::PathBuf;
 
 use base64::Engine as _;
 use moqom_relay::admin::Surface;
+use moqom_relay::possession::{Enforcement, Possession};
 use moqom_relay::{
     Authenticator, Cache, Fabric, Governor, Limits, Link, Metrics, Quotas, Session, Supervisor,
     VerificationKey,
@@ -107,7 +113,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| "[::]:4443".to_owned())
         .parse()?;
 
-    let tls = match (env_path("MOQOM_RELAY_CERT"), env_path("MOQOM_RELAY_KEY")) {
+    let (tls, identity) = match (env_path("MOQOM_RELAY_CERT"), env_path("MOQOM_RELAY_KEY")) {
         (Some(cert), Some(key)) => tls_from_pem(&cert, &key)?,
         (None, None) => {
             let names: Vec<String> = env("MOQOM_RELAY_NAMES")
@@ -115,9 +121,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .split(',')
                 .map(str::to_owned)
                 .collect();
-            let (tls, hash) = self_signed(&names)?;
+            let (tls, hash, identity) = self_signed(&names)?;
             println!("certificate-hash: {hash}");
-            tls
+            (tls, identity)
         }
         _ => {
             return Err(
@@ -160,7 +166,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let fabric = Fabric::observed(Cache::new(limits), metrics.clone())
         .governed(governor()?)
-        .authenticated(authenticator()?);
+        .authenticated(authenticator()?)
+        .proving(possession(identity)?);
     // Held for the life of the process; dropping it detaches. Before the accept
     // loop so that a relay restarting into a room with a ban in force learns
     // about it in the same second rather than after somebody rejoins.
@@ -428,18 +435,57 @@ fn env_path(key: &str) -> Option<PathBuf> {
     env(key).map(PathBuf::from)
 }
 
+/// How strictly this relay holds a session to proving its credential is its own.
+///
+/// Defaults to [`Enforcement::Observed`], which verifies a proof when one arrives
+/// and admits a session that sends none. That is a deliberate middle: `required`
+/// is the destination and cannot be the default, because a relay is deployed
+/// before the clients that dial it are, and a default of `required` would mean
+/// every upgrade of this binary disconnected every client that had not been
+/// updated yet. `bearer` is what the relay did before proofs existed and is kept
+/// for a deployment that needs to get back there in a hurry.
+///
+/// Logged at startup either way, because "are credentials bearer tokens here" is
+/// not a question anybody should have to answer by reading the environment of a
+/// running container.
+fn possession(certificate: String) -> Result<Possession, Box<dyn std::error::Error>> {
+    let mode = match env("MOQOM_RELAY_POSSESSION") {
+        Some(name) => {
+            Enforcement::parse(&name).map_err(|e| format!("MOQOM_RELAY_POSSESSION: {e}"))?
+        }
+        None => Enforcement::default(),
+    };
+    match mode {
+        Enforcement::Required => {
+            tracing::info!("sessions must prove they hold the key their token names");
+        }
+        Enforcement::Observed => tracing::info!(
+            "checking proofs of possession where offered, admitting sessions without one"
+        ),
+        Enforcement::Bearer => {
+            tracing::warn!("tokens are bearer credentials: a stolen one works until it expires");
+        }
+    }
+    Ok(Possession::new(mode, Some(certificate)))
+}
+
 fn tls_from_pem(
     cert: &PathBuf,
     key: &PathBuf,
-) -> Result<rustls::ServerConfig, Box<dyn std::error::Error>> {
+) -> Result<(rustls::ServerConfig, String), Box<dyn std::error::Error>> {
     let certs = rustls_pemfile::certs(&mut io::BufReader::new(std::fs::File::open(cert)?))
         .collect::<Result<Vec<_>, _>>()?;
+    let leaf = certs.first().ok_or("no certificate in the cert file")?;
+    let identity = certificate_identity(leaf);
     let key = rustls_pemfile::private_key(&mut io::BufReader::new(std::fs::File::open(key)?))?
         .ok_or("no private key in the key file")?;
 
-    Ok(rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)?)
+    Ok((
+        rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)?,
+        identity,
+    ))
 }
 
 /// A certificate for `names`, and the hash a client pins it by.
@@ -450,7 +496,7 @@ fn tls_from_pem(
 /// a handshake that fails with no indication of which side is wrong.
 fn self_signed(
     names: &[String],
-) -> Result<(rustls::ServerConfig, String), Box<dyn std::error::Error>> {
+) -> Result<(rustls::ServerConfig, String, String), Box<dyn std::error::Error>> {
     let generated = rcgen::generate_simple_self_signed(names.to_vec())?;
     let der = generated.cert.der().clone();
     let key = rustls::pki_types::PrivateKeyDer::try_from(generated.signing_key.serialize_der())
@@ -458,9 +504,27 @@ fn self_signed(
 
     let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, der.as_ref());
     let hash = base64::engine::general_purpose::STANDARD.encode(digest.as_ref());
+    let identity = certificate_identity(&der);
 
     let tls = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![der], key)?;
-    Ok((tls, hash))
+    Ok((tls, hash, identity))
+}
+
+/// What a proof of possession names this relay by.
+///
+/// The same digest of the same bytes as the pinning hash above, in base64url with
+/// no padding rather than standard base64 — the spelling every other identifier in
+/// a token or a proof uses, and the reason the two lines differ. Which is worth
+/// saying out loud, because a value that looks like the one printed at startup but
+/// is not it invites somebody to paste the wrong one.
+///
+/// Nobody should have to: both sides compute this from the certificate itself
+/// rather than from configuration. A client takes the DER from the TLS handshake,
+/// whether or not it was pinning anything, so a relay given a certificate by a
+/// real authority is named here exactly as reliably as a self-signed one.
+fn certificate_identity(der: &rustls::pki_types::CertificateDer<'_>) -> String {
+    let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, der.as_ref());
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest.as_ref())
 }

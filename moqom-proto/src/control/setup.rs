@@ -41,6 +41,8 @@ use crate::varint::VarInt;
 /// carry bytes. The registry is consistent with that, so the value shape of an
 /// option is readable from its number.
 pub mod option_type {
+    use super::PRIVATE_USE;
+
     /// URI path, native QUIC only. Client only.
     pub const PATH: u64 = 0x01;
     /// One or more session authorization tokens. May repeat.
@@ -55,7 +57,46 @@ pub mod option_type {
     pub const MOQT_IMPLEMENTATION: u64 = 0x07;
     /// Unacknowledged `REQUEST_UPDATE`s allowed per stream. Default 0.
     pub const MAX_REQUEST_UPDATES: u64 = 0x08;
+
+    /// A proof that the sender holds the key its token is bound to. Not in any
+    /// draft registry: see [`super::PRIVATE_USE`].
+    ///
+    /// Odd, so it carries bytes, which is the parity rule and not a choice. The
+    /// value is a compact JWS the relay checks against the token's `cnf.jkt`;
+    /// without it a token is a bearer credential and works for whoever holds it.
+    pub const AUTHORIZATION_PROOF: u64 = PRIVATE_USE;
 }
+
+/// Where this implementation numbers an extension of its own.
+///
+/// `0x4D51` is "MQ", picked to be recognisable in a packet capture, and it is
+/// odd because the parity rule makes odd types the ones that carry bytes. It
+/// sits far above draft-19's assignments and outside the greasing sequence, so
+/// a future draft would have to travel a long way to collide with it.
+///
+/// Private use rather than an extension code point, because draft-19 has no
+/// registry for one and the alternative was worse. An unknown *option* must be
+/// ignored, which is exactly the behaviour wanted here: a peer that does not
+/// know about proofs skips this and is told by the relay's close reason why its
+/// session ended. Had this needed a new message type instead, the draft requires
+/// an unknown type to close the session, and a private extension would have been
+/// a code every other implementation must fail on.
+pub const PRIVATE_USE: u64 = 0x4D51;
+
+/// The three properties [`PRIVATE_USE`] must not lose, checked where losing one
+/// costs nothing to catch: the build.
+///
+/// None of them fails loudly at runtime. Wrong parity is a value read as the
+/// wrong shape, a collision with the greasing sequence is an option peers are
+/// entitled to discard, and a collision with a draft assignment is a proof
+/// parsed as something else — all three would present as an authentication
+/// failure a long way from the cause.
+const _: () = assert!(!PRIVATE_USE.is_multiple_of(2), "must carry bytes, so odd");
+const _: () = assert!(!is_grease(PRIVATE_USE), "greased options may be ignored");
+const _: () = assert!(
+    PRIVATE_USE > option_type::MAX_REQUEST_UPDATES,
+    "must sit above the draft's own assignments"
+);
 
 /// Base of the reserved greasing sequence, per draft-19 §14.
 const GREASE_BASE: u64 = 0x9D;
@@ -202,6 +243,19 @@ impl SetupOptions {
             .iter()
             .filter(|p| p.type_value() == option_type::AUTHORIZATION_TOKEN)
             .filter_map(Parameter::as_bytes)
+    }
+
+    /// The proof of possession, if the peer sent one.
+    ///
+    /// Singular where [`Self::authorization_tokens`] is plural, and the
+    /// asymmetry is deliberate. Tokens may repeat because a peer can offer
+    /// several and let the relay pick the one it can verify; a proof is bound to
+    /// one token, so a second would be a proof of something the relay is not
+    /// asking about. Where more than one arrives this yields the first, which is
+    /// the same rule [`Parameters::get`] applies everywhere else.
+    #[must_use]
+    pub fn authorization_proof(&self) -> Option<&Bytes> {
+        self.bytes_of(option_type::AUTHORIZATION_PROOF)
     }
 
     /// Auth token cache budget in bytes.
@@ -574,6 +628,33 @@ mod tests {
             assert!(!is_grease(t), "{t:#x}");
         }
         assert_eq!(grease(u64::MAX), None);
+    }
+
+    /// The number's own properties are asserted at compile time beside its
+    /// definition. What is left to check here is that it survives the wire, which
+    /// for a type this far above its neighbours is a question about delta
+    /// encoding rather than about the number.
+    #[test]
+    fn a_proof_rides_beside_the_token_it_belongs_to() {
+        let mut setup = Setup::new();
+        setup
+            .options
+            .set_bytes(option_type::AUTHORIZATION_TOKEN, &b"token"[..])
+            .unwrap();
+        setup
+            .options
+            .set_bytes(option_type::AUTHORIZATION_PROOF, &b"proof"[..])
+            .unwrap();
+        round_trip(&setup);
+        assert_eq!(
+            setup.options.authorization_proof().map(Bytes::as_ref),
+            Some(&b"proof"[..])
+        );
+        assert_eq!(
+            setup.options.authorization_tokens().count(),
+            1,
+            "the proof must not read as another token"
+        );
     }
 
     /// Greasing only proves anything if the grease actually rides the wire, so

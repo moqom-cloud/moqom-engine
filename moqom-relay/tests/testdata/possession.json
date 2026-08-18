@@ -1,0 +1,55 @@
+{
+  "keys" : [
+    {
+      "jwk" : {
+        "crv" : "P-256",
+        "kty" : "EC",
+        "x" : "MKBCTNIcKUSDii11ySs3526iDZ8AiTo7Tu6KPAqv7D4",
+        "y" : "4Etl6SRW2YiLUrN5vfvVHuhp7x8PxltmWWlbbM4IFyM"
+      },
+      "name" : "rfc 7517 §a.1, thumbprinted per rfc 7638",
+      "thumbprint" : "cn-I_WNMClehiVp51i_0VpOENW1upEerA8sEam5hn-s"
+    },
+    {
+      "jwk" : {
+        "crv" : "P-256",
+        "kty" : "EC",
+        "x" : "AFpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo",
+        "y" : "_xERERERERERERERERERERERERERERERERERERERERE"
+      },
+      "name" : "a coordinate whose first byte is zero",
+      "thumbprint" : "vatPg66Dje00I5LZ7uvrIyEOSBoO_x2Knl9QpAk5kEc"
+    },
+    {
+      "jwk" : {
+        "crv" : "P-256",
+        "kty" : "EC",
+        "x" : "_xERERERERERERERERERERERERERERERERERERERERE",
+        "y" : "AFpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo"
+      },
+      "name" : "a coordinate whose high bit is set",
+      "thumbprint" : "7aA6rL4nlzf7nBiad1MjqspCxrOV5LxBv1siU532QFk"
+    }
+  ],
+  "proofs" : [
+    {
+      "name" : "a short token",
+      "proof" : "eyJhbGciOiJFUzI1NiIsInR5cCI6Ik1PUVQtUE9QIiwiandrIjp7ImNydiI6IlAtMjU2Iiwia3R5IjoiRUMiLCJ4IjoiSGhoVEw5UjFUQUx6QkIyY2RjNnpPNFBfMkJySHprX29nc3l4eVl2RmlXNCIsInkiOiJwR3d4SEU0djlBM1phalpUNXVSVVJkTXRfa2h1enRkY2VwREdvWWlCd0tNIn19.eyJhdGgiOiJycHBYMXpLNlk5Q0Q0YU1KTXNzYnZyUFN2WThYVEc1NFJCTUNRdGQ0ZWxZIiwianRpIjoiU0xfbGw5MHJCbzRTajhRWWwwbjNHUSIsInJlbCI6ImNHbHVkR2hwYzNKbGJHRjVjMk5sY25ScFptbGpZWFJsYUdGemFBIn0._3y7tB87Kxll2xYZbTqspGPViyidjcIG7n-pVqa9TEO7K2orq9dHcASW2npIDuL8fWNZ1UzSDwofAjoo30TaAA",
+      "thumbprint" : "gWjt7nmB1udyFpLYVp0SxJnI8lJEvl7q8AFYZRqnGV8",
+      "token" : "a.token"
+    },
+    {
+      "name" : "a token shaped like the compact jws it is",
+      "proof" : "eyJhbGciOiJFUzI1NiIsInR5cCI6Ik1PUVQtUE9QIiwiandrIjp7ImNydiI6IlAtMjU2Iiwia3R5IjoiRUMiLCJ4IjoiSGhoVEw5UjFUQUx6QkIyY2RjNnpPNFBfMkJySHprX29nc3l4eVl2RmlXNCIsInkiOiJwR3d4SEU0djlBM1phalpUNXVSVVJkTXRfa2h1enRkY2VwREdvWWlCd0tNIn19.eyJhdGgiOiJkVTBqSXd4dWtGVURsckZGVDFaaTc2Ulg4Q3BZZ2dPYUhrTFdmaVFDcGpZIiwianRpIjoiQVNoRGpBZ1VBVk9KODZiNGxzNGdSdyIsInJlbCI6ImNHbHVkR2hwYzNKbGJHRjVjMk5sY25ScFptbGpZWFJsYUdGemFBIn0.hhgDKxtC0KiRxD7KcYV8dD-vlMc4z9ymTxkXOQzDyNpHv9CJnQK-0DvNSlIeVIkUo1c0Hc8JiJPPMV5WZPR1ZQ",
+      "thumbprint" : "gWjt7nmB1udyFpLYVp0SxJnI8lJEvl7q8AFYZRqnGV8",
+      "token" : "eyJhbGciOiJFZERTQSIsImtpZCI6ImZpeHR1cmUifQ.eyJpc3MiOiJodHRwczovL2FwaS5tb3FvbS5jbG91ZCJ9.c2lnbmF0dXJlLWJ5dGVzLXdoaWNoLW5vdGhpbmctaGVyZS12ZXJpZmllcw"
+    },
+    {
+      "name" : "a second proof over the first token",
+      "proof" : "eyJhbGciOiJFUzI1NiIsInR5cCI6Ik1PUVQtUE9QIiwiandrIjp7ImNydiI6IlAtMjU2Iiwia3R5IjoiRUMiLCJ4IjoiSGhoVEw5UjFUQUx6QkIyY2RjNnpPNFBfMkJySHprX29nc3l4eVl2RmlXNCIsInkiOiJwR3d4SEU0djlBM1phalpUNXVSVVJkTXRfa2h1enRkY2VwREdvWWlCd0tNIn19.eyJhdGgiOiJycHBYMXpLNlk5Q0Q0YU1KTXNzYnZyUFN2WThYVEc1NFJCTUNRdGQ0ZWxZIiwianRpIjoiVS1QNzVQRzVpUXJ4XzVnY0hQYThydyIsInJlbCI6ImNHbHVkR2hwYzNKbGJHRjVjMk5sY25ScFptbGpZWFJsYUdGemFBIn0.KYQs_wI8sO3VAdYwaIx1GXOS7vg9AFAOOqq9yRyupFM9gcxlEgh33U9pAiwPWLctuwCslNpMmYCFVWAeSvVlEA",
+      "thumbprint" : "gWjt7nmB1udyFpLYVp0SxJnI8lJEvl7q8AFYZRqnGV8",
+      "token" : "a.token"
+    }
+  ],
+  "relay" : "cGludGhpc3JlbGF5c2NlcnRpZmljYXRlaGFzaA"
+}

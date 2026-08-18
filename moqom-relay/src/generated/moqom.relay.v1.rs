@@ -127,6 +127,11 @@ pub struct SessionState {
     pub opened_at: ::core::option::Option<::prost_types::Timestamp>,
     /// When the session's token expires. The relay closes the session then unless
     /// it has been revalidated.
+    ///
+    /// Moves when the session presents a fresh token mid-call, so this is the
+    /// deadline as of the message carrying it rather than the one the session was
+    /// admitted on. Unset means there is nothing to enforce, which is a relay
+    /// holding no verification keys — not a session that has already lapsed.
     #[prost(message, optional, tag = "9")]
     pub token_expires_at: ::core::option::Option<::prost_types::Timestamp>,
     /// The username whose following this session came in through, from the token's
