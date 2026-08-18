@@ -715,7 +715,7 @@ impl Admission {
 
     /// The instant a session admitted on this credential must be closed.
     ///
-    /// [`Self::expires`] plus the same [`CLOCK_SKEW`] the verifier allows, and
+    /// [`Self::expires`] plus the same `CLOCK_SKEW` the verifier allows, and
     /// the tolerance is not optional. Admission accepts a token up to that far
     /// past its `exp`, so enforcing the bare claim would close a session the
     /// handshake had just let in — and the symptom would be a client that

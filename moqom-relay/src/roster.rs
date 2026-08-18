@@ -12,7 +12,7 @@
 //! The second is ejection. A ban is a row in somebody's database until a
 //! connection closes, and closing it means reaching a session from outside its
 //! own task. Nothing else here can: a session is otherwise reachable only by
-//! [`Command`](crate::fabric::Command) on a channel it drains itself, which is
+//! [`Command`] on a channel it drains itself, which is
 //! exactly the wrong mechanism for "stop draining that channel".
 //!
 //! # Why this holds a transport handle when the metrics deliberately do not

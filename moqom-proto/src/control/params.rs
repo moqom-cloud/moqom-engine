@@ -322,13 +322,13 @@ impl Parameters {
 
     /// Every authorization token carried here, in the order sent.
     ///
-    /// The counterpart of [`setup::Options::authorization_tokens`], for the
-    /// request parameter registry rather than the setup option one. Draft-19
-    /// keeps those registries separate and assigns the same value in both, which
-    /// is convenient and worth naming rather than relying on: see
+    /// The counterpart of [`SetupOptions::authorization_tokens`], for the request
+    /// parameter registry rather than the setup option one. Draft-19 keeps those
+    /// registries separate and assigns the same value in both, which is
+    /// convenient and worth naming rather than relying on: see
     /// [`param_type::AUTHORIZATION_TOKEN`].
     ///
-    /// [`setup::Options::authorization_tokens`]: crate::control::setup::Options::authorization_tokens
+    /// [`SetupOptions::authorization_tokens`]: crate::control::setup::SetupOptions::authorization_tokens
     pub fn authorization_tokens(&self) -> impl Iterator<Item = &Bytes> {
         self.0
             .iter()

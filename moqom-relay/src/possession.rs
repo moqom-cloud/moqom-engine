@@ -287,7 +287,7 @@ impl Possession {
     ///
     /// `certificate` is the SHA-256 of the relay's certificate in base64url, the
     /// same digest the client pins. `None` disables the relay binding; see the
-    /// field note on [`Self::relay`].
+    /// note on the `relay` field.
     #[must_use]
     pub fn new(mode: Enforcement, certificate: Option<String>) -> Self {
         Self {

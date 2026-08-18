@@ -33,7 +33,7 @@ jobs:
       - name: Install nightly
         run: rustup toolchain install nightly --profile minimal
 
-      - uses: Swatinem/rust-cache@v2
+      # No rust-cache: see the note in ci.yml's Rust job.
 
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked

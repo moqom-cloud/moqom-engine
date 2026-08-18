@@ -40,8 +40,13 @@ jobs:
       - name: Show toolchain
         run: rustc --version && cargo --version
 
-      - uses: Swatinem/rust-cache@v2
-
+      # No rust-cache here, and its absence is deliberate now that the runner is
+      # a machine somebody works on. It earns its keep on a hosted runner that
+      # starts empty and is destroyed; this one keeps its target directory and
+      # its registry between runs anyway, so the action's only remaining effect
+      # is that it prunes ~/.cargo/bin to what it restored -- which deleted the
+      # rustup binary and cargo-fuzz out from under the person using the Mac, and
+      # left every shim in that directory a dangling symlink.
       - name: Format
         run: cargo fmt --all --check
 
@@ -69,8 +74,8 @@ jobs:
       - name: Install nightly
         run: rustup toolchain install nightly --profile minimal
 
-      - uses: Swatinem/rust-cache@v2
-
+      # See the note in the Rust job: the action prunes ~/.cargo/bin, which on
+      # this runner is somebody's own.
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
 
