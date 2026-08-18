@@ -13,10 +13,25 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
 
+# Every job here runs on a Mac we own rather than on ubuntu-latest, and it is not
+# because macOS is the better host for this. GitHub stopped dispatching jobs
+# altogether: each one fails in about three seconds with no runner assigned, no
+# steps and no log, and the only place the reason appears is the check
+# annotation -- "The job was not started because recent account payments have
+# failed or your spending limit needs to be increased". That is the account, not
+# the monthly allowance, so it did not clear when August began, and nothing in
+# this repository has been checked since 28 July.
+#
+# The compromise to keep in view: Linux is what the relay is deployed on, and
+# this now tests it on Darwin. Everything here passes on both -- fmt, clippy, the
+# whole test suite, and the vendored-quinn check were run on this machine before
+# the switch -- but a Linux-only regression is now something CI cannot see, and
+# quinn-udp is precisely the sort of code that has a different path per platform.
+# Worth reverting the moment the billing block is lifted.
 jobs:
   rust:
     name: Rust
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, macOS, ARM64]
     steps:
       - uses: actions/checkout@v7
 
@@ -47,7 +62,7 @@ jobs:
   # because the corpus is seeded first.
   fuzz-smoke:
     name: Fuzz (smoke)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, macOS, ARM64]
     steps:
       - uses: actions/checkout@v7
 
@@ -82,7 +97,7 @@ jobs:
   # checked rather than trusted.
   vendor:
     name: Vendored quinn
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, macOS, ARM64]
     steps:
       - uses: actions/checkout@v7
       - name: Verify
@@ -97,7 +112,7 @@ jobs:
   # GITHUB_TOKEN cannot stand in for it, being scoped to this repository alone.
   tokens:
     name: Token fixture
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, macOS, ARM64]
     steps:
       - uses: actions/checkout@v7
         with:

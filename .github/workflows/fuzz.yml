@@ -18,7 +18,11 @@ env:
 jobs:
   fuzz:
     name: Fuzz ${{ matrix.target }}
-    runs-on: ubuntu-latest
+    # The same machine and the same reason as ci.yml, which explains it. Checked
+    # rather than assumed portable: cargo-fuzz builds and runs on
+    # aarch64-apple-darwin, and a 15-second run of the decoders target managed
+    # 290,000 executions there before this was switched over.
+    runs-on: [self-hosted, macOS, ARM64]
     strategy:
       fail-fast: false
       matrix:
