@@ -123,6 +123,19 @@ jobs:
         with:
           path: moqom-engine
 
+      # Without this the checkout below fails with "Input required and not
+      # supplied: token", which names neither the secret nor the reason. Failing
+      # rather than skipping is deliberate: a cross-language check that skips
+      # itself reports the same green as one that ran.
+      - name: Check that the cross-repository token is present
+        env:
+          MOQOM_REPO_TOKEN: ${{ secrets.MOQOM_REPO_TOKEN }}
+        run: |
+          if [[ -z "${MOQOM_REPO_TOKEN:-}" ]]; then
+            echo "::error::MOQOM_REPO_TOKEN is not set, so moqom-cloud/moqom cannot be cloned and the fixture cannot be re-minted. It needs to be an organisation secret (or a secret on this repository) holding a token with read access to moqom-cloud."
+            exit 1
+          fi
+
       - uses: actions/checkout@v7
         with:
           repository: moqom-cloud/moqom
