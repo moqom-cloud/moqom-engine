@@ -1032,6 +1032,7 @@ dependencies = [
 name = "moqom-cli"
 version = "0.0.0"
 dependencies = [
+ "bytes",
  "clap",
  "moqom-client",
  "tokio",

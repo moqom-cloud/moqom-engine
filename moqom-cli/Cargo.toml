@@ -15,8 +15,19 @@ path = "src/main.rs"
 
 [dependencies]
 moqom-client = { path = "../moqom-client" }
+bytes = { workspace = true }
 clap = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util", "io-std"] }
+# `time` paces a file at its frame rate, and `signal` is what lets a subscriber
+# writing a file be stopped with C-c and still have a playable one.
+tokio = { workspace = true, features = [
+  "rt-multi-thread",
+  "macros",
+  "io-util",
+  "io-std",
+  "time",
+  "signal",
+  "fs",
+] }
 
 [lints]
 workspace = true
