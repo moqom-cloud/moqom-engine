@@ -13,11 +13,15 @@
 #![forbid(unsafe_code)]
 
 mod error;
+pub mod properties;
 mod session;
 pub mod tls;
 
 pub use error::Error;
-pub use session::{Announcement, Object, Session, Subscription};
+pub use properties::ObjectProperties;
+pub use session::{
+    Announcement, GroupWriter, Metadata, Object, OutgoingObject, Session, Subscription,
+};
 
 pub use bytes::Bytes;
 pub use moqom_proto::model::{FullTrackName, GroupId, NameError, TrackAlias, TrackNamespace};

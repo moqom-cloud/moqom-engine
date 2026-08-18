@@ -20,6 +20,7 @@ use tokio::sync::{mpsc, watch};
 use web_transport_quinn::{RecvStream, SendStream};
 
 use crate::Error;
+use crate::properties::ObjectProperties;
 use crate::tls::{apply_alpn, install_crypto_provider};
 
 /// One object delivered on a subscription.
@@ -31,6 +32,44 @@ pub struct Object {
     pub object: u64,
     /// Payload bytes. Empty is a legal normal object.
     pub payload: Bytes,
+    /// What the publisher said about this object, and the reason a subscriber can
+    /// measure latency: the capture time is on the object rather than inferred
+    /// from arrival order.
+    pub properties: ObjectProperties,
+}
+
+/// One object to publish: a payload, and what to say about it.
+///
+/// Separate from [`Object`] because the two are not the same thing in either
+/// direction — this borrows its payload, since a publisher already has the bytes
+/// somewhere, and it has no object ID, those being assigned by position within
+/// the group.
+#[derive(Debug, Clone, Default)]
+pub struct OutgoingObject<'a> {
+    /// The bytes to send.
+    pub payload: &'a [u8],
+    /// What to say about them.
+    pub properties: ObjectProperties,
+}
+
+impl<'a> OutgoingObject<'a> {
+    /// A payload with nothing said about it.
+    #[must_use]
+    pub fn new(payload: &'a [u8]) -> Self {
+        Self {
+            payload,
+            properties: ObjectProperties::default(),
+        }
+    }
+
+    /// A payload tagged with the properties given.
+    #[must_use]
+    pub const fn tagged(payload: &'a [u8], properties: ObjectProperties) -> Self {
+        Self {
+            payload,
+            properties,
+        }
+    }
 }
 
 /// A live subscription. Dropping it cancels the subscription.
@@ -260,21 +299,178 @@ impl Session {
         group: u64,
         payloads: &[&[u8]],
     ) -> Result<(), Error> {
+        let objects: Vec<OutgoingObject<'_>> =
+            payloads.iter().copied().map(OutgoingObject::new).collect();
+        self.publish_objects(alias, group, &objects).await
+    }
+
+    /// Write one subgroup into `group`, with what to say about each object.
+    ///
+    /// This is what a media publisher wants and [`Self::publish_group`] cannot
+    /// express: a frame's capture time and temporal layer travel as object
+    /// properties, so a viewer can measure end-to-end latency and a relay can
+    /// drop an enhancement layer without decoding anything. See
+    /// [`crate::properties`] for the codes.
+    ///
+    /// `properties_present` is declared on the header only when something is
+    /// actually said, because the flag changes the stream's type code: setting it
+    /// unconditionally would put every publisher on a wire format that costs a
+    /// length prefix per object to carry nothing.
+    ///
+    /// # Errors
+    /// Opening the data stream, encoding the subgroup, or writing it.
+    pub async fn publish_objects(
+        &self,
+        alias: TrackAlias,
+        group: u64,
+        objects: &[OutgoingObject<'_>],
+    ) -> Result<(), Error> {
         let group = GroupId::new(VarInt::new(group)?);
         let mut stream = self.transport.open_uni().await?;
-        let header = SubgroupHeader::new(alias, group, SubgroupSource::Zero);
+        let mut header = SubgroupHeader::new(alias, group, SubgroupSource::Zero);
+        header.properties_present = objects.iter().any(|object| !object.properties.is_empty());
 
         let mut buf = BytesMut::new();
         header.encode(&mut buf);
         let mut writer = SubgroupWriter::new(&header);
-        for (index, payload) in payloads.iter().enumerate() {
-            let object = SubgroupObject::new(index as u32, Bytes::copy_from_slice(payload));
-            writer.write(&mut buf, &object)?;
+        for (index, object) in objects.iter().enumerate() {
+            let payload = Bytes::copy_from_slice(object.payload);
+            let encoded = if header.properties_present {
+                SubgroupObject {
+                    object: (index as u32).into(),
+                    content: SubgroupContent::Normal {
+                        payload,
+                        properties: object.properties.to_wire(),
+                    },
+                }
+            } else {
+                SubgroupObject::new(index as u32, payload)
+            };
+            writer.write(&mut buf, &encoded)?;
         }
 
         stream.write_all(&buf).await.map_err(Error::write)?;
         stream.finish().map_err(Error::write)?;
         Ok(())
+    }
+
+    /// Open a group and write objects into it as they arrive.
+    ///
+    /// [`Self::publish_objects`] takes a whole group at once, which a publisher
+    /// reading from a file or an encoder does not have: a group is a group of
+    /// pictures, so waiting to fill one delays its first frame by the entire
+    /// group. On a two-second GOP that is two seconds added to every frame, and
+    /// the capture times the objects carry would faithfully record it — measuring
+    /// the buffer rather than the network. Frames go out as they are produced
+    /// instead, which is also what the iOS publisher does.
+    ///
+    /// Whether objects carry properties is declared here because it is a flag on
+    /// the header, which goes out before the first object.
+    ///
+    /// # Errors
+    /// Opening the data stream, or writing the header.
+    pub async fn open_group(
+        &self,
+        alias: TrackAlias,
+        group: u64,
+        metadata: Metadata,
+    ) -> Result<GroupWriter, Error> {
+        let group = GroupId::new(VarInt::new(group)?);
+        let mut stream = self.transport.open_uni().await?;
+        let mut header = SubgroupHeader::new(alias, group, SubgroupSource::Zero);
+        header.properties_present = metadata == Metadata::Present;
+
+        let mut buf = BytesMut::new();
+        header.encode(&mut buf);
+        stream.write_all(&buf).await.map_err(Error::write)?;
+
+        Ok(GroupWriter {
+            writer: SubgroupWriter::new(&header),
+            properties_present: header.properties_present,
+            stream,
+            next: 0,
+        })
+    }
+}
+
+/// Whether the objects in a group will say anything about themselves.
+///
+/// Declared when the group is opened rather than inferred per object, since the
+/// flag is on the header. It is not free either way: present costs a length
+/// prefix on every object, so a publisher sending bytes should not ask for it,
+/// and a publisher sending frames cannot do without it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Metadata {
+    /// Objects may carry properties.
+    Present,
+    /// No object will, and the stream stays on the cheaper type code.
+    Absent,
+}
+
+/// A group being written one object at a time.
+///
+/// Object IDs are assigned by position, starting at zero, so the caller does not
+/// track them. Each object is flushed as it is written: a relay that parses as
+/// bytes arrive can forward a frame before the group is done, which is the point.
+///
+/// Dropping this without [`Self::finish`] resets the stream rather than closing
+/// it, so a group abandoned halfway is one a subscriber can tell was abandoned,
+/// instead of one that looks complete and is missing its end.
+pub struct GroupWriter {
+    stream: SendStream,
+    writer: SubgroupWriter,
+    properties_present: bool,
+    next: u32,
+}
+
+impl GroupWriter {
+    /// Append an object, and return the ID it was given.
+    ///
+    /// # Errors
+    /// Encoding the object, writing it, or stating properties in a group that
+    /// [`Metadata::Absent`] opened.
+    pub async fn write(&mut self, object: &OutgoingObject<'_>) -> Result<u64, Error> {
+        if !self.properties_present && !object.properties.is_empty() {
+            return Err(Error::PropertiesNotDeclared);
+        }
+
+        let id = self.next;
+        let payload = Bytes::copy_from_slice(object.payload);
+        let encoded = if self.properties_present {
+            SubgroupObject {
+                object: id.into(),
+                content: SubgroupContent::Normal {
+                    payload,
+                    properties: object.properties.to_wire(),
+                },
+            }
+        } else {
+            SubgroupObject::new(id, payload)
+        };
+
+        let mut buf = BytesMut::new();
+        self.writer.write(&mut buf, &encoded)?;
+        self.stream.write_all(&buf).await.map_err(Error::write)?;
+
+        self.next = self.next.saturating_add(1);
+        Ok(u64::from(id))
+    }
+
+    /// How many objects have been written.
+    #[must_use]
+    pub const fn written(&self) -> u64 {
+        self.next as u64
+    }
+
+    /// Close the group.
+    ///
+    /// Not optional. A stream left open leaves its last objects in flight at a
+    /// relay that parses as bytes arrive.
+    ///
+    /// # Errors
+    /// Finishing the underlying stream.
+    pub fn finish(mut self) -> Result<(), Error> {
+        self.stream.finish().map_err(Error::write)
     }
 }
 
@@ -399,8 +595,11 @@ async fn read_subgroup(mut recv: RecvStream, inbox: &Mutex<Inbox>) -> Result<(),
     loop {
         match next_object(&mut recv, &mut buffer, &mut reader).await {
             Ok(Some(object)) => {
-                let payload = match object.content {
-                    SubgroupContent::Normal { payload, .. } => payload,
+                let (payload, properties) = match object.content {
+                    SubgroupContent::Normal {
+                        payload,
+                        properties,
+                    } => (payload, ObjectProperties::from_wire(&properties)),
                     SubgroupContent::Terminal(_) => continue,
                 };
                 if tx
@@ -408,6 +607,7 @@ async fn read_subgroup(mut recv: RecvStream, inbox: &Mutex<Inbox>) -> Result<(),
                         group: header.group,
                         object: object.object.get(),
                         payload,
+                        properties,
                     }))
                     .await
                     .is_err()

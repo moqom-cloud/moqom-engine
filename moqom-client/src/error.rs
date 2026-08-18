@@ -78,6 +78,16 @@ pub enum Error {
     /// A subgroup could not be encoded.
     #[error("{0}")]
     Subgroup(#[from] SubgroupError),
+
+    /// An object carried properties into a group that was opened without them.
+    ///
+    /// Refused rather than dropped. Whether properties are present is a flag on
+    /// the subgroup header, so it is fixed before the first object and cannot be
+    /// revised; encoding the object anyway would discard exactly the capture time
+    /// a latency measurement is made of, and the measurement would come back
+    /// empty with nothing to say why.
+    #[error("this group was opened without properties, so an object cannot carry any")]
+    PropertiesNotDeclared,
 }
 
 impl Error {

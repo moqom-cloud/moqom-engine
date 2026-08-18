@@ -9,7 +9,9 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use bytes::Bytes;
-use moqom_client::{FullTrackName, Session, TrackNamespace};
+use moqom_client::{
+    FullTrackName, Metadata, ObjectProperties, OutgoingObject, Session, TrackNamespace,
+};
 use moqom_relay::{Cache, Fabric, Limits, Session as RelaySession};
 use moqom_transport::{Server, server::with_moqt_alpn};
 
@@ -144,4 +146,231 @@ async fn objects_round_trip_through_a_relay() {
     assert_eq!(&first.payload[..], b"first");
     assert_eq!(second.object, 1);
     assert_eq!(&second.payload[..], b"second");
+
+    // Nothing said, so nothing arrives: the header's properties_present flag is
+    // off for a publisher that only sends bytes, and an empty set on the far side
+    // is what proves it rather than a set of defaults.
+    assert!(first.properties.is_empty());
+}
+
+/// What a publisher says about each object arrives with it, through the relay.
+///
+/// The claim a latency measurement rests on. A capture time inferred from arrival
+/// order measures the receiver's scheduler; this one is the publisher's clock,
+/// carried on the object, and the relay forwards it without understanding it.
+#[tokio::test]
+async fn object_properties_survive_the_relay() {
+    let relay = Relay::start();
+    let tls = moqom_client::tls::pinned(relay.certificate.clone());
+
+    let mut publisher = within(
+        "publisher connect",
+        Session::connect(relay.addr, "localhost", tls.clone(), None),
+    )
+    .await
+    .expect("publisher connects");
+    let mut subscriber = within(
+        "subscriber connect",
+        Session::connect(relay.addr, "localhost", tls, None),
+    )
+    .await
+    .expect("subscriber connects");
+
+    let namespace = TrackNamespace::from_parts(["acme", "room-42"]).expect("a valid namespace");
+    let track = FullTrackName::new(namespace.clone(), Bytes::from_static(b"video"))
+        .expect("a valid track name");
+
+    let announcement = within("announce", publisher.announce(namespace))
+        .await
+        .expect("the relay accepts the announcement");
+    within("the announcement to register", async {
+        while relay.fabric.namespaces().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    let mut subscription = within("subscribe", subscriber.subscribe(track))
+        .await
+        .expect("the relay accepts the subscription");
+    within("the relay to pull the publisher", announcement.subscribed()).await;
+
+    // A keyframe and the frame after it, tagged the way a video publisher tags
+    // them: the group opener carries the parameter sets, both carry a capture
+    // time, and the second is on the enhancement layer a relay may drop.
+    let opener = ObjectProperties::default()
+        .captured_at_micros(1_000_000)
+        .opening(Bytes::from_static(b"sps/pps"));
+    let follower = ObjectProperties {
+        capture_time_micros: Some(1_033_333),
+        temporal_layer: Some(1),
+        ..ObjectProperties::default()
+    };
+    within(
+        "publish",
+        publisher.publish_objects(
+            announcement.alias(),
+            7,
+            &[
+                OutgoingObject::tagged(b"keyframe", opener.clone()),
+                OutgoingObject::tagged(b"delta", follower.clone()),
+            ],
+        ),
+    )
+    .await
+    .expect("the publisher writes a tagged subgroup");
+
+    let first = within("first object", subscription.next_object())
+        .await
+        .expect("the first object decodes")
+        .expect("the first object arrives");
+    let second = within("second object", subscription.next_object())
+        .await
+        .expect("the second object decodes")
+        .expect("the second object arrives");
+
+    assert_eq!(first.properties, opener);
+    assert_eq!(second.properties, follower);
+    assert_eq!(&first.payload[..], b"keyframe");
+    assert_eq!(&second.payload[..], b"delta");
+    assert_eq!(first.group.get(), 7);
+}
+
+/// A frame arrives before the group it is in has finished.
+///
+/// The whole reason [`Session::open_group`] exists. A group is a group of
+/// pictures, so a publisher that hands over a complete one has already held its
+/// keyframe for the length of a GOP -- and because the capture times ride on the
+/// objects, that delay would show up in the measurement as though the network had
+/// caused it. This asserts the frames come out one at a time, while the group is
+/// still open.
+#[tokio::test]
+async fn a_frame_arrives_before_its_group_is_finished() {
+    let relay = Relay::start();
+    let tls = moqom_client::tls::pinned(relay.certificate.clone());
+
+    let mut publisher = within(
+        "publisher connect",
+        Session::connect(relay.addr, "localhost", tls.clone(), None),
+    )
+    .await
+    .expect("publisher connects");
+    let mut subscriber = within(
+        "subscriber connect",
+        Session::connect(relay.addr, "localhost", tls, None),
+    )
+    .await
+    .expect("subscriber connects");
+
+    let namespace = TrackNamespace::from_parts(["acme", "room-42"]).expect("a valid namespace");
+    let track = FullTrackName::new(namespace.clone(), Bytes::from_static(b"video"))
+        .expect("a valid track name");
+
+    let announcement = within("announce", publisher.announce(namespace))
+        .await
+        .expect("the relay accepts the announcement");
+    within("the announcement to register", async {
+        while relay.fabric.namespaces().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    let mut subscription = within("subscribe", subscriber.subscribe(track))
+        .await
+        .expect("the relay accepts the subscription");
+    within("the relay to pull the publisher", announcement.subscribed()).await;
+
+    let mut group = within(
+        "open a group",
+        publisher.open_group(announcement.alias(), 3, Metadata::Present),
+    )
+    .await
+    .expect("the publisher opens a group");
+
+    let keyframe = ObjectProperties::default()
+        .captured_at_micros(500_000)
+        .opening(Bytes::from_static(b"vps/sps/pps"));
+    assert_eq!(
+        within(
+            "write the keyframe",
+            group.write(&OutgoingObject::tagged(b"keyframe", keyframe.clone())),
+        )
+        .await
+        .expect("the keyframe is written"),
+        0,
+        "object IDs come from position in the group"
+    );
+
+    // Nothing has finished the group, and the frame is expected anyway.
+    let first = within("the keyframe to arrive", subscription.next_object())
+        .await
+        .expect("the keyframe decodes")
+        .expect("the keyframe arrives while the group is open");
+    assert_eq!(&first.payload[..], b"keyframe");
+    assert_eq!(first.properties, keyframe);
+    assert_eq!(first.group.get(), 3);
+
+    let delta = ObjectProperties::default().captured_at_micros(533_333);
+    within(
+        "write the delta",
+        group.write(&OutgoingObject::tagged(b"delta", delta.clone())),
+    )
+    .await
+    .expect("the delta is written");
+
+    let second = within("the delta to arrive", subscription.next_object())
+        .await
+        .expect("the delta decodes")
+        .expect("the delta arrives while the group is open");
+    assert_eq!(&second.payload[..], b"delta");
+    assert_eq!(second.properties, delta);
+    assert_eq!(second.object, 1);
+
+    assert_eq!(group.written(), 2);
+    group.finish().expect("the group closes");
+}
+
+/// Whether properties are present is a header flag, so it is settled before the
+/// first object. Silently dropping them would leave a latency harness reporting
+/// nothing with no way to find out why.
+#[tokio::test]
+async fn a_group_opened_without_properties_refuses_a_tagged_object() {
+    let relay = Relay::start();
+    let tls = moqom_client::tls::pinned(relay.certificate.clone());
+
+    let mut publisher = within(
+        "publisher connect",
+        Session::connect(relay.addr, "localhost", tls, None),
+    )
+    .await
+    .expect("publisher connects");
+
+    let namespace = TrackNamespace::from_parts(["acme", "room-42"]).expect("a valid namespace");
+    let announcement = within("announce", publisher.announce(namespace))
+        .await
+        .expect("the relay accepts the announcement");
+
+    let mut group = within(
+        "open a group",
+        publisher.open_group(announcement.alias(), 0, Metadata::Absent),
+    )
+    .await
+    .expect("the publisher opens a group");
+
+    let error = group
+        .write(&OutgoingObject::tagged(
+            b"frame",
+            ObjectProperties::default().captured_at_micros(1),
+        ))
+        .await
+        .expect_err("a tagged object in an untagged group is refused");
+    assert!(matches!(error, moqom_client::Error::PropertiesNotDeclared));
+
+    // An untagged object on the same group is still fine.
+    within(
+        "write an untagged object",
+        group.write(&OutgoingObject::new(b"frame")),
+    )
+    .await
+    .expect("an untagged object is accepted");
+    group.finish().expect("the group closes");
 }
