@@ -39,10 +39,18 @@
 //!   an outage longer than the window is answered with the gap markers that say
 //!   so rather than with silence.
 //! - Subscribers are isolated from each other and shed rather than queue. Each
-//!   copy of a subgroup is written by its own task with a short bounded queue,
-//!   so a viewer that cannot keep up is abandoned for that subgroup — stream
-//!   reset, `moqom_relay_subgroups_shed_total` incremented — instead of holding
-//!   up the room or backing pressure up into the publisher's phone.
+//!   copy of a subgroup is written by its own task, and a viewer whose bytes have
+//!   been waiting longer than the latency budget is abandoned for that subgroup
+//!   — stream reset, `moqom_relay_subgroups_shed_total` incremented — instead of
+//!   holding up the room or backing pressure up into the publisher's phone.
+//!
+//!   The budget is a duration rather than a queue length, which is a distinction
+//!   worth stating because getting it wrong is a bug this had. A queue short
+//!   enough to double as a latency bound is also short enough to overflow when
+//!   the relay's own scheduler hesitates, and the relay then sheds a subscriber
+//!   whose connection was never the problem — worst exactly when the relay is
+//!   busiest, and every viewer asks for a lower rung on the strength of it.
+//!   Depth now bounds only memory.
 //!
 //!   What the relay does *not* do is choose a smaller rung on that viewer's
 //!   behalf. It cannot: the layers are the publisher's, the choice belongs to
