@@ -37,6 +37,22 @@ pub enum Error {
     #[error("the peer closed the stream before answering")]
     Closed,
 
+    /// The relay refused the session and said why as it closed.
+    ///
+    /// Distinct from [`Self::Refused`], which is one request being turned down on
+    /// a session that stands. This is the session itself, and the reason phrase is
+    /// the only thing that distinguishes the several ways it can happen -- an
+    /// unverifiable token, a missing proof, a proof from the wrong key, and a
+    /// credential that merely got old all arrive as the same error code, and the
+    /// right response to each differs.
+    #[error("the relay refused this session ({code}): {reason}")]
+    Rejected {
+        /// The MOQT session error code.
+        code: u64,
+        /// What the relay said as it closed.
+        reason: String,
+    },
+
     /// The peer answered SETUP with something else, or with an undecodable body.
     #[error("SETUP failed: {0}")]
     Setup(String),
@@ -88,6 +104,19 @@ pub enum Error {
     /// empty with nothing to say why.
     #[error("this group was opened without properties, so an object cannot carry any")]
     PropertiesNotDeclared,
+
+    /// A device key was offered, but the relay presented no certificate to bind
+    /// the proof to.
+    ///
+    /// Not reachable over a raw QUIC handshake, which cannot complete without one.
+    /// Refused rather than proven against an empty identity, since that proof
+    /// would be refused by every relay for a reason nothing here would explain.
+    #[error("the relay presented no certificate, so a proof cannot be bound to it")]
+    NoRelayIdentity,
+
+    /// The device key could not sign.
+    #[error("{0}")]
+    DeviceKey(#[from] crate::device::DeviceKeyError),
 }
 
 impl Error {

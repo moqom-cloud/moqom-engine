@@ -20,6 +20,7 @@ use tokio::sync::{mpsc, watch};
 use web_transport_quinn::{RecvStream, SendStream};
 
 use crate::Error;
+use crate::device::{Credentials, certificate_identity};
 use crate::properties::ObjectProperties;
 use crate::tls::{apply_alpn, install_crypto_provider};
 
@@ -125,17 +126,28 @@ impl Session {
     /// Connect to `addr` over raw QUIC and exchange SETUP.
     ///
     /// `server_name` is the SNI and the name verified against the certificate,
-    /// unless `tls` skips verification. `token`, when present, is sent as
-    /// `AUTHORIZATION_TOKEN`. The `moqt-19` ALPN is set on `tls` here, so a
-    /// caller cannot accidentally complete a handshake that is not MOQT.
+    /// unless `tls` skips verification. The `moqt-19` ALPN is set on `tls` here, so
+    /// a caller cannot accidentally complete a handshake that is not MOQT.
+    ///
+    /// `credentials`, when present, are sent as `AUTHORIZATION_TOKEN`, and as
+    /// `AUTHORIZATION_PROOF` when they carry a device key. The proof can only be
+    /// made here and not by the caller: it commits to the relay's certificate,
+    /// which is not known until the handshake this function performs has completed.
+    ///
+    /// A key that cannot sign is a hard failure rather than a session that
+    /// silently falls back to bearer. A caller that supplied one asked to be
+    /// identified by it, and a relay running as `observed` would admit the
+    /// fallback -- so the mistake would surface as an authorisation that quietly
+    /// stopped meaning what it says.
     ///
     /// # Errors
-    /// Binding, the handshake, or a SETUP the peer refuses or mis-encodes.
+    /// Binding, the handshake, signing the proof, or a SETUP the peer refuses or
+    /// mis-encodes.
     pub async fn connect(
         addr: SocketAddr,
         server_name: &str,
         mut tls: rustls::ClientConfig,
-        token: Option<&[u8]>,
+        credentials: Option<&Credentials<'_>>,
     ) -> Result<Self, Error> {
         install_crypto_provider();
         apply_alpn(&mut tls);
@@ -145,6 +157,11 @@ impl Session {
         endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(crypto)));
 
         let connection = endpoint.connect(addr, server_name)?.await?;
+        let relay = relay_identity(&connection);
+        // Kept past the move below, because how a relay refuses a session is by
+        // closing the connection, and the reason it gives is on the connection
+        // rather than on any stream.
+        let quic = connection.clone();
         let transport = moqom_transport::Session::raw(
             connection,
             web_transport_quinn::proto::ConnectRequest::new(placeholder_url()),
@@ -159,18 +176,39 @@ impl Session {
                 IMPLEMENTATION,
             )
             .map_err(Error::setup)?;
-        if let Some(token) = token {
+        if let Some(credentials) = credentials {
             ours.options
                 .set_bytes(
                     moqom_proto::control::setup::option_type::AUTHORIZATION_TOKEN,
-                    Bytes::copy_from_slice(token),
+                    Bytes::copy_from_slice(credentials.token),
                 )
                 .map_err(Error::setup)?;
+
+            if let Some(key) = credentials.key {
+                // No certificate means the peer presented none, which for a raw
+                // QUIC handshake it cannot have done. Proving against an empty
+                // identity would produce a proof every relay refuses, so this says
+                // so instead.
+                let relay = relay.ok_or(Error::NoRelayIdentity)?;
+                let proof = key.prove(credentials.token, &relay)?;
+                ours.options
+                    .set_bytes(
+                        moqom_proto::control::setup::option_type::AUTHORIZATION_PROOF,
+                        Bytes::from(proof),
+                    )
+                    .map_err(Error::setup)?;
+            }
         }
         write(&mut send, &ours).await?;
 
         let mut frames = Frames::new(recv);
-        let frame = frames.next().await?.ok_or(Error::Closed)?;
+        // Nothing coming back is what a refusal looks like from here: the relay
+        // decides on the credentials in the SETUP it has just read and closes
+        // instead of answering. Asking the connection why turns "the peer closed
+        // the stream" into the sentence the relay actually wrote.
+        let Some(frame) = frames.next().await? else {
+            return Err(rejection(&quic).await);
+        };
         if frame.message_type != MessageType::Setup {
             return Err(Error::Unexpected {
                 found: frame.message_type,
@@ -391,6 +429,44 @@ impl Session {
             next: 0,
         })
     }
+}
+
+/// Why the relay closed, as an error worth showing somebody.
+///
+/// Bounded, and the bound is the point rather than caution: a peer that closed only
+/// the stream will never close the connection, so waiting for a reason that is not
+/// coming would hang instead of reporting the little that is known.
+async fn rejection(connection: &quinn::Connection) -> Error {
+    let waited = tokio::time::timeout(REJECTION_PATIENCE, connection.closed()).await;
+    match waited {
+        Ok(quinn::ConnectionError::ApplicationClosed(closed)) => Error::Rejected {
+            code: closed.error_code.into_inner(),
+            reason: String::from_utf8_lossy(&closed.reason).into_owned(),
+        },
+        // Closed by the transport rather than by the relay, or closed without
+        // saying anything. Neither has a sentence to quote.
+        Ok(_) | Err(_) => Error::Closed,
+    }
+}
+
+/// How long to wait for a closing relay to say why.
+///
+/// Short: the close frame is already in flight when the stream ends, so this is a
+/// bound on a wait that normally finishes immediately, not a retry window.
+const REJECTION_PATIENCE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The relay's identity for a proof's `rel` claim, from the completed handshake.
+///
+/// The leaf certificate, which is the first in the chain the peer presented. The
+/// relay hashes its own configured certificate the same way, so anything else here
+/// -- an intermediate, the whole chain, the public key alone -- produces a proof it
+/// refuses while looking entirely well-formed.
+fn relay_identity(connection: &quinn::Connection) -> Option<String> {
+    let identity = connection.peer_identity()?;
+    let chain = identity
+        .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+        .ok()?;
+    Some(certificate_identity(chain.first()?.as_ref()))
 }
 
 /// Whether the objects in a group will say anything about themselves.

@@ -12,11 +12,13 @@
 
 #![forbid(unsafe_code)]
 
+pub mod device;
 mod error;
 pub mod properties;
 mod session;
 pub mod tls;
 
+pub use device::{Credentials, DeviceKey, DeviceKeyError};
 pub use error::Error;
 pub use properties::ObjectProperties;
 pub use session::{

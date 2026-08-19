@@ -20,7 +20,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
 use moqom_client::{
-    FullTrackName, Metadata, Object, ObjectProperties, OutgoingObject, Session, TrackNamespace,
+    Credentials, DeviceKey, FullTrackName, Metadata, Object, ObjectProperties, OutgoingObject,
+    Session, TrackNamespace,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -43,6 +44,15 @@ enum Command {
     Subscribe(SubscribeArgs),
     /// Publish a video file, or each line of stdin.
     Publish(PublishArgs),
+    /// Print this machine's device thumbprint, creating its key if needed.
+    Identity(IdentityArgs),
+}
+
+#[derive(clap::Args)]
+struct IdentityArgs {
+    /// Where the device key lives.
+    #[arg(long, value_name = "PATH")]
+    key: PathBuf,
 }
 
 #[derive(clap::Args)]
@@ -59,6 +69,13 @@ struct Common {
     /// Path to a session token, sent as `AUTHORIZATION_TOKEN`.
     #[arg(long)]
     token: Option<PathBuf>,
+    /// Path to this machine's device key, used to prove the token is ours.
+    ///
+    /// A token minted against a device thumbprint is refused by a relay that
+    /// requires proof of possession unless the matching key signs for it. Create
+    /// one with `moqom identity`, which prints the thumbprint to mint against.
+    #[arg(long, value_name = "PATH", requires = "token")]
+    key: Option<PathBuf>,
     /// Skip certificate verification. For a self-signed development relay.
     #[arg(long)]
     insecure: bool,
@@ -132,6 +149,7 @@ async fn run() -> Fallible {
     match cli.command {
         Command::Subscribe(args) => subscribe(args).await,
         Command::Publish(args) => publish(args).await,
+        Command::Identity(args) => identity(&args),
     }
 }
 
@@ -436,16 +454,100 @@ async fn connect(common: &Common) -> Result<(Session, FullTrackName), Box<dyn st
     } else {
         moqom_client::tls::native()
     };
+
+    // Trimmed, because a token is almost always in a file some shell wrote and a
+    // trailing newline is a different token: the proof hashes these exact bytes,
+    // and the relay hashes what it received. The failure that avoids is a proof
+    // that verifies as a signature and is then rejected as being for some other
+    // token, which says nothing about a newline.
     let token = match &common.token {
-        Some(path) => Some(std::fs::read(path)?),
+        Some(path) => Some(std::fs::read(path).map(trimmed)?),
         None => None,
     };
-    let session = Session::connect(addr, &server_name, tls, token.as_deref()).await?;
+    let key = match &common.key {
+        Some(path) => Some(load_key(path)?),
+        None => None,
+    };
+
+    let credentials = token.as_deref().map(|token| match &key {
+        Some(key) => Credentials::proven(token, key),
+        None => Credentials::bearer(token),
+    });
+    let session = Session::connect(addr, &server_name, tls, credentials.as_ref()).await?;
     let track = FullTrackName::new(
         namespace(&common.namespace)?,
         common.name.as_bytes().to_vec().into(),
     )?;
     Ok((session, track))
+}
+
+/// Print the device thumbprint, creating the key if there is not one yet.
+///
+/// Whoever mints the token needs this value: it goes into the token's `cnf.jkt`,
+/// and a relay requiring proof of possession admits the session only if the key
+/// behind this thumbprint signs for it.
+fn identity(args: &IdentityArgs) -> Fallible {
+    let key = if args.key.exists() {
+        load_key(&args.key)?
+    } else {
+        let (key, pkcs8) = DeviceKey::generate()?;
+        write_private(&args.key, &pkcs8)?;
+        eprintln!("created a device key at {}", args.key.display());
+        key
+    };
+    println!("{}", key.thumbprint());
+    Ok(())
+}
+
+/// Load a device key, or say what to do about it not being there.
+///
+/// Deliberately not generating one here, though it would be one line. A key
+/// created on connect is a new device that no token names, and the relay would
+/// refuse the session for being the wrong device -- which is a true statement
+/// about a mistyped path and a very confusing one to read. Creating a key is
+/// something to ask for.
+fn load_key(path: &Path) -> Result<DeviceKey, Box<dyn std::error::Error>> {
+    let pkcs8 = std::fs::read(path).map_err(|error| {
+        format!(
+            "cannot read the device key at {}: {error}. Create one with `moqom identity --key {}`.",
+            path.display(),
+            path.display()
+        )
+    })?;
+    Ok(DeviceKey::from_pkcs8(&pkcs8)?)
+}
+
+/// Write a private key, readable only by its owner.
+///
+/// The mode is set as the file is created rather than after, so there is no window
+/// in which the key exists and is world-readable.
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    std::io::Write::write_all(&mut options.open(path)?, bytes)
+}
+
+/// A credential without the trailing whitespace a file or a shell added.
+fn trimmed(bytes: Vec<u8>) -> Vec<u8> {
+    let end = bytes
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map_or(0, |last| last + 1);
+    let mut bytes = bytes;
+    bytes.truncate(end);
+    bytes
 }
 
 fn namespace(spec: &str) -> Result<TrackNamespace, moqom_client::NameError> {
