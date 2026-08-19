@@ -31,6 +31,22 @@ fn room() -> (std::sync::Arc<str>, std::sync::Arc<str>) {
     ("acme".into(), "room-42".into())
 }
 
+/// Wait for an announcement to reach the fabric before subscribing to it.
+///
+/// Announcing and subscribing are two sessions racing through the relay, and
+/// without this the subscription can arrive while the track still has no
+/// publisher: the relay refuses it, asks the publisher for nothing, and the
+/// test waits out its patience for an upstream SUBSCRIBE that was never going
+/// to be sent.
+async fn registered(relay: &Relay) {
+    within("the announcement to register", async {
+        while relay.fabric.namespaces().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+}
+
 /// Wait for the roster to catch up with a handshake that has completed.
 async fn enrolled(relay: &Relay, count: usize) {
     within("the roster to record the session", async {
@@ -270,6 +286,7 @@ async fn a_force_mute_reaches_the_phone_and_stops_the_track() {
     let microphone = FullTrackName::new(slot, Bytes::from_static(b"audio")).expect("a track");
     // Held: dropping an announcement withdraws it.
     let _slot = ada.announce(&camera.namespace().clone()).await;
+    registered(&relay).await;
 
     // Before the mute: bea can watch the camera, and the relay pulls it.
     let watching = {

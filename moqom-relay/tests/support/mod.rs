@@ -31,6 +31,7 @@ use moqom_proto::error::DecodeError;
 use moqom_proto::model::{FullTrackName, GroupId, Location, TrackAlias, TrackNamespace};
 use moqom_relay::admin::Surface;
 use moqom_relay::possession::{Enforcement, Possession};
+use moqom_relay::session::RESET_SHED;
 use moqom_relay::{Authenticator, Cache, Fabric, Governor, Limits, Metrics, Quotas, Session};
 use moqom_transport::{Server, alpn, server::with_moqt_alpn};
 use web_transport_quinn::{RecvStream, SendStream};
@@ -827,11 +828,31 @@ impl Client {
     /// The distinction is the point of shedding: a reset stream tells the
     /// subscriber this subgroup is not coming, where a stream left to dangle
     /// would have it waiting for objects nobody intends to send.
+    ///
+    /// Deliberately never reads. Reading is what a subscriber that is keeping up
+    /// does, and it opens this connection's window as it goes — so a helper that
+    /// drained the stream would be describing a subscriber who took the bytes
+    /// and then asking why they were not delivered. The earlier version did
+    /// exactly that and passed only because the relay's queue was four chunks
+    /// deep, shallow enough to overflow before the read began.
     pub async fn subgroup_was_abandoned(&self) -> bool {
         let mut recv = within("a forwarded subgroup", self.session.accept_uni())
             .await
             .expect("the relay opens a data stream");
-        recv.read_to_end(1024 * 1024).await.is_err()
+
+        match within("the relay to give up on it", recv.received_reset()).await {
+            Ok(Some(code)) => {
+                assert_eq!(
+                    code, RESET_SHED,
+                    "an abandoned subgroup must be distinguishable from a fault"
+                );
+                true
+            }
+            // The stream finished, so every byte arrived: this subscriber was
+            // never behind enough to be shed.
+            Ok(None) => false,
+            Err(e) => panic!("the session failed instead of resetting the stream: {e}"),
+        }
     }
 
     /// Receive a track the relay offers without being asked, and read it.

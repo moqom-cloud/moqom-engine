@@ -34,7 +34,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use bytes::{Buf, Bytes, BytesMut};
 use moqom_proto::control::{
@@ -2772,24 +2772,46 @@ async fn read_header(frames: &mut Frames) -> Result<SubgroupHeader, SessionError
     }
 }
 
-/// How much of a subgroup may be waiting for one subscriber before the relay
-/// stops keeping it.
+/// How much of a subgroup may be held for one subscriber at once.
 ///
-/// Chunks, of at most eight kilobytes each, so a few tens of kilobytes at the
-/// outside. Small on purpose. The tempting alternative — a generous buffer per
-/// subscriber — turns a bandwidth problem into a latency problem and hides it:
-/// the pictures keep arriving, in order, later and later, and nothing in the
-/// system reports a fault. For live video, bytes that arrive after their moment
-/// are worse than bytes that never arrive, because the second kind at least
-/// lets the subscriber ask for a smaller rung and recover.
-const QUEUE_DEPTH: usize = 4;
+/// A bound on memory, and only on memory: chunks of at most eight kilobytes, so
+/// half a megabyte per copy in flight at the very outside. What keeps queueing
+/// from turning a bandwidth problem into a latency problem is [`SHED_AFTER`],
+/// not this number, so this one can afford to be generous enough to absorb a
+/// burst arriving faster than the writer is scheduled.
+///
+/// It was once four, which was small enough to be a latency bound in its own
+/// right — and that was the bug. A publisher on loopback delivers a subgroup in
+/// one burst, so four chunks meant a healthy subscriber was shed whenever its
+/// writer task lost the CPU for a moment. Depth is not evidence about a
+/// subscriber's connection; elapsed time is.
+const QUEUE_DEPTH: usize = 64;
+
+/// How long a subscriber may take nothing before the relay gives up on the
+/// subgroup for it.
+///
+/// The latency bound, and the reason a deep queue is safe. For live video,
+/// bytes that arrive after their moment are worse than bytes that never arrive,
+/// because the second kind at least lets the subscriber ask for a smaller rung
+/// and recover — so what has to be bounded is how late a picture may be, which
+/// is a duration and was previously being approximated by a count of chunks.
+///
+/// Generous next to a frame interval, and deliberately: it has to sit above the
+/// scheduling jitter of a loaded relay, or it would shed for the relay's own
+/// hesitation rather than for the subscriber's connection. Well under the point
+/// where a viewer would rather have the picture late than not at all.
+const SHED_AFTER: Duration = Duration::from_millis(250);
 
 /// What a shed subgroup's stream is reset with.
 ///
 /// The subscriber is told the stream was abandoned rather than left to infer it
 /// from a group that never completes. A dedicated code, so that "you were too
 /// slow for this frame" is distinguishable from a relay or publisher fault.
-const RESET_SHED: u32 = 0x02;
+///
+/// Public because it is part of what the relay says to its subscribers, and a
+/// test that asserted on its own copy of the number would not be checking the
+/// relay's answer.
+pub const RESET_SHED: u32 = 0x02;
 
 /// One subscriber's copy of one subgroup, and the task writing it.
 ///
@@ -2807,6 +2829,19 @@ struct Outlet {
     /// writer is typically blocked mid-write when that decision is made, and
     /// the point of the decision is not to wait for it.
     abandon: Arc<Notify>,
+    /// When the writer last got bytes as far as the transport, as milliseconds
+    /// after [`Outlet::opened`].
+    ///
+    /// The one fact [`Outlet::offer`] needs and cannot get from the queue: a
+    /// full queue says a subscriber is behind, but not whether it is behind
+    /// because its connection will not take the bytes or because the relay has
+    /// not had a chance to offer them yet. Only the first is the subscriber's
+    /// fault, and only the first is worth shedding a subgroup over.
+    wrote: Arc<AtomicU64>,
+    /// The instant `wrote` is measured from. An `Instant` is not something that
+    /// can live in an atomic, and a shared origin plus milliseconds is precise
+    /// enough for a quarter-second decision.
+    opened: Instant,
 }
 
 /// What became of a chunk offered to a subscriber.
@@ -2827,6 +2862,8 @@ impl Outlet {
     fn open(route: &Route, header: &SubgroupHeader, metrics: Metrics) -> Self {
         let (chunks, mut queue) = mpsc::channel(QUEUE_DEPTH);
         let abandon = Arc::new(Notify::new());
+        let wrote = Arc::new(AtomicU64::new(0));
+        let opened = Instant::now();
 
         // Counted at the decision rather than at the open, because this is the
         // point of no return for the subscriber: a stream shed later was still
@@ -2844,6 +2881,7 @@ impl Outlet {
             ..header.clone()
         };
         let abandoned = Arc::clone(&abandon);
+        let progress = Arc::clone(&wrote);
 
         tokio::spawn(async move {
             let Ok(mut stream) = session.open_uni().await else {
@@ -2856,6 +2894,11 @@ impl Outlet {
                 metrics.fanout_failed();
                 return;
             }
+            // Opening the stream and writing the header is the relay's own
+            // latency, so the clock the shed decision reads starts once that is
+            // done rather than at `open`. Otherwise a subscriber sitting at its
+            // stream limit would be charged for the wait.
+            note(&progress, opened);
 
             loop {
                 let chunk: Bytes = tokio::select! {
@@ -2878,26 +2921,77 @@ impl Outlet {
                 // behind a congestion window is the case this whole mechanism
                 // is for; cancelling a partial write costs nothing, since the
                 // stream is about to be reset.
+                //
+                // The deadline is here as well as in `Outlet::offer` because the
+                // two catch different moments. `offer` only runs when there is
+                // another chunk to hand over, so it cannot notice a subscriber
+                // that stalls on the last chunks of a subgroup — and a stall at
+                // the end of a group is the ordinary case, since a publisher
+                // sends a group and then stops. A write that has not completed
+                // inside the budget means this connection's window is full and
+                // the peer is not draining it, which is the definition of the
+                // subscriber this mechanism exists for.
                 let written = tokio::select! {
                     biased;
                     () = abandoned.notified() => break,
-                    written = stream.write_chunk(chunk) => written,
+                    written = tokio::time::timeout(SHED_AFTER, stream.write_chunk(chunk)) => written,
+                };
+                let Ok(written) = written else {
+                    // Counted here rather than left to `fan_out`, which will
+                    // never see this copy again: the queue is what it offers
+                    // to, and this task is about to stop reading it.
+                    metrics.subgroup_shed();
+                    break;
                 };
                 if written.is_err() {
                     metrics.fanout_failed();
                     return;
                 }
+                note(&progress, opened);
                 metrics.egress(length);
             }
 
             let _ = stream.reset(RESET_SHED);
         });
 
-        Self { chunks, abandon }
+        Self {
+            chunks,
+            abandon,
+            wrote,
+            opened,
+        }
+    }
+
+    /// How long since the writer last got bytes as far as the transport.
+    fn since_progress(&self) -> Duration {
+        let wrote = Duration::from_millis(self.wrote.load(Ordering::Relaxed));
+        self.opened.elapsed().saturating_sub(wrote)
+    }
+
+    /// How many chunks this subscriber has yet to take.
+    fn outstanding(&self) -> usize {
+        self.chunks.max_capacity() - self.chunks.capacity()
     }
 
     /// Hand this subscriber a chunk, or give up on the subgroup for it.
+    ///
+    /// Two reasons to give up, and they are different claims about the
+    /// subscriber. Bytes that have been waiting longer than [`SHED_AFTER`] are
+    /// late enough not to be worth delivering, whatever the queue looks like;
+    /// that is the one that fires in practice, and it fires while there is
+    /// still room, because a stalled writer stops taking chunks long before the
+    /// queue is full. A full queue is the second, and is only the memory bound
+    /// having been reached by a subscriber that is making progress but not
+    /// enough of it.
     fn offer(&self, chunk: Bytes) -> Handoff {
+        // Nothing outstanding means nothing is late: a track that sends a chunk
+        // every few frames leaves the writer idle between them, and an idle
+        // writer must not read as a stalled one.
+        if self.outstanding() > 0 && self.since_progress() > SHED_AFTER {
+            self.abandon.notify_one();
+            return Handoff::Shed;
+        }
+
         match self.chunks.try_send(chunk) {
             Ok(()) => Handoff::Taken,
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -2907,6 +3001,15 @@ impl Outlet {
             Err(mpsc::error::TrySendError::Closed(_)) => Handoff::Gone,
         }
     }
+}
+
+/// Record that the writer got somewhere, as milliseconds after `opened`.
+fn note(progress: &AtomicU64, opened: Instant) {
+    // Saturating, and no ordering stronger than relaxed: the reader is deciding
+    // whether a quarter of a second has passed, so a stale value costs one more
+    // chunk's grace and nothing else.
+    let millis = u64::try_from(opened.elapsed().as_millis()).unwrap_or(u64::MAX);
+    progress.store(millis, Ordering::Relaxed);
 }
 
 /// Offer `bytes` to every destination, keeping the ones still worth writing to.
