@@ -16,6 +16,7 @@
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::{Buf, Bytes, BytesMut};
 use moqom_proto::control::params::{Parameter, param_type};
@@ -257,6 +258,124 @@ impl Relay {
     /// agree with the relay on a value neither of them derived.
     pub fn certificate_identity(&self) -> String {
         tokens::device::certificate_identity(&self.certificate)
+    }
+
+    /// Attach this relay to `parent`, so it can serve tracks it does not hold.
+    ///
+    /// Returns once the link is up, leaving the session running. Awaited rather
+    /// than spawned and hoped for, because a test that subscribed before the
+    /// handshake finished would be refused for the right reason at the wrong
+    /// moment and read as the feature not working.
+    pub async fn attach_to(
+        &self,
+        parent: &Relay,
+        token: Option<&str>,
+    ) -> tokio::task::JoinHandle<Result<(), String>> {
+        let (running, up) = self.dial(parent, token);
+        within("the upstream link to come up", up).await;
+        running
+    }
+
+    /// Attach by a host name rather than by the address the parent bound.
+    ///
+    /// For the case a literal address cannot reach: a name resolving to more than
+    /// one address, only one of which has a listener.
+    pub async fn attach_by_name(
+        &self,
+        name: &str,
+        parent: &Relay,
+    ) -> tokio::task::JoinHandle<Result<(), String>> {
+        let (running, up) = self.dial_to(name, parent.addr.port(), parent, None);
+        within("the upstream link to come up", up).await;
+        running
+    }
+
+    /// The same, for a parent that may refuse.
+    ///
+    /// Returns the error the link failed with rather than waiting for a session
+    /// that is never going to be established, which is what a test about refusal
+    /// needs and what [`Self::attach_to`] cannot express.
+    pub async fn try_attach_to(
+        &self,
+        parent: &Relay,
+        token: Option<&str>,
+    ) -> Result<tokio::task::JoinHandle<Result<(), String>>, String> {
+        let (mut running, up) = self.dial(parent, token);
+        // Whichever happens first. A refusal arrives as the task finishing with an
+        // error; success arrives as the fabric gaining a parent.
+        tokio::select! {
+            () = up => Ok(running),
+            outcome = &mut running => Err(match outcome {
+                Ok(Err(e)) => e,
+                Ok(Ok(())) => "the link closed without attaching".to_owned(),
+                Err(e) => format!("the upstream task failed: {e}"),
+            }),
+        }
+    }
+
+    /// Start dialling `parent`, returning the task and a future that completes when
+    /// the link is registered.
+    fn dial(
+        &self,
+        parent: &Relay,
+        token: Option<&str>,
+    ) -> (
+        tokio::task::JoinHandle<Result<(), String>>,
+        impl std::future::Future<Output = ()> + use<>,
+    ) {
+        // The literal address the parent bound, so the dial does not depend on how
+        // this machine resolves anything.
+        self.dial_to(
+            &parent.addr.ip().to_string(),
+            parent.addr.port(),
+            parent,
+            token,
+        )
+    }
+
+    fn dial_to(
+        &self,
+        host: &str,
+        port: u16,
+        parent: &Relay,
+        token: Option<&str>,
+    ) -> (
+        tokio::task::JoinHandle<Result<(), String>>,
+        impl std::future::Future<Output = ()> + use<>,
+    ) {
+        install_crypto_provider();
+
+        let mut tls = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(PinnedCertificate(
+                parent.certificate.clone(),
+            )))
+            .with_no_client_auth();
+        tls.alpn_protocols = vec![alpn::MOQT_DRAFT_19.to_vec()];
+
+        let dialer = moqom_relay::upstream::Dialer::new(tls).expect("outgoing sockets");
+        let parent = moqom_relay::upstream::Parent {
+            host: host.to_owned(),
+            port,
+            // The certificate is pinned above, so the name here is only what
+            // verification is told to expect and is independent of what is dialled.
+            server_name: "localhost".to_owned(),
+            token: token.map(str::to_owned),
+        };
+        let fabric = self.fabric.clone();
+        let running = tokio::spawn(async move {
+            moqom_relay::upstream::attach(&dialer, &parent, fabric)
+                .await
+                .map_err(|e| e.to_string())
+        });
+
+        let fabric = self.fabric.clone();
+        let up = async move {
+            while fabric.upstream().is_none() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        (running, up)
     }
 }
 
@@ -609,12 +728,44 @@ impl Client {
         &mut self,
         track: &FullTrackName,
     ) -> Result<Subscription, moqom_proto::control::RequestError> {
+        self.try_subscribe_with(track, &[]).await
+    }
+
+    /// Subscribe carrying `parameters`, each a type and a varint value.
+    ///
+    /// For standing in as a relay rather than a client. A viewer sends a bare
+    /// SUBSCRIBE; a relay forwarding one carries a hop budget on it, and the
+    /// behaviour that depends on the budget cannot be reached any other way.
+    pub async fn subscribe_with(
+        &mut self,
+        track: &FullTrackName,
+        parameters: &[(u64, u64)],
+    ) -> Result<Subscription, u64> {
+        self.try_subscribe_with(track, parameters)
+            .await
+            .map_err(|error| error.code.get())
+    }
+
+    async fn try_subscribe_with(
+        &mut self,
+        track: &FullTrackName,
+        parameters: &[(u64, u64)],
+    ) -> Result<Subscription, moqom_proto::control::RequestError> {
         let (mut send, recv) = self
             .session
             .open_bi()
             .await
             .expect("opening a request stream");
-        let request = Subscribe::new(self.next_request(), track.clone());
+        let mut request = Subscribe::new(self.next_request(), track.clone());
+        for &(type_value, value) in parameters {
+            request.parameters.push(
+                Parameter::varint(
+                    type_value,
+                    moqom_proto::varint::VarInt::try_from(value).expect("a varint"),
+                )
+                .expect("a parameter"),
+            );
+        }
         write(&mut send, &request).await;
 
         let mut frames = Frames::new(recv);

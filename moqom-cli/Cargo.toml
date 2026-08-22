@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 moqom-client = { path = "../moqom-client" }
+moqom-media = { path = "../moqom-media", features = ["clap"] }
 bytes = { workspace = true }
 clap = { workspace = true }
 # `time` paces a file at its frame rate, and `signal` is what lets a subscriber

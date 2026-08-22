@@ -20,6 +20,8 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time", "io-util", "signal", "net"] }
 tracing = { workspace = true }
 web-transport-quinn = { workspace = true }
+url = { workspace = true }
+webpki-roots = "0.26"
 
 # Verifying the credential a session presents. aws-lc-rs supplies Ed25519 and is
 # already here as the rustls provider, so the signature check costs no new

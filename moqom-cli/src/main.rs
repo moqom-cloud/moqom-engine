@@ -11,8 +11,6 @@
 //! a number taken from another; a file produces the same frames at the same sizes
 //! in the same order on every machine.
 
-mod annexb;
-
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -25,7 +23,7 @@ use moqom_client::{
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-use crate::annexb::{AccessUnit, Codec};
+use moqom_media::annexb::{self, AccessUnit, Codec};
 
 /// Speak MOQT as a subscriber or a publisher.
 #[derive(Parser)]

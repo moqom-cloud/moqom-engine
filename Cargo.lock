@@ -1035,6 +1035,7 @@ dependencies = [
  "bytes",
  "clap",
  "moqom-client",
+ "moqom-media",
  "tokio",
 ]
 
@@ -1057,6 +1058,29 @@ dependencies = [
  "url",
  "web-transport-quinn",
  "webpki-roots 0.26.11",
+]
+
+[[package]]
+name = "moqom-loadgen"
+version = "0.0.0"
+dependencies = [
+ "aws-lc-rs",
+ "base64",
+ "bytes",
+ "clap",
+ "moqom-client",
+ "moqom-media",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
+]
+
+[[package]]
+name = "moqom-media"
+version = "0.0.0"
+dependencies = [
+ "bytes",
+ "clap",
 ]
 
 [[package]]
@@ -1112,6 +1136,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "web-transport-quinn",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]

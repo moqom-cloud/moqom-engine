@@ -49,6 +49,25 @@ pub mod param_type {
     /// one — a renewal without a fresh proof would be a way to trade a proven
     /// credential for an unproven one.
     pub const AUTHORIZATION_PROOF: u64 = crate::control::setup::PRIVATE_USE;
+
+    /// How many further relays may be asked for this track.
+    ///
+    /// Present on a SUBSCRIBE one relay sends another, and absent on one a client
+    /// sends, which is the distinction that makes it useful: a relay receiving a
+    /// subscription with no budget is being asked by a viewer and starts a fresh
+    /// one, and a relay receiving a budget is standing in a chain and must spend
+    /// from it.
+    ///
+    /// A chain that comes round on itself is otherwise unbounded — two relays each
+    /// configured with the other as a parent will ask each other about a track
+    /// neither holds until something runs out, and neither can see the loop from
+    /// its own end, because a subscription from a sibling relay arrives looking
+    /// exactly like a subscription from a viewer. Spending a hop per forward makes
+    /// the loop terminate in a refusal rather than in exhaustion.
+    ///
+    /// Even, so it carries a varint. See
+    /// [`setup::PRIVATE_USE_VARINT`](crate::control::setup::PRIVATE_USE_VARINT).
+    pub const RELAY_HOPS: u64 = crate::control::setup::PRIVATE_USE_VARINT;
 }
 
 /// A parameter could not be constructed.

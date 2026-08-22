@@ -1,0 +1,43 @@
+[package]
+name = "moqom-loadgen"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+license = "Apache-2.0"
+description = "Drives a relay with one publisher and many subscribers, and reports what it did"
+
+[[bin]]
+name = "moqom-load"
+path = "src/main.rs"
+
+[dependencies]
+# The whole point: subscribers here are the same client a customer links, so a
+# capacity number is a number about the path people actually use. Deliberately no
+# dependency on moqom-relay -- the relay is reached over a socket and scraped over
+# HTTP, which keeps this crate on the Apache side of LICENSING.md and keeps
+# `cargo tree` honest about the split.
+moqom-client = { path = "../moqom-client" }
+# The same parser the `moqom` binary publishes a file with, so that a capacity
+# figure is taken against the framing the product actually ships.
+moqom-media = { path = "../moqom-media", features = ["clap"] }
+bytes = { workspace = true }
+clap = { workspace = true }
+thiserror = { workspace = true }
+# Minting the tokens the subscribers present. Ed25519 because that is what the
+# control plane signs with and what the relay verifies.
+aws-lc-rs = { workspace = true }
+base64 = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = [
+  "rt-multi-thread",
+  "macros",
+  "io-util",
+  "net",
+  "time",
+] }
+
+[lints]
+workspace = true

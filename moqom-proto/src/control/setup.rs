@@ -98,6 +98,30 @@ const _: () = assert!(
     "must sit above the draft's own assignments"
 );
 
+/// Where this implementation numbers an extension whose value is a number.
+///
+/// The even neighbour of [`PRIVATE_USE`], for the same reasons and with the same
+/// three properties, differing only in parity: the Key-Value-Pair rule makes even
+/// types carry a varint, so a counted extension cannot share the odd number that
+/// carries byte strings. Adjacent so that both read as this implementation's in a
+/// capture.
+pub const PRIVATE_USE_VARINT: u64 = 0x4D50;
+
+/// As for [`PRIVATE_USE`], checked at build time for the same reasons — save that
+/// the parity requirement is inverted, this one carrying a count.
+const _: () = assert!(
+    PRIVATE_USE_VARINT.is_multiple_of(2),
+    "must carry a varint, so even"
+);
+const _: () = assert!(
+    !is_grease(PRIVATE_USE_VARINT),
+    "greased options may be ignored"
+);
+const _: () = assert!(
+    PRIVATE_USE_VARINT > option_type::MAX_REQUEST_UPDATES,
+    "must sit above the draft's own assignments"
+);
+
 /// Base of the reserved greasing sequence, per draft-19 §14.
 const GREASE_BASE: u64 = 0x9D;
 /// Stride of the reserved greasing sequence.

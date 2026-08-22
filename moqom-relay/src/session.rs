@@ -56,6 +56,7 @@ use tokio::sync::{Notify, mpsc, oneshot, watch};
 use web_transport_quinn::{RecvStream, SendStream};
 
 use crate::fabric::{Command, Fabric, NamespaceEvent, Pulling, Route, SessionId, UpstreamError};
+use crate::hops::Hops;
 use crate::metrics::{Ending, Fetched, Flowing, Metrics, Subscribed};
 use crate::policy::Silence;
 use crate::quota::{Lease, Principal, Refusal, Resource};
@@ -540,6 +541,34 @@ pub struct Session {
     /// reconnects mid-mute wants the current state, and this way the current
     /// state is always the beginning of a group rather than the middle of one.
     policy_sequence: Arc<AtomicU64>,
+
+    /// Which end of this session this relay is.
+    ///
+    /// Almost everything a session does is the same either way — the same streams
+    /// carry the same messages and the fan-out does not care where bytes came from
+    /// — so this is read in the few places where the difference is real: which end
+    /// opens the control stream, which half of the SETUP exchange to perform, which
+    /// parity of Request ID to allocate, and whether the peer is a participant to
+    /// be reported to the control plane.
+    facing: Facing,
+}
+
+/// Which end of a session this relay is.
+///
+/// A relay accepts sessions from clients and, when it is an edge, opens one to a
+/// parent. The second is not a client of this relay and must not be treated as
+/// one: it is where tracks come from rather than somebody watching them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Facing {
+    /// A peer that connected to this relay: a publisher, a viewer, or a child
+    /// relay. This relay is the server, and everything it has always done applies.
+    Downstream,
+    /// A parent relay this one connected to, to fetch tracks it does not hold.
+    ///
+    /// This relay is the client. Nothing here is charged against a quota, enrolled
+    /// as a participant, or subject to the namespace grammar, because none of those
+    /// describe a sibling in the fleet — the parent applies its own to us.
+    Upstream,
 }
 
 /// Identity and carrier only. The rest is a connection, a lock, and channels,
@@ -597,6 +626,7 @@ impl Session {
             via: Arc::default(),
             locale: Arc::default(),
             policy_sequence: Arc::new(AtomicU64::new(0)),
+            facing: Facing::Downstream,
         };
 
         let result = session.run(command_queue).await;
@@ -658,10 +688,175 @@ impl Session {
         result
     }
 
+    /// Run a session to a parent relay, so this one can serve tracks it does not
+    /// hold.
+    ///
+    /// The mirror image of [`serve`](Self::serve): this relay opens the control
+    /// stream and sends the first SETUP instead of waiting for one. Everything
+    /// after the handshake is the same code, which is the point — an object
+    /// arriving from a parent is forwarded, cached, deduplicated and shed by the
+    /// machinery that already does that for an object arriving from a phone, and a
+    /// second implementation of any of it would be a second set of bugs.
+    ///
+    /// Registers itself as the fabric's parent once the handshake completes, and
+    /// withdraws on the way out, so a subscription arriving while the link is down
+    /// is refused rather than queued against a session that is gone.
+    ///
+    /// `token`, when present, is offered to the parent as this relay's credential.
+    /// The parent authenticates us exactly as it authenticates anybody: being a
+    /// relay is not a way in.
+    ///
+    /// # Errors
+    /// [`SessionError`] if the handshake fails or the parent violates the protocol.
+    pub async fn attach(
+        transport: moqom_transport::Session,
+        fabric: Fabric,
+        token: Option<&[u8]>,
+    ) -> Result<(), SessionError> {
+        let id = fabric.next_session_id();
+        let (commands, command_queue) = mpsc::channel(32);
+        let session = Self {
+            id,
+            transport,
+            // Raw QUIC: an upstream link is relay to relay inside a fleet, with no
+            // browser at either end to need WebTransport.
+            carrier: setup::Transport::Quic,
+            fabric: fabric.clone(),
+            routes: Routes::default(),
+            next_alias: Arc::new(AtomicU64::new(0)),
+            // Client parity, because on this session that is what this relay is.
+            // Sharing the server's parity with the parent would collide on the
+            // first request either side sent.
+            requests: Arc::new(Mutex::new(RequestIdGenerator::new(Role::Client))),
+            commands,
+            pulling: Arc::default(),
+            pulled: Arc::default(),
+            subscribed: Arc::default(),
+            principal: Arc::default(),
+            permission: Arc::default(),
+            credential: watch::Sender::new(None),
+            via: Arc::default(),
+            locale: Arc::default(),
+            policy_sequence: Arc::new(AtomicU64::new(0)),
+            facing: Facing::Upstream,
+        };
+
+        let result = session.run_upstream(command_queue, token).await;
+        fabric.remove_session(id);
+        fabric.detach_upstream();
+        let ending = Ending::of(&result);
+        fabric.metrics().session_ended(id, ending);
+        tracing::info!(
+            session = %id,
+            outcome = ?ending,
+            error = result.as_ref().err().map(tracing::field::display),
+            "upstream session ended"
+        );
+        match &result {
+            Ok(()) => session.transport.close(0, b"bye"),
+            Err(SessionError::Protocol(reason)) => session
+                .transport
+                .close(code::PROTOCOL_VIOLATION, reason.as_bytes()),
+            Err(_) => session.transport.close(code::INTERNAL, b"session failed"),
+        }
+        result
+    }
+
+    /// Serve a session this relay opened, having introduced itself first.
+    async fn run_upstream(
+        &self,
+        commands: mpsc::Receiver<Command>,
+        token: Option<&[u8]>,
+    ) -> Result<(), SessionError> {
+        let (mut control_send, control_recv) = self.transport.open_bi().await?;
+        let mut control = Frames::new(control_recv);
+        self.introduce(&mut control_send, &mut control, token)
+            .await?;
+
+        // Available to subscribers only now. Published earlier, a subscription
+        // could be handed to a session whose handshake was still in doubt, and a
+        // refusal by the parent would arrive as a failure of this relay.
+        self.fabric.attach_upstream(self.commands.clone());
+
+        let peer = self.connection().remote_address();
+        let live = self
+            .fabric
+            .metrics()
+            .session_started(self.id, peer.to_string(), self.carrier);
+        tracing::info!(session = %self.id, %peer, "attached to upstream relay");
+
+        // Deliberately not `enrol()`. That reports a participant to the control
+        // plane, and a parent relay is not one: enrolling it would put a
+        // phantom member in every room this edge serves.
+        tokio::select! {
+            result = self.serve_control(control_send, control, commands) => result,
+            result = self.accept_requests() => result,
+            result = self.accept_data() => result,
+            result = self.sample_transport(live.as_deref()) => result,
+        }
+    }
+
+    /// Send our SETUP and read the parent's: the client half of the exchange.
+    ///
+    /// Charges nothing and authenticates nobody, which is the difference from
+    /// [`handshake`](Self::handshake) beyond the order of the messages. A quota is
+    /// something this relay imposes on peers that connect to it, and the parent is
+    /// not one of those; the parent charges us, on its own side, by the token below.
+    async fn introduce(
+        &self,
+        send_stream: &mut SendStream,
+        control: &mut Frames,
+        token: Option<&[u8]>,
+    ) -> Result<(), SessionError> {
+        let mut ours = Setup::new();
+        ours.options
+            .set_bytes(setup::option_type::MOQT_IMPLEMENTATION, IMPLEMENTATION)
+            .map_err(|_| SessionError::Protocol("implementation string too long"))?;
+        ours.options
+            .set_varint(setup::option_type::MAX_FILTER_RANGES, MAX_FILTER_RANGES)
+            .map_err(|_| SessionError::Protocol("filter range limit not encodable"))?;
+        if let Some(token) = token {
+            ours.options
+                .set_bytes(
+                    setup::option_type::AUTHORIZATION_TOKEN,
+                    bytes::Bytes::copy_from_slice(token),
+                )
+                .map_err(|_| SessionError::Protocol("token too long for a setup option"))?;
+        }
+        send(send_stream, &ours).await?;
+
+        let frame = control.expect().await?;
+        if frame.message_type != MessageType::Setup {
+            return Err(SessionError::Protocol(
+                "first message from an upstream relay must be SETUP",
+            ));
+        }
+        let mut body = frame.body.clone();
+        let len = body.len();
+        let peer = Setup::decode(&mut body, len)?;
+        // The parent is the server on this session, so its options are held to the
+        // server's rules -- the mirror of what `handshake` checks of a client.
+        peer.validate(Role::Server, self.carrier)?;
+        if let Some(implementation) = peer.options.moqt_implementation() {
+            tracing::debug!(
+                session = %self.id,
+                peer = %String::from_utf8_lossy(implementation),
+                "upstream implementation"
+            );
+        }
+        Ok(())
+    }
+
     /// This session's identifier within the relay.
     #[must_use]
     pub fn id(&self) -> SessionId {
         self.id
+    }
+
+    /// Which end of this session this relay is.
+    #[must_use]
+    pub const fn facing(&self) -> Facing {
+        self.facing
     }
 
     /// How many tracks this session is currently forwarding, for diagnostics.
@@ -1675,7 +1870,26 @@ impl Session {
             .await;
         }
 
-        let Some(publisher) = self.fabric.publisher(track.namespace()) else {
+        // How many further relays may be asked, spent one per hop. Absent on a
+        // subscription from a viewer, which is what starts a fresh budget; present
+        // on one from a child relay, which is what makes a cycle terminate.
+        let hops = Hops::asked_for(&request.parameters);
+
+        // Nothing local, so ask the parent -- an edge fetching a track it does not
+        // have is the whole of what makes a fan-out tree possible. A relay with no
+        // parent, or one whose budget is spent, answers as it always did.
+        let publisher = self.fabric.publisher(track.namespace()).or_else(|| {
+            let upstream = self.fabric.upstream().filter(|_| hops.may_forward())?;
+            tracing::debug!(
+                session = %self.id,
+                %track,
+                remaining = hops.remaining(),
+                "no local publisher; asking upstream"
+            );
+            Some(upstream)
+        });
+
+        let Some(publisher) = publisher else {
             tracing::debug!(session = %self.id, %track, "no publisher for namespace");
             self.fabric.metrics().subscribed(Subscribed::NoPublisher);
             return send(
@@ -1696,6 +1910,7 @@ impl Session {
         let command = Command::Subscribe {
             track: track.clone(),
             route: Box::new(route),
+            hops,
             ready,
         };
 
@@ -1988,8 +2203,9 @@ impl Session {
             Command::Subscribe {
                 track,
                 route,
+                hops,
                 ready,
-            } => self.pull(track, route, ready),
+            } => self.pull(track, route, hops, ready),
             Command::Release {
                 track,
                 upstream,
@@ -2185,6 +2401,7 @@ impl Session {
         &self,
         track: FullTrackName,
         route: Box<Route>,
+        hops: Hops,
         ready: oneshot::Sender<Result<Pulling, UpstreamError>>,
     ) {
         // Resolved in its own scope so the lock is not held across the await
@@ -2233,7 +2450,9 @@ impl Session {
             Join::Opening(announce) => {
                 let session = self.clone();
                 tokio::spawn(async move {
-                    let result = session.subscribe_upstream(track.clone(), *route).await;
+                    let result = session
+                        .subscribe_upstream(track.clone(), *route, hops)
+                        .await;
                     if result.is_err() {
                         // Cleared rather than left pending, so the next
                         // subscriber tries again instead of inheriting a
@@ -2304,6 +2523,7 @@ impl Session {
         &self,
         track: FullTrackName,
         route: Route,
+        hops: Hops,
     ) -> Result<TrackAlias, UpstreamError> {
         let internal = |context: &str, e: &dyn std::fmt::Display| {
             UpstreamError::new(RequestErrorCode::INTERNAL_ERROR, format!("{context}: {e}"))
@@ -2315,7 +2535,13 @@ impl Session {
             .await
             .map_err(|e| internal("could not open a request stream", &e))?;
 
-        let request = Subscribe::new(self.allocate_request_id(), track.clone());
+        let mut request = Subscribe::new(self.allocate_request_id(), track.clone());
+        // Only towards a parent relay. A publisher is the end of the chain — it has
+        // nowhere to forward a subscription to — and sending it a budget would put
+        // an unknown parameter on the wire for no purpose.
+        if self.facing == Facing::Upstream {
+            hops.spent().note(&mut request.parameters);
+        }
         send(&mut send_stream, &request)
             .await
             .map_err(|e| internal("could not send SUBSCRIBE", &e))?;

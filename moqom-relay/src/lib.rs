@@ -102,6 +102,7 @@ pub mod cache;
 pub mod catalog;
 pub mod clock;
 pub mod fabric;
+pub mod hops;
 pub mod identity;
 pub mod link;
 pub mod media;
@@ -112,6 +113,7 @@ pub mod quota;
 pub mod roster;
 pub mod scope;
 pub mod session;
+pub mod upstream;
 
 mod generated;
 

@@ -7,7 +7,9 @@ members = [
     "moqom-relay",
     "moqom-transport",
     "moqom-client",
+    "moqom-media",
     "moqom-cli",
+    "moqom-loadgen",
 ]
 # cargo-fuzz needs nightly and links libFuzzer, so it cannot build under the
 # pinned stable toolchain the rest of the workspace uses. Excluded rather than

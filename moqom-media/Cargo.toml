@@ -1,0 +1,23 @@
+[package]
+name = "moqom-media"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+license = "Apache-2.0"
+description = "Reading coded video into the objects MOQOM publishes"
+
+[dependencies]
+bytes = { workspace = true }
+# Only for deriving `ValueEnum` on `Codec`, so that a binary can take `--codec`
+# without restating the list. Optional because a codec parser has no business
+# dragging an argument parser into anything that links it for the framing alone.
+clap = { workspace = true, optional = true }
+
+[features]
+clap = ["dep:clap"]
+
+[lints]
+workspace = true

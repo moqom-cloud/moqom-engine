@@ -11,7 +11,9 @@ product is source-available.
 | `moqom-proto` | Apache-2.0 | An implementation of an IETF draft. Nobody should need permission to speak a standard. |
 | `moqom-transport` | Apache-2.0 | QUIC and WebTransport session establishment — the other half of being able to speak it. |
 | `moqom-client` | Apache-2.0 | A MOQT subscriber and publisher. Receiving frames is this crate, not the admin SDK. |
+| `moqom-media` | Apache-2.0 | Reading coded video into objects. Framing, not decoding, and shared by the binary that publishes a file and the harness that measures with one. |
 | `moqom-cli` | Apache-2.0 | The `moqom` binary. It uses only `moqom-client`'s public API. |
+| `moqom-loadgen` | Apache-2.0 | A load harness. It measures the relay from outside, over a socket, and links none of it — so it sits with `fuzz` rather than with the product, and a customer sizing their own deployment can use it. |
 | `moqom-relay` | BUSL-1.1 → Apache-2.0 | The server. This is the product. |
 | `fuzz` | Apache-2.0 | Test harness for the Apache half. |
 | `vendor/quinn` | MIT OR Apache-2.0 | Upstream's, unmodified. See `vendor/quinn-rationale.md`. |

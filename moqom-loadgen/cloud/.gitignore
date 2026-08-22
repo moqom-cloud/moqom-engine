@@ -1,0 +1,7 @@
+# Measurements are evidence, not source. They are kept locally and quoted in
+# docs/PLAN.md when they change a conclusion; committing every sweep would put
+# megabytes of per-run output in the history for the sake of a few numbers.
+results/
+
+# One person's project, zone and quota, not the design.
+lab.local

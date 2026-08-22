@@ -29,7 +29,8 @@ use bytes::{BufMut, Bytes, BytesMut};
 /// type in the low five bits of one byte, HEVC in six bits of the first of two —
 /// so a wrong guess does not fail, it silently reads every NAL as the wrong kind
 /// and publishes a stream that arrives intact and decodes to nothing.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 pub enum Codec {
     /// H.264, one-byte NAL header.
     H264,

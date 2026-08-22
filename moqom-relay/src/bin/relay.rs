@@ -36,6 +36,19 @@
 //!   See [`possession`] for why the default is the middle one and not the strict
 //!   one. Without keys this decides nothing, since there is no token to be the
 //!   owner of.
+//! - `MOQOM_RELAY_UPSTREAM` — a parent relay, as `HOST:PORT`, to fetch tracks this
+//!   one does not hold. Unset is a single-tier relay, which serves what its own
+//!   publishers announce and refuses the rest. Set, this relay becomes an edge: a
+//!   subscription for a namespace nobody here publishes is asked of the parent, and
+//!   the audience for one track stops being bounded by one machine's network card.
+//!   See [`crate::upstream`](moqom_relay::upstream).
+//! - `MOQOM_RELAY_UPSTREAM_CA` — a PEM of certificate authorities to trust for that
+//!   link, in addition to the public roots. What a fleet on internal names needs,
+//!   since no public authority will certify them. Verification cannot be turned off.
+//! - `MOQOM_RELAY_UPSTREAM_TOKEN` — this relay's own credential for that parent.
+//!   Being a relay is not a way past a parent's door, so against a parent that
+//!   verifies credentials an edge without this is anonymous and will not be able to
+//!   read the tracks it exists to serve.
 //! - `MOQOM_CONTROL_ENDPOINT` — the control plane's URL. Unset means no
 //!   moderation reaches this relay: it enforces what tokens say and nothing
 //!   else, which is the mode the benches run in and not one to expose.
@@ -77,11 +90,14 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use base64::Engine as _;
 use moqom_relay::admin::Surface;
 use moqom_relay::possession::{Enforcement, Possession};
+use moqom_relay::upstream;
 use moqom_relay::{
     Authenticator, Cache, Fabric, Governor, Limits, Link, Metrics, Quotas, Session, Supervisor,
     VerificationKey,
@@ -133,11 +149,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let dscp = egress_dscp()?;
-    let server = Server::bind_marked(addr, with_moqt_alpn(tls), dscp)?;
+    let shards = shards()?;
+    let servers: Vec<Arc<Server>> = Server::bind_shards(addr, with_moqt_alpn(tls), dscp, shards)?
+        .into_iter()
+        .map(Arc::new)
+        .collect();
     if let Some(dscp) = dscp {
         tracing::info!(dscp, "marking egress");
     }
-    let bound = server.local_addr()?;
+    if shards.get() > 1 {
+        tracing::info!(shards = shards.get(), "sharing the port across sockets");
+    }
+    let bound = servers
+        .first()
+        .ok_or("no listener was bound")?
+        .local_addr()?;
     // Printed before the first accept so a harness can wait on this line rather
     // than poll the port, and flushed because stdout to a pipe is block
     // buffered — a harness reading line by line would otherwise wait forever.
@@ -173,6 +199,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // about it in the same second rather than after somebody rejoins.
     let _link = control_link(&fabric);
 
+    // An edge in a tier, if this relay was given a parent. Spawned rather than
+    // awaited: an edge whose parent is not up yet should still serve the publishers
+    // that connect to it directly, and the link retries in the background.
+    if let Some(parent) = upstream()? {
+        let dialer = upstream::Dialer::new(upstream_tls()?)?;
+        tracing::info!(%parent, "attaching upstream");
+        tokio::spawn(upstream::keep_attached(dialer, parent, fabric.clone()));
+    }
+
     let surface = Surface::new(metrics, fabric.clone());
     if let Some(addr) = admin_addr {
         let serving = surface.clone();
@@ -186,43 +221,75 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    loop {
-        tokio::select! {
-            () = shutdown() => {
-                tracing::info!("draining");
-                // Readiness drops before the drain begins, so a load balancer
-                // stops sending new connections while the existing ones finish.
-                // Doing it the other way round refuses traffic it was still
-                // capable of serving.
-                surface.draining();
-                server.shutdown().await;
-                return Ok(());
-            }
+    // One accept loop per listener. With a single shard this is the same single
+    // loop as ever, one task removed from the signal handler.
+    let mut listening = tokio::task::JoinSet::new();
+    for server in &servers {
+        listening.spawn(accept_on(Arc::clone(server), fabric.clone()));
+    }
 
-            incoming = server.accept() => {
-                let Some(incoming) = incoming else { return Ok(()) };
-                let fabric = fabric.clone();
-                // Spawned rather than awaited: the handshake happens inside, and
-                // awaiting it here would let one slow peer hold up every other
-                // connection. See `Server::accept`.
-                tokio::spawn(async move {
-                    let peer = incoming.remote_address();
-                    match incoming.establish().await {
-                        Err(e) => {
-                            fabric.metrics().handshake_failed();
-                            tracing::debug!(%peer, error = %e, "handshake failed");
-                        }
-                        Ok((session, negotiated)) => {
-                            if let Err(e) =
-                                Session::serve(session, negotiated.carrier, fabric).await
-                            {
-                                tracing::debug!(%peer, error = %e, "session ended badly");
-                            }
-                        }
-                    }
-                });
+    tokio::select! {
+        () = shutdown() => {
+            tracing::info!("draining");
+            // Readiness drops before the drain begins, so a load balancer stops
+            // sending new connections while the existing ones finish. Doing it the
+            // other way round refuses traffic it was still capable of serving.
+            surface.draining();
+            for server in &servers {
+                server.shutdown().await;
             }
         }
+
+        // Every listener stopping means the endpoints closed underneath the relay,
+        // which is not something a signal caused and not something to wait on.
+        () = async { while listening.join_next().await.is_some() {} } => {
+            tracing::warn!("every listener stopped");
+        }
+    }
+    Ok(())
+}
+
+/// Accept connections on one listener until it closes.
+async fn accept_on(server: Arc<Server>, fabric: Fabric) {
+    while let Some(incoming) = server.accept().await {
+        let fabric = fabric.clone();
+        // Spawned rather than awaited: the handshake happens inside, and awaiting
+        // it here would let one slow peer hold up every other connection. See
+        // `Server::accept`.
+        tokio::spawn(async move {
+            let peer = incoming.remote_address();
+            match incoming.establish().await {
+                Err(e) => {
+                    fabric.metrics().handshake_failed();
+                    tracing::debug!(%peer, error = %e, "handshake failed");
+                }
+                Ok((session, negotiated)) => {
+                    if let Err(e) = Session::serve(session, negotiated.carrier, fabric).await {
+                        tracing::debug!(%peer, error = %e, "session ended badly");
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// How many sockets share the listening port.
+///
+/// One by default, which is the ordinary single-socket listener. More than one
+/// divides packet handling across cores, and carries a caveat about clients that
+/// change address mid-connection -- see [`Server::bind_shards`], and do not raise
+/// this in front of mobile clients on the strength of a throughput number alone.
+fn shards() -> Result<NonZeroUsize, Box<dyn std::error::Error>> {
+    let Some(value) = env("MOQOM_RELAY_SHARDS") else {
+        return Ok(NonZeroUsize::MIN);
+    };
+    match value.trim() {
+        // Named rather than only numeric, because the useful number is a property
+        // of the machine and a deployment should not have to restate it per size.
+        "auto" => Ok(std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN)),
+        digits => Ok(digits
+            .parse::<NonZeroUsize>()
+            .map_err(|e| format!("MOQOM_RELAY_SHARDS must be a positive number or auto: {e}"))?),
     }
 }
 
@@ -429,6 +496,94 @@ fn authenticator() -> Result<Authenticator, Box<dyn std::error::Error>> {
 
     tracing::info!(keys = keys.len(), %issuer, "verifying session credentials");
     Ok(Authenticator::new(issuer, keys))
+}
+
+/// The parent relay this one fetches tracks from, if it has been given one.
+///
+/// A relay with no parent is the ordinary single-tier case and is unaffected by any
+/// of this: it serves what its own publishers announce and refuses the rest, exactly
+/// as it did before parents existed.
+fn upstream() -> Result<Option<upstream::Parent>, Box<dyn std::error::Error>> {
+    let Some(target) = env("MOQOM_RELAY_UPSTREAM") else {
+        return Ok(None);
+    };
+
+    // Split rather than resolved. The name is what the parent's certificate attests
+    // to, so verifying against an address would accept any host that answers on it,
+    // which is the whole attack certificate verification exists to stop -- and the
+    // address is looked up per attempt rather than here, so a parent that moves is
+    // followed instead of dialled forever at the address it had at startup.
+    let (host, port) = target
+        .rsplit_once(':')
+        .ok_or("MOQOM_RELAY_UPSTREAM needs a port, as HOST:PORT")?;
+    let port: u16 = port
+        .parse()
+        .map_err(|e| format!("MOQOM_RELAY_UPSTREAM {target} has no usable port: {e}"))?;
+    let host = host.trim_matches(['[', ']']).to_owned();
+
+    let token = env("MOQOM_RELAY_UPSTREAM_TOKEN");
+    if token.is_none() {
+        // Worth a line rather than silence: against a parent that verifies
+        // credentials this relay is anonymous, and an anonymous edge can read only
+        // what an anonymous client could, so the tracks it is there to serve will
+        // not resolve and the symptom appears at the viewer.
+        tracing::warn!("no MOQOM_RELAY_UPSTREAM_TOKEN, so this relay is anonymous to its parent");
+    }
+
+    Ok(Some(upstream::Parent {
+        server_name: host.clone(),
+        host,
+        port,
+        token,
+    }))
+}
+
+/// How to verify a parent relay's certificate.
+///
+/// The well-known roots, plus a private authority when one is configured, and no way
+/// to turn verification off. A relay-to-relay link carries every track in the fleet,
+/// so an unverified one is an interior tier that anybody able to answer on an address
+/// can impersonate — and a flag to skip it would end up set in production by somebody
+/// debugging a name that did not resolve.
+///
+/// The private authority is not a loophole in that, it is what a fleet actually needs:
+/// relays inside a VPC are reached by internal names that no public authority will
+/// certify, so without this the only way to run a tier would be to weaken it. The
+/// control-plane link takes `MOQOM_CONTROL_CA` for the same reason.
+fn upstream_tls() -> Result<rustls::ClientConfig, Box<dyn std::error::Error>> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+    if let Some(path) = env_path("MOQOM_RELAY_UPSTREAM_CA") {
+        let pem = std::fs::read(&path)
+            .map_err(|e| format!("reading MOQOM_RELAY_UPSTREAM_CA {}: {e}", path.display()))?;
+        let mut added = 0;
+        for certificate in rustls_pemfile::certs(&mut pem.as_slice()) {
+            let certificate = certificate
+                .map_err(|e| format!("MOQOM_RELAY_UPSTREAM_CA {}: {e}", path.display()))?;
+            roots
+                .add(certificate)
+                .map_err(|e| format!("MOQOM_RELAY_UPSTREAM_CA {}: {e}", path.display()))?;
+            added += 1;
+        }
+        // An empty or wrong-format file would otherwise leave verification quietly
+        // resting on the public roots, and the failure would appear later as a
+        // handshake error naming the parent rather than the file.
+        if added == 0 {
+            return Err(format!(
+                "MOQOM_RELAY_UPSTREAM_CA {} contains no certificates",
+                path.display()
+            )
+            .into());
+        }
+        tracing::info!(authorities = added, path = %path.display(), "trusting a private authority for the upstream link");
+    }
+
+    let mut tls = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    tls.alpn_protocols = vec![moqom_transport::alpn::MOQT_DRAFT_19.to_vec()];
+    Ok(tls)
 }
 
 fn env_path(key: &str) -> Option<PathBuf> {

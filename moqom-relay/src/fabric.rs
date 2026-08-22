@@ -39,6 +39,7 @@ use tokio::sync::{Notify, mpsc, oneshot};
 
 use crate::cache::Cache;
 use crate::clock;
+use crate::hops::Hops;
 use crate::identity::Authenticator;
 use crate::metrics::Metrics;
 use crate::policy::{Policy, Silence};
@@ -187,6 +188,15 @@ pub enum Command {
         /// the size of this enum; every other command would otherwise be
         /// padded out to match it.
         route: Box<Route>,
+        /// How many further relays may be asked, if this command is going to a
+        /// parent relay rather than to a local publisher.
+        ///
+        /// Carried on the command because the two ends of the decision are in
+        /// different sessions: the subscriber's session reads the budget off the
+        /// request that arrived, and the parent's session is what writes the
+        /// decremented one onto the request that leaves. Ignored by a session
+        /// serving a local publisher, which has nowhere to forward it.
+        hops: Hops,
         /// Completed once upstream has answered.
         ready: oneshot::Sender<Result<Pulling, UpstreamError>>,
     },
@@ -289,6 +299,12 @@ struct State {
     /// Newest announcement last. See the module docs on why this is a list.
     namespaces: HashMap<TrackNamespace, Vec<Announcement>>,
     watchers: Vec<Watcher>,
+    /// The session to a parent relay, when this relay has one.
+    ///
+    /// Kept beside the announcements rather than among them because it is not an
+    /// announcement: nothing has said the parent holds any particular track. It is
+    /// somewhere to ask, tried only when nothing here holds what was asked for.
+    upstream: Option<mpsc::Sender<Command>>,
 }
 
 /// The state shared between every session on one relay.
@@ -606,6 +622,32 @@ impl Fabric {
             .get(namespace)
             .and_then(|holders| holders.last())
             .map(|a| a.commands.clone())
+    }
+
+    /// Record the session to this relay's parent, replacing any earlier one.
+    ///
+    /// Replacing rather than collecting, because a relay has one parent: a second
+    /// call is a reconnection, and the session it replaces is already gone.
+    pub fn attach_upstream(&self, commands: mpsc::Sender<Command>) {
+        self.lock().upstream = Some(commands);
+    }
+
+    /// Forget the parent, because the session to it has ended.
+    ///
+    /// A subscription that arrives before the reconnection is refused, which is
+    /// the honest answer: this relay cannot serve the track and does not know
+    /// whether anybody can.
+    pub fn detach_upstream(&self) {
+        self.lock().upstream = None;
+    }
+
+    /// How to reach this relay's parent, if it has one and the link is up.
+    ///
+    /// Asked only when no local session publishes what was requested. An edge with
+    /// no parent is the single-relay case and behaves as it always did.
+    #[must_use]
+    pub fn upstream(&self) -> Option<mpsc::Sender<Command>> {
+        self.lock().upstream.clone()
     }
 
     /// Every announced namespace, for diagnostics.

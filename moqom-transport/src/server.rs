@@ -2,6 +2,7 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use web_transport_quinn::proto::ConnectResponse;
@@ -101,12 +102,82 @@ impl Server {
         Self::bound(addr, tls, Liveness::DEFAULT, dscp)
     }
 
+    /// Bind several sockets on one port, so that one thread is not the ceiling.
+    ///
+    /// A `quinn::Endpoint` owns one UDP socket and drives it from one task. Every
+    /// packet arriving for every connection on that endpoint is demultiplexed
+    /// there, and every packet leaving is a send on that one socket -- which the
+    /// kernel serialises per socket. Both are fine at hundreds of connections and
+    /// neither divides across cores: a relay measured at 3,500 subscribers on four
+    /// vCPUs never got past 3.4 of them, and collapsed rather than saturating the
+    /// link. Several sockets on the same port, which `SO_REUSEPORT` allows, give
+    /// each shard its own driver and its own send lock, and the kernel spreads
+    /// arriving connections across them by a hash of the four-tuple.
+    ///
+    /// Every returned `Server` is a peer of the others: each needs its own accept
+    /// loop, and they share nothing but the port.
+    ///
+    /// Two things to know before turning this on:
+    ///
+    /// * **Migration.** The kernel steers by four-tuple, so a client that changes
+    ///   address or port -- a phone moving from wifi to cellular -- can be steered
+    ///   to a shard that has never heard of its connection ID, which ends the
+    ///   connection that [`Server::bound`]'s `migration(true)` exists to preserve.
+    ///   Safe for a fixed fleet of subscribers and for a load test; not safe in
+    ///   front of mobile clients until the steering is done by connection ID with
+    ///   an eBPF `SO_REUSEPORT` program instead of by four-tuple.
+    /// * **Linux.** `SO_REUSEPORT` load-balances on Linux. On the BSDs, including
+    ///   macOS, it permits the bind without distributing across it, so asking for
+    ///   shards there binds successfully and measures nothing.
+    ///
+    /// One shard takes the ordinary single-socket path exactly, so the default
+    /// deployment is not affected by any of the above.
+    ///
+    /// # Errors
+    /// As [`Server::bind_marked`], and if `SO_REUSEPORT` cannot be set.
+    pub fn bind_shards(
+        addr: SocketAddr,
+        tls: rustls::ServerConfig,
+        dscp: Option<u8>,
+        shards: NonZeroUsize,
+    ) -> io::Result<Vec<Self>> {
+        let config = Self::configured(tls, Liveness::DEFAULT)?;
+        if shards.get() == 1 {
+            return Ok(vec![Self::new(Self::endpoint(addr, config, dscp, false)?)]);
+        }
+
+        // The first shard's bound address rather than the requested one, so that
+        // asking for port zero still puts every shard on one port. Binding each to
+        // port zero would hand out several ports, of which clients could reach one.
+        let first = Self::new(Self::endpoint(addr, config.clone(), dscp, true)?);
+        let port = first.local_addr()?;
+        let mut servers = vec![first];
+        for _ in 1..shards.get() {
+            servers.push(Self::new(Self::endpoint(
+                port,
+                config.clone(),
+                dscp,
+                true,
+            )?));
+        }
+        Ok(servers)
+    }
+
     fn bound(
         addr: SocketAddr,
         tls: rustls::ServerConfig,
         liveness: Liveness,
         dscp: Option<u8>,
     ) -> io::Result<Self> {
+        let config = Self::configured(tls, liveness)?;
+        Ok(Self::new(Self::endpoint(addr, config, dscp, false)?))
+    }
+
+    /// The QUIC server configuration a listener is built from.
+    fn configured(
+        tls: rustls::ServerConfig,
+        liveness: Liveness,
+    ) -> io::Result<quinn::ServerConfig> {
         let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
@@ -126,38 +197,54 @@ impl Server {
         // gap in somebody's broadcast -- and it would do so silently, which is
         // why it is written down rather than inherited.
         config.migration(true);
+        Ok(config)
+    }
 
-        let Some(dscp) = dscp else {
-            return Ok(Self::new(quinn::Endpoint::server(config, addr)?));
-        };
+    /// One endpoint, on a socket configured the way this deployment needs.
+    fn endpoint(
+        addr: SocketAddr,
+        config: quinn::ServerConfig,
+        dscp: Option<u8>,
+        share_port: bool,
+    ) -> io::Result<quinn::Endpoint> {
+        if dscp.is_none() && !share_port {
+            return quinn::Endpoint::server(config, addr);
+        }
 
         // Bound here rather than by `Endpoint::server`, which binds its own and offers no way to
         // configure it first. The codepoint has to be on the socket before the endpoint wraps it,
         // because `quinn-udp` reads it once and carries it into the control message it attaches
-        // to every datagram -- see the note in `vendor/quinn/VENDORED.md`.
+        // to every datagram -- see the note in `vendor/quinn/VENDORED.md`. `SO_REUSEPORT` has to
+        // be set before the bind for the same reason every sharing socket must set it: the kernel
+        // decides at bind time whether the address is already taken.
         let socket = socket2::Socket::new(
             socket2::Domain::for_address(addr),
             socket2::Type::DGRAM,
             Some(socket2::Protocol::UDP),
         )?;
-        // Shifted into the top six bits: the value names a codepoint, and the two bits below it
-        // are ECN's, which belong to the transport.
-        let tos = u32::from(dscp) << 2;
-        if addr.is_ipv6() {
-            socket.set_tclass_v6(tos)?;
-        } else {
-            socket.set_tos_v4(tos)?;
+        if share_port {
+            socket.set_reuse_port(true)?;
+        }
+        if let Some(dscp) = dscp {
+            // Shifted into the top six bits: the value names a codepoint, and the two bits below
+            // it are ECN's, which belong to the transport.
+            let tos = u32::from(dscp) << 2;
+            if addr.is_ipv6() {
+                socket.set_tclass_v6(tos)?;
+            } else {
+                socket.set_tos_v4(tos)?;
+            }
         }
         socket.bind(&addr.into())?;
 
         let runtime =
             quinn::default_runtime().ok_or_else(|| io::Error::other("no async runtime found"))?;
-        Ok(Self::new(quinn::Endpoint::new(
+        quinn::Endpoint::new(
             quinn::EndpointConfig::default(),
             Some(config),
             socket.into(),
             runtime,
-        )?))
+        )
     }
 
     /// Per-stream credit large enough that a media stream never needs a refill,
