@@ -39,6 +39,14 @@ sudo install -m 0755 target/release/moqom-load /opt/moqom/bin/moqom-load
 /opt/moqom/bin/moqom-load jwks > /tmp/jwks.json 2>/dev/null
 sudo install -m 0644 /tmp/jwks.json /opt/moqom/jwks.json
 
+# The relay's admin token. Its admin port listens across the lab's VPC, and the
+# relay refuses to do that without a credential. Random per build rather than a
+# constant like the seed above, and readable by every account on these hosts,
+# which only matters to somebody who already has a shell on one.
+tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 48 > /tmp/admin-token
+sudo install -m 0644 /tmp/admin-token /opt/moqom/admin-token
+rm -f /tmp/admin-token
+
 # The binaries' hashes rather than a version string. The relay takes its whole
 # configuration from the environment and ignores its arguments, so asking it for a
 # version would start a relay and never return -- and a hash is the thing worth

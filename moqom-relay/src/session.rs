@@ -32,7 +32,7 @@
 //! which removes an entire class of desynchronisation bug from the fan-out path.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -254,6 +254,14 @@ pub(crate) mod code {
 /// what it describes: the same person in another room is under other rules.
 const POLICY_TRACK: &[u8] = b".policy";
 
+/// How a request ended by a change of grants begins its reason phrase.
+///
+/// Fixed text, because a client matches on it: a request refused because it
+/// was never allowed and one ended because a demotion took it away look the
+/// same by code, and only the second should be shown to the user as "you are
+/// no longer on stage".
+pub const GRANTS_CHANGED: &str = "grants changed";
+
 /// Where to publish one session's restrictions, or `None` for a session with
 /// no room to be restricted in.
 ///
@@ -261,17 +269,66 @@ const POLICY_TRACK: &[u8] = b".policy";
 /// arrive on stage still muted, and a name that only covered the stage would
 /// let a promotion clear a mute.
 fn policy_track(scope: &Scope) -> Option<FullTrackName> {
+    FullTrackName::new(slot(scope)?, Bytes::from_static(POLICY_TRACK)).ok()
+}
+
+/// A participant's own slot in its room, where its reserved tracks are named.
+fn slot(scope: &Scope) -> Option<TrackNamespace> {
     let room = scope.room.as_ref()?;
     let marker: &str = if scope.backstage { "bs" } else { "r" };
-    let namespace = TrackNamespace::from_parts([
+    TrackNamespace::from_parts([
         scope.tenant.as_bytes(),
         marker.as_bytes(),
         room.as_bytes(),
         scope.user.as_bytes(),
         scope.device.as_bytes(),
     ])
-    .ok()?;
-    FullTrackName::new(namespace, Bytes::from_static(POLICY_TRACK)).ok()
+    .ok()
+}
+
+/// How a direct ticket track's name begins. The rest is the peer, as
+/// `user/device`: `.direct/bob/0123456789abcdef`.
+const TICKET_TRACK: &[u8] = b".direct/";
+
+/// The peer a ticket track is for, if `track` is one.
+fn ticket_peer(track: &FullTrackName) -> Option<&str> {
+    let peer = track.name().strip_prefix(TICKET_TRACK)?;
+    std::str::from_utf8(peer).ok()
+}
+
+/// Whether `scope` may hold tickets on `namespace` for a direct path to
+/// `peer`, and if not, why not.
+///
+/// The same people a peer admits to a direct path: somebody in a room who may
+/// publish. A viewer is refused here as well as by the peer, so that a viewer
+/// is never metered for a direct path it could not have had.
+fn ticket_eligibility(
+    scope: &Scope,
+    namespace: &TrackNamespace,
+    peer: &str,
+) -> Result<(), &'static str> {
+    if scope.relay {
+        return Err("a relay link has no direct paths");
+    }
+    if scope.room.is_none() {
+        return Err("direct paths are only between room participants");
+    }
+    if scope.publish.is_none() {
+        return Err("viewers never use direct paths");
+    }
+    if slot(scope).as_ref() != Some(namespace) {
+        return Err("tickets are issued only on the participant's own slot");
+    }
+    let well_formed = peer
+        .split_once('/')
+        .is_some_and(|(user, device)| !user.is_empty() && !device.is_empty() && peer.len() <= 256);
+    if !well_formed {
+        return Err("the peer is not a participant name");
+    }
+    if peer == format!("{}/{}", scope.user, scope.device) {
+        return Err("a direct path to oneself");
+    }
+    Ok(())
 }
 
 /// One object's worth of "here is what you may not publish".
@@ -418,6 +475,17 @@ struct Upstream {
     stop: Arc<Notify>,
 }
 
+/// The token a session's grants were last taken from. See [`Session::held`].
+#[derive(Default)]
+struct Held {
+    /// Its scope, before any ceiling. `None` for a session with no verified
+    /// scope, which has no grants to change.
+    scope: Option<Scope>,
+    /// When it was minted, which a renewal that changes grants must not
+    /// precede.
+    issued: Option<SystemTime>,
+}
+
 /// What a new subscriber must do to start receiving a track, decided under the
 /// [`Session::pulled`] lock and carried out after it is released.
 enum Join {
@@ -495,12 +563,38 @@ pub struct Session {
     /// could change who it is mid-session could shed a limit by doing so.
     principal: Arc<OnceLock<Principal>>,
 
-    /// What the token permitted, written beside the principal during SETUP.
+    /// What this session may do right now, first written beside the principal
+    /// during SETUP.
     ///
     /// Separate from it for the same reason provenance is: a principal is a
     /// quota key, compared for equality to find a bucket, and a permission is
     /// not something anybody is charged for.
-    permission: Arc<OnceLock<Permission>>,
+    ///
+    /// Not write-once, unlike the principal, because a viewer who becomes a
+    /// guest has to become one on the connection they are watching on. Tearing
+    /// the session down to change what it may do would interrupt the very
+    /// playback the promotion was supposed to leave alone. What keeps this safe
+    /// is that only two things move it: a renewal for the same seat, signed and
+    /// proven (see [`Self::renew_credential`]), and a ceiling from the control
+    /// plane, which only ever narrows (see [`crate::scope::Ceiling`]).
+    ///
+    /// A `watch` so that the tasks holding requests open can be woken when it
+    /// moves. A request authorised under the old grants is not grandfathered:
+    /// each one re-asks its own question against the new value and ends itself
+    /// if the answer changed. Every check reads the current value, so nothing
+    /// new is authorised against a stale one.
+    ///
+    /// `None` until SETUP has written it; see [`Self::permission`].
+    permission: watch::Sender<Option<Arc<Permission>>>,
+
+    /// The credential behind [`Self::permission`], as it was minted.
+    ///
+    /// Kept apart from the permission because they differ whenever a moderator
+    /// has set a ceiling: the token may say cohost while the session holds
+    /// viewer. A renewal is compared against this — the token it replaces —
+    /// and not against what the ceiling left, or every renewal of a demoted
+    /// session would look like a request for different grants.
+    held: Arc<Mutex<Held>>,
 
     /// When the credential behind that permission lapses, and a way to be woken
     /// when it moves.
@@ -511,12 +605,11 @@ pub struct Session {
     /// sleep against a change, so a renewal that arrives during the sleep pushes
     /// it out instead of being noticed a lifetime late.
     ///
-    /// Mutable where [`Self::principal`] and [`Self::permission`] are write-once,
-    /// and the asymmetry is the point. Who somebody is and what they may do must
-    /// not change under an established session — a peer that could restate
-    /// either would shed a quota bucket or a scope check. When their credential
-    /// runs out is the one part a peer may legitimately move, and only forward,
-    /// by presenting a fresh token for the same principal.
+    /// Mutable where [`Self::principal`] is write-once, and the asymmetry is the
+    /// point. Who somebody is must not change under an established session — a
+    /// peer that could restate it would shed a quota bucket. When their
+    /// credential runs out may move, and only forward, by presenting a fresh
+    /// token for the same principal.
     ///
     /// `None` means nothing to enforce: a relay holding no keys, which
     /// authorises everything and has no expiry to hold anybody to.
@@ -551,6 +644,11 @@ pub struct Session {
     /// parity of Request ID to allocate, and whether the peer is a participant to
     /// be reported to the control plane.
     facing: Facing,
+
+    /// What this session is billed for, set once it is admitted. Empty when
+    /// nothing is metered and on a session to a parent relay, which is not a
+    /// participant. See [`crate::usage`].
+    meter: Arc<OnceLock<Arc<crate::usage::Meter>>>,
 }
 
 /// Which end of a session this relay is.
@@ -621,16 +719,19 @@ impl Session {
             pulled: Arc::default(),
             subscribed: Arc::default(),
             principal: Arc::default(),
-            permission: Arc::default(),
+            permission: watch::Sender::new(None),
+            held: Arc::default(),
             credential: watch::Sender::new(None),
             via: Arc::default(),
             locale: Arc::default(),
             policy_sequence: Arc::new(AtomicU64::new(0)),
             facing: Facing::Downstream,
+            meter: Arc::default(),
         };
 
         let result = session.run(command_queue).await;
         fabric.remove_session(id);
+        fabric.usage().end(id);
         // Before the log line below, so that a relay reporting upstream says
         // somebody left at the same moment it says so locally. Harmless for a
         // session that was never enrolled, which is every session that failed
@@ -733,12 +834,14 @@ impl Session {
             pulled: Arc::default(),
             subscribed: Arc::default(),
             principal: Arc::default(),
-            permission: Arc::default(),
+            permission: watch::Sender::new(None),
+            held: Arc::default(),
             credential: watch::Sender::new(None),
             via: Arc::default(),
             locale: Arc::default(),
             policy_sequence: Arc::new(AtomicU64::new(0)),
             facing: Facing::Upstream,
+            meter: Arc::default(),
         };
 
         let result = session.run_upstream(command_queue, token).await;
@@ -888,6 +991,13 @@ impl Session {
         // and a departure for somebody who never arrived, and a room's event
         // stream is a thing customers read.
         self.enrol();
+        if let Some(meter) = self
+            .fabric
+            .usage()
+            .begin(self.id, self.permission.subscribe())
+        {
+            let _ = self.meter.set(meter);
+        }
 
         let peer = self.connection().remote_address();
         let live = self
@@ -1158,11 +1268,23 @@ impl Session {
         }
         let deadline = admitted.deadline();
         let _ = self.via.set(admitted.via);
-        // Only ever set once, and this is the only place that sets either. A
-        // peer that could change who it is mid-session could shed a limit; one
-        // that could change what it may do could shed the checks below.
+        // Only ever set once, and this is the only place that sets it. A peer
+        // that could change who it is mid-session could shed a limit.
         let _ = self.principal.set(admitted.who);
-        let _ = self.permission.set(admitted.permission);
+        {
+            let mut held = self.lock_held();
+            held.scope = match &admitted.permission {
+                Permission::Scoped(scope) => Some((**scope).clone()),
+                Permission::Unrestricted | Permission::Nothing => None,
+            };
+            held.issued = admitted.issued;
+        }
+        // Under any ceiling a moderator has set, and this is the line that makes
+        // a demotion survive a reconnection. Without it, somebody demoted who
+        // still had the token they held before could dial back in on it and be
+        // what they were.
+        let permission = self.under_ceiling(admitted.permission);
+        self.permission.send_replace(Some(Arc::new(permission)));
         // The expiry, on the other hand, is kept in something a renewal can
         // move. Enforcing it is what makes the token's short life mean anything
         // after the handshake; see `outlive_credential`.
@@ -1178,8 +1300,13 @@ impl Session {
         self.admissible(address)
     }
 
-    /// Take a renewed credential from a `REQUEST_UPDATE` and move the session's
-    /// deadline out to match.
+    /// Take a renewed credential from a `REQUEST_UPDATE`, move the session's
+    /// deadline out to match, and adopt the grants it carries if they changed.
+    ///
+    /// The grants are what turns a viewer into a guest without a handoff: the
+    /// backend mints a token for the new role, the client presents it on the
+    /// session it already has, and nothing reconnects. The rules for when that
+    /// is allowed are in [`Self::may_regrant`].
     ///
     /// The other half of [`Self::outlive_credential`], and neither is any use
     /// alone: enforcing an expiry without a way to renew would end every call at
@@ -1259,38 +1386,145 @@ impl Session {
             }
         };
 
-        // Who they are and what they may do must survive a renewal unchanged.
-        // Both are write-once on this session for good reasons — a principal is
-        // the key a rate limit is charged against, and a permission is what
-        // every announce and subscribe is checked against — so a token
-        // disagreeing with either could not take effect even if it were
-        // accepted. It would leave the relay enforcing one credential while
-        // holding another, which is worse than refusing.
-        //
-        // So a promotion, a move between rooms, or a change of publishable media
-        // needs a new session rather than a renewal. That is not a limitation
-        // this adds: a mid-session change of powers already travels as a
-        // directive from the control plane, and it does not travel in a token.
+        // Who they are must survive a renewal unchanged. A principal is the key
+        // a rate limit is charged against, so a token naming somebody else could
+        // not take effect even if it were accepted: it would leave the relay
+        // charging one person while serving another.
         if self.principal.get().is_some_and(|who| admitted.who != *who) {
             tracing::warn!(
                 session = %self.id,
                 "a renewed credential named a different holder; ignored"
             );
-            return Ok(());
-        }
-        if self
-            .permission
-            .get()
-            .is_some_and(|held| admitted.permission != *held)
-        {
-            tracing::warn!(
-                session = %self.id,
-                "a renewed credential carried a different scope; ignored"
-            );
+            self.fabric.metrics().regrade_refused("holder");
             return Ok(());
         }
 
-        let deadline = admitted.deadline();
+        // What they may do can change, and this is where a promotion or a
+        // demotion arrives without anybody reconnecting. The comparison is
+        // against the token being replaced, not against the session's current
+        // permission, which a ceiling may have narrowed below it.
+        let fresh = match &admitted.permission {
+            Permission::Scoped(scope) => Some(&**scope),
+            Permission::Unrestricted | Permission::Nothing => None,
+        };
+        let held = self.lock_held().scope.clone();
+        let regrant = match (held.as_ref(), fresh) {
+            // The same grants as before, which is an ordinary renewal — unless
+            // a ceiling has been lifted since and left the session below them.
+            // Lifting a ceiling does not widen anybody by itself, so this is
+            // where it takes effect, and under the same rules as any widening.
+            (Some(held), Some(fresh)) if held == fresh => {
+                let below =
+                    self.under_ceiling(Permission::scoped(fresh.clone())) != *self.permission();
+                (below && self.may_regrant(held, fresh, &admitted, proof.is_some()))
+                    .then(|| fresh.clone())
+            }
+            (Some(held), Some(fresh)) => {
+                // Refused the way a bad renewal is: logged, counted, and
+                // otherwise ignored. The session keeps the grants and the
+                // deadline it had, so it is not given more time on a credential
+                // it was not given.
+                if !self.may_regrant(held, fresh, &admitted, proof.is_some()) {
+                    return Ok(());
+                }
+                Some(fresh.clone())
+            }
+            // Nothing verified on one side or the other. There is no seat to
+            // compare, so there is nothing a renewal could safely change.
+            (held, fresh) if held.is_some() || fresh.is_some() => {
+                tracing::warn!(
+                    session = %self.id,
+                    "a renewed credential carried a different scope; ignored"
+                );
+                self.fabric.metrics().regrade_refused("scope");
+                return Ok(());
+            }
+            _ => None,
+        };
+
+        self.extend(admitted.deadline());
+        if let Some(scope) = regrant {
+            {
+                let mut held = self.lock_held();
+                held.scope = Some(scope.clone());
+                held.issued = admitted.issued;
+            }
+            let permission = self.under_ceiling(Permission::scoped(scope));
+            if let Permission::Scoped(scope) = permission {
+                self.regrant(*scope, "token");
+            }
+        }
+        tracing::debug!(session = %self.id, "credential renewed");
+        Ok(())
+    }
+
+    /// Whether a verified renewal for different grants may take effect on this
+    /// session. A refusal has been logged and counted by the time this returns.
+    ///
+    /// Three rules, each closing a way round a moderator.
+    ///
+    /// **Same seat.** The person, device, room and ownership must not move; see
+    /// [`Scope::same_seat`]. Moving rooms is a new session's work.
+    ///
+    /// **Proven.** The renewal must carry its own proof of possession, checked,
+    /// even where this relay would admit a session without one. A plain renewal
+    /// only keeps a session alive on the grants it already has; one that hands a
+    /// live connection new powers is the case where it matters most that the
+    /// device asking holds the key the token was issued to. On a relay in
+    /// bearer mode proofs are not checked at all, so there is nothing that could
+    /// satisfy this, and grants there change by reconnecting.
+    ///
+    /// **Not superseded.** The token must not have been minted before the one it
+    /// replaces. Otherwise a client could keep its host token, accept a
+    /// demotion, and then hand the host token back: genuine, unexpired, proven,
+    /// and out of date.
+    fn may_regrant(
+        &self,
+        held: &Scope,
+        fresh: &Scope,
+        admitted: &crate::identity::Admission,
+        proven: bool,
+    ) -> bool {
+        let refuse = |reason: &'static str, why: &str| {
+            tracing::warn!(session = %self.id, reason, "{why}; the session keeps its grants");
+            self.fabric.metrics().regrade_refused(reason);
+            false
+        };
+        if held.room != fresh.room {
+            return refuse(
+                "room",
+                "a renewed credential named another room, which needs a new session",
+            );
+        }
+        if !held.same_seat(fresh) {
+            return refuse("seat", "a renewed credential named a different seat");
+        }
+        let checked = self.fabric.possession().mode() != crate::possession::Enforcement::Bearer;
+        if !(proven && checked) {
+            return refuse(
+                "unproven",
+                "a renewed credential changing grants carried no checked proof of possession",
+            );
+        }
+        let held_issued = self.lock_held().issued;
+        let superseded = match (held_issued, admitted.issued) {
+            (Some(held), Some(fresh)) => fresh < held,
+            // A token that does not say when it was minted cannot be ordered
+            // against one that does, and the safe reading is the old one.
+            (Some(_), None) => true,
+            (None, _) => false,
+        };
+        if superseded {
+            return refuse(
+                "stale",
+                "a renewed credential changing grants was older than the one it replaces",
+            );
+        }
+        true
+    }
+
+    /// Move the credential's deadline out to `deadline`, if that is later.
+    fn extend(&self, deadline: Option<SystemTime>) {
         // Forward only. A token with an earlier expiry than the one in hand is
         // accepted and changes nothing, rather than being refused: it is a
         // client renewing from a stale cache, which is a harmless mistake, and
@@ -1307,8 +1541,79 @@ impl Session {
                 }
             }
         });
-        tracing::debug!(session = %self.id, "credential renewed");
-        Ok(())
+    }
+
+    /// `permission` with nothing above the ceiling a moderator has set for this
+    /// seat, if they have set one.
+    fn under_ceiling(&self, permission: Permission) -> Permission {
+        let Permission::Scoped(scope) = &permission else {
+            return permission;
+        };
+        let Some(room) = &scope.room else {
+            return permission;
+        };
+        let ceiling = self.fabric.policy().ceiling(
+            &(Arc::clone(&scope.tenant), Arc::clone(room)),
+            &scope.user,
+            &scope.device,
+        );
+        match ceiling {
+            Some(ceiling) => Permission::scoped(scope.capped(ceiling)),
+            None => permission,
+        }
+    }
+
+    /// Hold this session to `to` from now on.
+    ///
+    /// Everything that depends on what a session may do follows from the one
+    /// `send_replace` below. New requests are checked against it as they
+    /// arrive. Open ones are woken by it and each re-asks its own question: an
+    /// announcement the new grants do not cover is withdrawn, a subscription
+    /// they do not cover is ended with `PUBLISH_DONE`, a watch with a refusal —
+    /// and nothing else is touched, so a demoted guest goes on watching the
+    /// stage they just left.
+    ///
+    /// The roster goes first. An audience-only mute is decided by whether the
+    /// *subscriber* is privileged, read from the roster on the publisher's
+    /// task, so a demoted cohost's subscriptions must already read as an
+    /// audience member's by the time they wake to re-check.
+    fn regrant(&self, to: Scope, source: &'static str) {
+        let before = self.permission();
+        let Permission::Scoped(from) = &*before else {
+            return;
+        };
+        let Some(change) = from.regrade(&to) else {
+            return;
+        };
+        let moved = from.backstage != to.backstage;
+        self.fabric.roster().regrade(self.id, &to);
+        tracing::info!(
+            session = %self.id,
+            change = change.name(),
+            source,
+            publish_from = ?from.publish,
+            publish_to = ?to.publish,
+            capabilities_from = format_args!("{:#x}", from.capabilities),
+            capabilities_to = format_args!("{:#x}", to.capabilities),
+            backstage_from = from.backstage,
+            backstage_to = to.backstage,
+            "grants changed on a live session"
+        );
+        self.fabric.metrics().regraded(change.name());
+        self.permission
+            .send_replace(Some(Arc::new(Permission::scoped(to))));
+
+        // The `.policy` track's name includes which side of the stage somebody
+        // is on, so a move puts them under a name they have never been told
+        // anything on. A mute held in the queue must be heard again on stage,
+        // before the camera that the promotion is about to start.
+        if moved {
+            let silence = self.silence();
+            if !silence.is_empty() {
+                let session = self.clone();
+                tokio::spawn(async move { session.tell_policy(silence).await });
+            }
+        }
     }
 
     /// Whether the room will have this session, as distinct from whether its
@@ -1319,7 +1624,17 @@ impl Session {
     /// control plane sent the room's state. Asking it now — at the moment a
     /// phone is waiting to join — is the design this is arranged to avoid.
     fn admissible(&self, address: std::net::IpAddr) -> Result<(), SessionError> {
-        let Permission::Scoped(scope) = self.permission() else {
+        // Before the room's rules and regardless of whether there is a scope to
+        // read them against: a self-hosted relay told its tenant may not admit
+        // refuses every new session, and only new ones.
+        if !self.fabric.usage().admitting() {
+            let refusal = crate::policy::Refusal::NotAdmitting;
+            tracing::info!(session = %self.id, %address, "session refused: billing is not admitting");
+            self.fabric.metrics().policy_refused(refusal.name());
+            return Err(SessionError::Refused(refusal));
+        }
+        let permission = self.permission();
+        let Permission::Scoped(scope) = &*permission else {
             // Nothing to check against. Either no keys are configured, in which
             // case this relay authorises nothing and says so at startup, or the
             // token has not been verified yet — and no request is served in
@@ -1351,7 +1666,8 @@ impl Session {
     /// Silently does nothing for a session with no verified room, which is the
     /// correct amount of reporting about somebody the control plane cannot name.
     fn enrol(&self) {
-        let Permission::Scoped(scope) = self.permission() else {
+        let permission = self.permission();
+        let Permission::Scoped(scope) = &*permission else {
             return;
         };
         let via = self.via.get().cloned().flatten();
@@ -1426,7 +1742,8 @@ impl Session {
     /// relay that authorises nothing: there is nobody the control plane could
     /// have named in a mute.
     fn silence(&self) -> Silence {
-        let Permission::Scoped(scope) = self.permission() else {
+        let permission = self.permission();
+        let Permission::Scoped(scope) = &*permission else {
             return Silence::default();
         };
         let Some(room) = scope.room.as_ref() else {
@@ -1458,14 +1775,26 @@ impl Session {
     /// whose token has not been read is exactly the case authorisation exists
     /// for, and a relay without them permits, because it has nothing to check
     /// against and refusing would leave it unable to relay at all.
-    fn permission(&self) -> &Permission {
-        self.permission.get_or_init(|| {
-            if self.fabric.authenticator().is_enabled() {
-                Permission::Nothing
-            } else {
-                Permission::Unrestricted
-            }
+    ///
+    /// Returned by value, as a shared handle, because it can change between two
+    /// reads: a caller that held a borrow across an await would be holding the
+    /// `watch` lock, and one that re-read it for each half of a decision could
+    /// make the two halves against different grants.
+    fn permission(&self) -> Arc<Permission> {
+        if let Some(permission) = self.permission.borrow().as_ref() {
+            return Arc::clone(permission);
+        }
+        Arc::new(if self.fabric.authenticator().is_enabled() {
+            Permission::Nothing
+        } else {
+            Permission::Unrestricted
         })
+    }
+
+    fn lock_held(&self) -> std::sync::MutexGuard<'_, Held> {
+        self.held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Turn a denial into the refusal that goes back on the request stream.
@@ -1720,23 +2049,49 @@ impl Session {
         // publisher's announcement is its longest-lived stream, so it is the
         // natural place for it to renew, and reading one frame and stopping
         // would have withdrawn the namespace on the first attempt.
+        //
+        // The grants are watched alongside, because an announcement is the
+        // thing a demotion most has to end: a guest returned to the audience is
+        // still holding a namespace the audience is watching.
+        let mut grants = self.permission.subscribe();
+        let mut revoked = false;
         let (result, reason) = loop {
-            match frames.next().await {
-                Ok(None) => break (Ok(()), DoneReason::Stopped),
-                Ok(Some(frame)) if frame.message_type == MessageType::RequestUpdate => {
-                    if let Err(e) = self.renew_credential(&frame) {
-                        break (Err(e), DoneReason::Vanished);
+            tokio::select! {
+                frame = frames.next() => match frame {
+                    Ok(None) => break (Ok(()), DoneReason::Stopped),
+                    Ok(Some(frame)) if frame.message_type == MessageType::RequestUpdate => {
+                        if let Err(e) = self.renew_credential(&frame) {
+                            break (Err(e), DoneReason::Vanished);
+                        }
                     }
-                }
-                Ok(Some(_)) => {
+                    Ok(Some(_)) => {
+                        break (
+                            Err(SessionError::Protocol(
+                                "unexpected message on a PUBLISH_NAMESPACE stream",
+                            )),
+                            DoneReason::Vanished,
+                        );
+                    }
+                    Err(e) => break (Err(e), DoneReason::Vanished),
+                },
+                changed = grants.changed() => {
+                    if changed.is_err() {
+                        continue;
+                    }
+                    let Err(denial) = self.permission().may_announce(&request.namespace) else {
+                        continue;
+                    };
+                    revoked = true;
+                    // `Stopped` rather than `Vanished`: the watchers are told
+                    // this publisher is not coming back under this name, which
+                    // is true, rather than to hold a tile open for a reconnect
+                    // that is not going to happen.
                     break (
-                        Err(SessionError::Protocol(
-                            "unexpected message on a PUBLISH_NAMESPACE stream",
-                        )),
-                        DoneReason::Vanished,
+                        self.revoke("announcement", denial, &request.namespace, send_stream)
+                            .await,
+                        DoneReason::Stopped,
                     );
                 }
-                Err(e) => break (Err(e), DoneReason::Vanished),
             }
         };
 
@@ -1747,7 +2102,90 @@ impl Session {
             "namespace withdrawn"
         );
         self.fabric.withdraw(self.id, &request.namespace, reason);
+        if revoked {
+            // Withdrawing the name stops anybody new arriving. The subscribers
+            // already here are the other half, and they are the half that does
+            // not depend on the client cooperating: a phone that ignored the
+            // refusal and kept sending would otherwise still be forwarded to
+            // everybody already watching it.
+            let stopped = self.stop_pulls_under(&request.namespace);
+            tracing::info!(
+                session = %self.id,
+                namespace = %request.namespace,
+                tracks = stopped,
+                "stopped pulling a revoked announcement"
+            );
+        }
         result
+    }
+
+    /// End a request because the session's grants no longer cover it, saying so
+    /// on its stream.
+    ///
+    /// `REQUEST_ERROR` with the authorisation code, which is the answer the
+    /// request would get if it were made now. The reason phrase says that the
+    /// grants changed, so a client can tell this from a request that was never
+    /// allowed: the right response to the first is to update its UI, and to the
+    /// second is to stop asking.
+    async fn revoke(
+        &self,
+        request: &'static str,
+        denial: Denial,
+        name: &TrackNamespace,
+        send_stream: &mut SendStream,
+    ) -> Result<(), SessionError> {
+        tracing::info!(
+            session = %self.id,
+            %name,
+            request,
+            reason = denial.name(),
+            "request ended: the session's grants no longer cover it"
+        );
+        self.fabric.metrics().revoked(request);
+        send(
+            send_stream,
+            &RequestError::new(
+                denial.code(),
+                ReasonPhrase::truncating(&format!("{GRANTS_CHANGED}: {denial}")),
+            ),
+        )
+        .await
+    }
+
+    /// Stop every upstream subscription to a track under `namespace`, telling
+    /// the subscribers it ended, and report how many.
+    ///
+    /// For an announcement that has been revoked rather than withdrawn. When a
+    /// publisher withdraws, it stops sending and its subscriptions wind down on
+    /// their own; when the relay withdraws it, nothing says the publisher will.
+    fn stop_pulls_under(&self, namespace: &TrackNamespace) -> usize {
+        let stopping: Vec<(TrackAlias, Arc<Notify>)> = self
+            .lock_pulled()
+            .iter()
+            .filter(|(track, _)| track.namespace() == namespace)
+            .filter_map(|(_, pull)| match pull {
+                Pull::Ready(upstream) => Some((upstream.alias, Arc::clone(&upstream.stop))),
+                // Not yet established. The task establishing it checks the
+                // grants again when it completes, and stops it then.
+                Pull::Pending(_) => None,
+            })
+            .collect();
+
+        // Told before the pull stops, because stopping forgets the routes. A
+        // permit rather than a broadcast, so a subscriber task between two
+        // waits still finds it.
+        {
+            let routes = self.lock_routes();
+            for (alias, _) in &stopping {
+                for route in routes.get(alias).into_iter().flatten() {
+                    route.done.notify_one();
+                }
+            }
+        }
+        for (_, stop) in &stopping {
+            stop.notify_one();
+        }
+        stopping.len()
     }
 
     /// Report matching namespaces, now and as they change.
@@ -1774,6 +2212,10 @@ impl Session {
 
         let (existing, mut events) = self.fabric.watch(self.id, prefix.clone());
         tracing::info!(session = %self.id, %prefix, "watching namespaces");
+        // A host demoted to the audience stops being entitled to the backstage
+        // queue they were watching, and this is what ends that watch. The room's
+        // own watch survives a demotion, which is what keeps the roster going.
+        let mut grants = self.permission.subscribe();
 
         for namespace in existing {
             if let Some(suffix) = suffix_of(&namespace, &prefix) {
@@ -1815,11 +2257,42 @@ impl Session {
                     )),
                     Err(e) => break Err(e),
                 },
+
+                changed = grants.changed() => {
+                    if changed.is_err() {
+                        continue;
+                    }
+                    if let Err(denial) = self.permission().may_read(&prefix) {
+                        break self.revoke("watch", denial, &prefix, send_stream).await;
+                    }
+                }
             }
         };
 
         self.fabric.unwatch(self.id, &prefix);
         result
+    }
+
+    /// A subscription: to a direct-ticket track, which this relay answers
+    /// itself, or to anything else, which somebody publishes.
+    async fn on_subscribe(
+        &self,
+        frame: &ControlFrame,
+        send_stream: &mut SendStream,
+        frames: &mut Frames,
+        slot: Lease,
+    ) -> Result<(), SessionError> {
+        let request = Subscribe::decode(&mut frame.body.clone())?;
+        match ticket_peer(&request.track) {
+            Some(peer) => {
+                self.serve_tickets(&request.track, peer, send_stream, frames, slot)
+                    .await
+            }
+            None => {
+                self.subscribe_track(request, send_stream, frames, slot)
+                    .await
+            }
+        }
     }
 
     /// Satisfy a subscription by pulling the track from whoever publishes it.
@@ -1833,14 +2306,13 @@ impl Session {
     /// request stream does: there is no UNSUBSCRIBE message in this protocol,
     /// so the subscriber closing the stream is the only way it can say it has
     /// stopped watching, and something has to be here to hear it.
-    async fn on_subscribe(
+    async fn subscribe_track(
         &self,
-        frame: &ControlFrame,
+        request: Subscribe,
         send_stream: &mut SendStream,
         frames: &mut Frames,
         slot: Lease,
     ) -> Result<(), SessionError> {
-        let request = Subscribe::decode(&mut frame.body.clone())?;
         let track = request.track.clone();
 
         // Before the publisher is looked up, so that a refusal cannot be told
@@ -1903,9 +2375,11 @@ impl Session {
         };
 
         let alias = self.allocate_alias();
-        let route = Route::new(self.transport.clone(), self.id, alias);
+        let route =
+            Route::new(self.transport.clone(), self.id, alias).metered(self.meter.get().cloned());
         let ending = Arc::clone(&route.done);
         let streams = Arc::clone(&route.streams);
+        let forward = Arc::clone(&route.forward);
         let (ready, answered) = oneshot::channel();
         let command = Command::Subscribe {
             track: track.clone(),
@@ -1941,7 +2415,16 @@ impl Session {
                 // `slot` is held rather than stored, now that the subscription
                 // and its request stream end together: the limit counts
                 // subscriptions because this call lasts as long as one.
-                let outcome = self.hold(send_stream, frames, &ending, &streams).await;
+                let meter = self.meter.get();
+                if let Some(meter) = meter {
+                    meter.watch(&track);
+                }
+                let outcome = self
+                    .hold(&track, send_stream, frames, &ending, &streams, &forward)
+                    .await;
+                if let Some(meter) = meter {
+                    meter.unwatch(&track);
+                }
                 drop(slot);
 
                 self.lock_subscribed().remove(&request.request_id);
@@ -1960,6 +2443,168 @@ impl Session {
         }
     }
 
+    /// Issue direct tickets on the participant's own `.direct/{peer}` track for
+    /// as long as it holds the subscription, and meter that time.
+    ///
+    /// Answered here rather than by anybody's publication: the relay is the
+    /// publisher, and the participant is the only one who may subscribe. One
+    /// object per ticket, each on its own group, so a renewal is never
+    /// mistaken for part of the one before.
+    async fn serve_tickets(
+        &self,
+        track: &FullTrackName,
+        peer: &str,
+        send_stream: &mut SendStream,
+        frames: &mut Frames,
+        slot: Lease,
+    ) -> Result<(), SessionError> {
+        let refuse = |code, reason: &str| RequestError::new(code, ReasonPhrase::truncating(reason));
+        let eligible = |permission: &Permission| match permission {
+            Permission::Scoped(scope) => {
+                ticket_eligibility(scope, track.namespace(), peer).map(|()| scope.clone())
+            }
+            Permission::Unrestricted | Permission::Nothing => {
+                Err("direct tickets need a verified participant")
+            }
+        };
+        if let Err(why) = eligible(&self.permission()) {
+            tracing::info!(session = %self.id, %track, reason = why, "direct ticket refused");
+            return send(send_stream, &refuse(RequestErrorCode::UNAUTHORIZED, why)).await;
+        }
+        let Some(ticketing) = self.fabric.tickets().cloned() else {
+            return send(
+                send_stream,
+                &refuse(
+                    RequestErrorCode::NOT_SUPPORTED,
+                    "this relay issues no direct tickets",
+                ),
+            )
+            .await;
+        };
+
+        let alias = self.allocate_alias();
+        send(send_stream, &SubscribeOk::new(alias)).await?;
+        tracing::info!(session = %self.id, %track, "direct tickets started");
+        let meter = self.meter.get().cloned();
+        if let Some(meter) = &meter {
+            meter.direct_began();
+        }
+
+        let mut grants = self.permission.subscribe();
+        let mut issued = 0u64;
+        let outcome = 'issuing: loop {
+            // Re-read each time, so a ticket never outlives the grants it
+            // was issued under by more than its own lifetime.
+            let scope = match eligible(&self.permission()) {
+                Ok(scope) => scope,
+                Err(why) => break 'issuing self.end_tickets(send_stream, issued, why).await,
+            };
+            if let Err(e) = self
+                .send_ticket(&scope, peer, alias, issued, &ticketing)
+                .await
+            {
+                break 'issuing Err(e);
+            }
+            issued += 1;
+
+            let renewal = tokio::time::sleep(ticketing.renew);
+            tokio::pin!(renewal);
+            loop {
+                tokio::select! {
+                    () = &mut renewal => break,
+                    changed = grants.changed() => {
+                        if changed.is_err() {
+                            continue;
+                        }
+                        if let Err(why) = eligible(&self.permission()) {
+                            break 'issuing self.end_tickets(send_stream, issued, why).await;
+                        }
+                    }
+                    frame = frames.next() => match frame {
+                        Ok(None) => break 'issuing Ok(()),
+                        Ok(Some(frame)) if frame.message_type == MessageType::RequestUpdate => {
+                            if let Err(e) = self.renew_credential(&frame) {
+                                break 'issuing Err(e);
+                            }
+                        }
+                        Ok(Some(_)) => break 'issuing Err(SessionError::Protocol(
+                            "unexpected message on a SUBSCRIBE stream",
+                        )),
+                        Err(e) => break 'issuing Err(e),
+                    },
+                }
+            }
+        };
+
+        if let Some(meter) = &meter {
+            meter.direct_ended();
+        }
+        tracing::info!(session = %self.id, %track, issued, "direct tickets stopped");
+        drop(slot);
+        outcome
+    }
+
+    /// End a ticket subscription the participant's grants no longer allow.
+    async fn end_tickets(
+        &self,
+        send_stream: &mut SendStream,
+        issued: u64,
+        why: &str,
+    ) -> Result<(), SessionError> {
+        let mut done =
+            PublishDone::new(PublishDoneStatus::UNAUTHORIZED, StreamCount::Exact(issued));
+        done.reason = ReasonPhrase::truncating(&format!("{GRANTS_CHANGED}: {why}"));
+        send(send_stream, &done).await
+    }
+
+    /// Sign one ticket and write it as group `group` of the ticket track.
+    ///
+    /// The ticket keys go with it, which is how the participant learns what
+    /// to check its peer's tickets against: from its own relay, never from the
+    /// peer.
+    async fn send_ticket(
+        &self,
+        scope: &Scope,
+        peer: &str,
+        alias: TrackAlias,
+        group: u64,
+        ticketing: &crate::fabric::Ticketing,
+    ) -> Result<(), SessionError> {
+        let claims = crate::ticket::Claims::new(
+            &scope.tenant,
+            scope.room.as_deref().unwrap_or_default(),
+            &scope.user,
+            &scope.device,
+            peer,
+            SystemTime::now(),
+        );
+        let payload = serde_json::json!({
+            "version": 1,
+            "ticket": ticketing.keys.issue(&claims),
+            "expires": claims.exp,
+            "keys": ticketing.keys.public_jwks(),
+        });
+        let payload = Bytes::from(serde_json::to_vec(&payload).unwrap_or_default());
+
+        let header = SubgroupHeader::new(
+            alias,
+            GroupId::new(VarInt::new(group).unwrap_or(VarInt::MAX)),
+            SubgroupSource::Zero,
+        );
+        let mut buf = BytesMut::new();
+        header.encode(&mut buf);
+        SubgroupWriter::new(&header)
+            .write(
+                &mut buf,
+                &SubgroupObject::new(ObjectSeq::from(0u32), payload),
+            )
+            .map_err(|_| SessionError::Protocol("could not encode a ticket object"))?;
+        let mut stream = self.transport.open_uni().await?;
+        stream.write_all(&buf).await?;
+        let _ = stream.finish();
+        Ok(())
+    }
+
     /// Stay with a subscription until one end or the other finishes it.
     ///
     /// Two ways out, and they are not symmetrical. The subscriber closing its
@@ -1968,15 +2613,49 @@ impl Session {
     /// indistinguishable from a network that has gone quiet, and the two call
     /// for opposite responses from a player, so `PUBLISH_DONE` is what turns a
     /// stall into news.
+    ///
+    /// A third, which is neither end's doing: the subscriber's grants changed
+    /// and no longer cover the track. Two questions are asked again, because a
+    /// demotion can change either answer. Whether they may read the name at all
+    /// — a cohost watching backstage loses that — and whether an audience-only
+    /// mute now withholds it, since hearing through one is a privilege of the
+    /// people running the room.
     async fn hold(
         &self,
+        track: &FullTrackName,
         send_stream: &mut SendStream,
         frames: &mut Frames,
         ending: &Notify,
         streams: &AtomicU64,
+        forward: &AtomicBool,
     ) -> Result<(), SessionError> {
+        let mut grants = self.permission.subscribe();
         loop {
             tokio::select! {
+                changed = grants.changed() => {
+                    if changed.is_err() {
+                        continue;
+                    }
+                    let why = match self.permission().may_read(track.namespace()) {
+                        Err(denial) => denial.to_string(),
+                        Ok(()) if self.withheld(track) => "a mute withholds it from the audience".to_owned(),
+                        Ok(()) => continue,
+                    };
+                    tracing::info!(
+                        session = %self.id,
+                        %track,
+                        reason = %why,
+                        "subscription ended: the session's grants no longer cover it"
+                    );
+                    self.fabric.metrics().revoked("subscription");
+                    let mut done = PublishDone::new(
+                        PublishDoneStatus::UNAUTHORIZED,
+                        StreamCount::Exact(streams.load(Ordering::Relaxed)),
+                    );
+                    done.reason = ReasonPhrase::truncating(&format!("{GRANTS_CHANGED}: {why}"));
+                    return send(send_stream, &done).await;
+                }
+
                 () = ending.notified() => {
                     // Read after the pull has stopped, so nothing can open
                     // another stream under it and the count is final rather
@@ -1995,13 +2674,16 @@ impl Session {
                 frame = frames.next() => match frame {
                     // How unsubscribe is spelled. There is no message for it.
                     Ok(None) => return Ok(()),
-                    // A subscriber may re-prioritise a subscription it holds, or
-                    // renew the session's credential. Nothing here acts on
-                    // priorities yet, and answering a hint by tearing down the
-                    // session it was sent on would be a wildly disproportionate
-                    // way to say so.
+                    // A subscriber may re-prioritise a subscription it holds,
+                    // pause or resume it, or renew the session's credential.
+                    // Nothing here acts on priorities yet, and answering a hint
+                    // by tearing down the session it was sent on would be a
+                    // wildly disproportionate way to say so.
                     Ok(Some(frame)) if frame.message_type == MessageType::RequestUpdate => {
                         self.renew_credential(&frame)?;
+                        if let Some(wanted) = forwarding(&frame)? {
+                            forward.store(wanted, Ordering::Relaxed);
+                        }
                     }
                     Ok(Some(_)) => return Err(SessionError::Protocol(
                         "unexpected message on a SUBSCRIBE stream",
@@ -2192,6 +2874,9 @@ impl Session {
         }
 
         stream.write_all(&buf).await?;
+        if let Some(meter) = self.meter.get() {
+            meter.egress(buf.len());
+        }
         let _ = stream.finish();
         Ok(())
     }
@@ -2213,6 +2898,17 @@ impl Session {
                 downstream,
             } => self.release_route(&track, upstream, subscriber, downstream),
             Command::Restrict { silence } => self.restrict(silence),
+            Command::Regrant { ceiling } => {
+                // The current permission, capped. Never the token's grants
+                // capped, which could be wider than what the session holds now
+                // if an earlier ceiling had already narrowed it: a directive
+                // takes away, and this is where that is made true by
+                // construction.
+                let current = self.permission();
+                if let Permission::Scoped(scope) = &*current {
+                    self.regrant(scope.capped(ceiling), "directive");
+                }
+            }
         }
     }
 
@@ -2333,7 +3029,8 @@ impl Session {
     /// already enforced by the pulls that were cancelled and by the policy that
     /// will refuse the next subscription.
     async fn tell_policy(&self, silence: Silence) {
-        let Permission::Scoped(scope) = self.permission() else {
+        let permission = self.permission();
+        let Permission::Scoped(scope) = &*permission else {
             return;
         };
         let Some(track) = policy_track(scope) else {
@@ -2404,6 +3101,15 @@ impl Session {
         hops: Hops,
         ready: oneshot::Sender<Result<Pulling, UpstreamError>>,
     ) {
+        // A subscriber found this session by its announcement, and a demotion
+        // can withdraw that announcement between the lookup and this command
+        // arriving. Answered as though nobody published it, which since a
+        // moment ago is true.
+        if !self.still_publishes(&track) {
+            let _ = ready.send(Err(UpstreamError::unavailable()));
+            return;
+        }
+
         // Resolved in its own scope so the lock is not held across the await
         // points below, and so the `Vacant` arm can claim the track before
         // anything is spawned.
@@ -2470,9 +3176,22 @@ impl Session {
                         upstream,
                         shared: false,
                     }));
+                    // The grants may have changed during that round trip, after
+                    // a revocation had already swept the pulls that were ready.
+                    if !session.still_publishes(&track) {
+                        session.stop_pulls_under(track.namespace());
+                    }
                 });
             }
         }
+    }
+
+    /// Whether this session's grants still let it publish `track`.
+    ///
+    /// Only asked of a session facing downstream: a parent relay is not
+    /// authorised by this relay, and holds no permission here to ask about.
+    fn still_publishes(&self, track: &FullTrackName) -> bool {
+        self.facing == Facing::Upstream || self.permission().may_announce(track.namespace()).is_ok()
     }
 
     /// Add a route to a subscription somebody else already established, unless
@@ -2652,7 +3371,13 @@ impl Session {
         };
 
         let metrics = self.fabric.metrics();
-        let routes = self.routes_for(header.track_alias);
+        // A paused subscriber is skipped for the whole subgroup rather than cut
+        // off inside one, so what it does receive is always whole.
+        let routes: Vec<Route> = self
+            .routes_for(header.track_alias)
+            .into_iter()
+            .filter(|route| route.forward.load(Ordering::Relaxed))
+            .collect();
         // Looked up before the early return below, so that a subgroup arriving on
         // a track nobody is watching still counts as the publisher being alive.
         // Otherwise the last subscriber leaving would make a healthy publisher
@@ -2679,10 +3404,14 @@ impl Session {
             .into_iter()
             .map(|route| Outlet::open(&route, &header, metrics.clone()))
             .collect();
+        let meter = self.meter.get().cloned();
 
         let leftover = frames.take_buffered();
         if !leftover.is_empty() {
             metrics.ingress(leftover.len());
+            if let Some(meter) = &meter {
+                meter.ingress(leftover.len());
+            }
             if let Some(flow) = &flow {
                 flow.carried(leftover.len());
             }
@@ -2702,6 +3431,9 @@ impl Session {
                 Ok(Some(0) | None) | Err(_) => break,
                 Ok(Some(n)) => {
                     metrics.ingress(n);
+                    if let Some(meter) = &meter {
+                        meter.ingress(n);
+                    }
                     if let Some(flow) = &flow {
                         flow.carried(n);
                     }
@@ -2736,17 +3468,24 @@ impl Session {
                 );
                 None
             })?;
-        let catalog = track.name().as_ref() == b".catalog";
+        let catalog = (track.name().as_ref() == b".catalog").then(|| track.namespace().clone());
         let recorder = self.fabric.cache().record(track, header);
-        (recorder.is_enabled() || catalog)
-            .then(|| Tee::new(header, recorder, catalog.then(|| self.clone())))
+        (recorder.is_enabled() || catalog.is_some()).then(|| {
+            Tee::new(
+                header,
+                recorder,
+                catalog.map(|namespace| (self.clone(), namespace)),
+            )
+        })
     }
 
-    /// Take a locale from a catalog object, if it changed.
-    fn note_catalog(&self, object: &SubgroupObject) {
+    /// Take a locale from a catalog object, if it changed, and the geometry of
+    /// what it lists for tiering the people watching.
+    fn note_catalog(&self, namespace: &TrackNamespace, object: &SubgroupObject) {
         let SubgroupContent::Normal { payload, .. } = &object.content else {
             return;
         };
+        self.fabric.usage().catalog(self.id, namespace, payload);
         let Some(locale) = crate::catalog::locale_in(payload) else {
             return;
         };
@@ -2915,6 +3654,26 @@ impl Session {
     }
 }
 
+/// The FORWARD value a `REQUEST_UPDATE` carries, if it carries one.
+///
+/// # Errors
+/// A value other than 0 or 1, which draft-19 makes a protocol violation, or an
+/// update that does not decode.
+fn forwarding(frame: &ControlFrame) -> Result<Option<bool>, SessionError> {
+    let update = RequestUpdate::decode(&mut frame.body.clone())?;
+    let Some(parameter) = update
+        .parameters
+        .get(moqom_proto::control::params::param_type::FORWARD)
+    else {
+        return Ok(None);
+    };
+    match parameter.as_varint().map(u64::from) {
+        Some(0) => Ok(Some(false)),
+        Some(1) => Ok(Some(true)),
+        _ => Err(SessionError::Protocol("FORWARD must be 0 or 1")),
+    }
+}
+
 /// Parses a copy of a forwarded subgroup stream into the cache.
 ///
 /// Object IDs on a subgroup stream are delta-encoded against the previous
@@ -2932,12 +3691,17 @@ struct Tee {
     /// Bytes received but not yet a whole object.
     pending: BytesMut,
     live: bool,
-    /// The session whose catalog this is, when the track is `.catalog`.
-    catalog: Option<Session>,
+    /// The session whose catalog this is, and the namespace it describes, when
+    /// the track is `.catalog`.
+    catalog: Option<(Session, TrackNamespace)>,
 }
 
 impl Tee {
-    fn new(header: &SubgroupHeader, recorder: cache::Recorder, catalog: Option<Session>) -> Self {
+    fn new(
+        header: &SubgroupHeader,
+        recorder: cache::Recorder,
+        catalog: Option<(Session, TrackNamespace)>,
+    ) -> Self {
         Self {
             reader: SubgroupReader::new(header),
             recorder,
@@ -2961,8 +3725,8 @@ impl Tee {
                     let consumed = self.pending.len() - cursor.len();
                     self.pending.advance(consumed);
                     self.recorder.push(&object);
-                    if let Some(session) = &self.catalog {
-                        session.note_catalog(&object);
+                    if let Some((session, namespace)) = &self.catalog {
+                        session.note_catalog(namespace, &object);
                     }
                 }
                 Err(DecodeError::Short { .. }) => return,
@@ -3100,6 +3864,7 @@ impl Outlet {
         route.streams.fetch_add(1, Ordering::Relaxed);
 
         let session = route.session.clone();
+        let meter = route.meter.clone();
         // Re-addressed per destination: the alias is the subscriber's own, and
         // everything after the header is copied verbatim.
         let header = SubgroupHeader {
@@ -3175,6 +3940,9 @@ impl Outlet {
                 }
                 note(&progress, opened);
                 metrics.egress(length);
+                if let Some(meter) = &meter {
+                    meter.egress(length);
+                }
             }
 
             let _ = stream.reset(RESET_SHED);
@@ -3274,6 +4042,39 @@ mod tests {
 
     fn namespace(fields: &[&str]) -> TrackNamespace {
         TrackNamespace::from_parts(fields).expect("valid namespace")
+    }
+
+    fn update(forward: Option<u32>) -> ControlFrame {
+        use moqom_proto::control::params::{Parameter, param_type};
+        let mut update = RequestUpdate::new(RequestId::new(4).expect("a small ID"));
+        if let Some(value) = forward {
+            update.parameters.push(
+                Parameter::varint(
+                    param_type::FORWARD,
+                    moqom_proto::varint::VarInt::from(value),
+                )
+                .expect("an even type"),
+            );
+        }
+        let mut body = bytes::BytesMut::new();
+        update.encode(&mut body);
+        ControlFrame {
+            message_type: MessageType::RequestUpdate,
+            body: body.freeze(),
+        }
+    }
+
+    /// Absent means unchanged, and anything but 0 or 1 is a protocol violation
+    /// (draft-19 §10.2.17) rather than something to round to a boolean.
+    #[test]
+    fn forward_is_zero_one_or_unchanged() {
+        assert_eq!(forwarding(&update(None)).ok(), Some(None));
+        assert_eq!(forwarding(&update(Some(0))).ok(), Some(Some(false)));
+        assert_eq!(forwarding(&update(Some(1))).ok(), Some(Some(true)));
+        assert!(matches!(
+            forwarding(&update(Some(2))),
+            Err(SessionError::Protocol(_))
+        ));
     }
 
     #[test]

@@ -116,6 +116,11 @@ pub enum AuthError {
     /// Issued by a different deployment.
     #[error("token was issued by another deployment")]
     WrongIssuer,
+    /// Verified, but for a tenant this relay does not serve. Only a relay
+    /// pinned to one tenant -- a customer's own, enrolled for their tenant --
+    /// says this.
+    #[error("token is for another tenant")]
+    WrongTenant,
     /// Verified, but does not name a tenant, user, and device.
     #[error("token does not name a complete identity")]
     Incomplete,
@@ -145,9 +150,11 @@ impl AuthError {
             // when the proof itself is what was malformed: the token is fine, and
             // a client told its token was malformed goes and fetches another one,
             // which will not help it.
-            Self::UnknownKey | Self::BadSignature | Self::WrongIssuer | Self::Unproven(_) => {
-                Code::UNAUTHORIZED
-            }
+            Self::UnknownKey
+            | Self::BadSignature
+            | Self::WrongIssuer
+            | Self::WrongTenant
+            | Self::Unproven(_) => Code::UNAUTHORIZED,
         }
     }
 
@@ -162,6 +169,7 @@ impl AuthError {
             Self::Expired => "expired",
             Self::NotYetValid => "not_yet_valid",
             Self::WrongIssuer => "wrong_issuer",
+            Self::WrongTenant => "wrong_tenant",
             Self::Incomplete => "incomplete",
             Self::Unproven(e) => e.name(),
         }
@@ -249,6 +257,7 @@ struct Confirmation {
 ///   which the capability rule already imposed.
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
+#[allow(clippy::struct_excessive_bools)] // the claim's shape, which the minter decides
 struct Scope {
     #[serde(default)]
     room: String,
@@ -271,6 +280,10 @@ struct Scope {
     #[serde(default)]
     #[allow(dead_code)]
     age: bool,
+    /// Whether the holder is another relay's link to this one. See
+    /// [`scope::Scope::relay`](crate::scope::Scope::relay).
+    #[serde(default)]
+    rly: bool,
 }
 
 /// A public key this relay will accept tokens from.
@@ -378,6 +391,8 @@ struct Shared {
 
 struct Keys {
     issuer: String,
+    /// The one tenant this relay serves, or empty for any.
+    tenant: String,
     by_id: HashMap<String, Vec<u8>>,
 }
 
@@ -411,11 +426,42 @@ impl Authenticator {
             inner: Arc::new(Shared {
                 effective: RwLock::new(Arc::new(Keys {
                     issuer: issuer.into(),
+                    tenant: String::new(),
                     by_id: configured.clone(),
                 })),
                 configured,
             }),
         }
+    }
+
+    /// The same, refusing every token not issued for `tenant`.
+    ///
+    /// For a relay a customer runs and enrolled for their own tenant. The
+    /// control plane already refuses to tell such a relay about anybody else's
+    /// rooms; this is the relay declining to serve them in the first place,
+    /// with keys that would otherwise verify every tenant's tokens. Empty is
+    /// the same as [`Self::new`].
+    #[must_use]
+    pub fn for_tenant(
+        issuer: impl Into<String>,
+        tenant: impl Into<String>,
+        keys: Vec<VerificationKey>,
+    ) -> Self {
+        let authenticator = Self::new(issuer, keys);
+        let tenant = tenant.into();
+        {
+            let mut effective = authenticator
+                .inner
+                .effective
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *effective = Arc::new(Keys {
+                issuer: effective.issuer.clone(),
+                tenant,
+                by_id: effective.by_id.clone(),
+            });
+        }
+        authenticator
     }
 
     /// An authenticator with no keys, which verifies nothing.
@@ -451,6 +497,7 @@ impl Authenticator {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *effective = Arc::new(Keys {
             issuer: effective.issuer.clone(),
+            tenant: effective.tenant.clone(),
             by_id,
         });
         count
@@ -659,6 +706,17 @@ pub struct Admission {
     /// keys — see [`Self::anonymous`].
     pub expires: Option<SystemTime>,
 
+    /// When the token was minted, from the `iat` claim.
+    ///
+    /// What orders two credentials for the same person. A renewal that changes
+    /// grants must not be older than the credential it replaces, or a client
+    /// that kept its host token could hand it back after being demoted and be a
+    /// host again — the token is genuine, unexpired and provably theirs, and the
+    /// only thing wrong with it is that it has been superseded.
+    ///
+    /// `None` where the token did not say, or where there was no token.
+    pub issued: Option<SystemTime>,
+
     /// The device key this token was issued to, from `cnf.jkt`, untruncated.
     ///
     /// Distinct from the device in [`Self::who`], which is the first sixteen
@@ -689,6 +747,7 @@ impl Admission {
             permission: Permission::Unrestricted,
             via: None,
             expires: None,
+            issued: None,
             thumbprint: None,
         }
     }
@@ -709,6 +768,7 @@ impl Admission {
             permission: Permission::Nothing,
             via: None,
             expires: None,
+            issued: None,
             thumbprint: None,
         }
     }
@@ -787,16 +847,17 @@ impl Keys {
         if now.saturating_sub(CLOCK_SKEW) > expires {
             return Err(AuthError::Expired);
         }
-        if claims.iat != 0 {
-            let issued = unix(claims.iat);
-            if now + CLOCK_SKEW < issued {
-                return Err(AuthError::NotYetValid);
-            }
+        let issued = (claims.iat != 0).then(|| unix(claims.iat));
+        if issued.is_some_and(|issued| now + CLOCK_SKEW < issued) {
+            return Err(AuthError::NotYetValid);
         }
 
         let device = device_from(&claims.cnf.jkt);
         if claims.aud.is_empty() || claims.sub.is_empty() || device.is_empty() {
             return Err(AuthError::Incomplete);
+        }
+        if !self.tenant.is_empty() && claims.aud != self.tenant {
+            return Err(AuthError::WrongTenant);
         }
         // A token attributed to its own subject is dropped rather than refused.
         // The control plane will not mint one, so this is defence against a bug
@@ -812,6 +873,14 @@ impl Keys {
         if claims.moqt.cap & !capability::KNOWN != 0 {
             return Err(AuthError::Unsupported);
         }
+        // A relay link reads and does nothing else, and is not metered. A link
+        // claim beside any power would be an unmetered session that can
+        // publish or moderate, which the control plane never mints, so it is
+        // refused rather than given either half.
+        let m = &claims.moqt;
+        if m.rly && (m.publish != 0 || m.cap != 0 || m.own || m.bs) {
+            return Err(AuthError::Unsupported);
+        }
         let permission = Permission::scoped(scope::Scope {
             tenant: Arc::from(claims.aud.as_str()),
             user: Arc::from(claims.sub.as_str()),
@@ -823,6 +892,7 @@ impl Keys {
             capabilities: claims.moqt.cap,
             owner: claims.moqt.own,
             backstage: claims.moqt.bs,
+            relay: claims.moqt.rly,
         });
 
         Ok(Admission {
@@ -830,6 +900,7 @@ impl Keys {
             permission,
             via,
             expires: Some(expires),
+            issued,
             thumbprint: Some(Arc::from(claims.cnf.jkt.as_str())),
         })
     }
@@ -1046,6 +1117,57 @@ mod tests {
     }
 
     #[test]
+    fn a_relay_link_is_a_signed_grant_and_only_a_read_only_one() {
+        let now = at(0);
+        let link = |moqt: serde_json::Value| {
+            let mut claims = claims(now);
+            claims["moqt"] = moqt;
+            authenticator().admit([mint(&header(), &claims).as_bytes()], peer(), now)
+        };
+        let relay = |admitted: Result<Admission, AuthError>| match &admitted
+            .expect("verifies")
+            .permission
+        {
+            Permission::Scoped(scope) => scope.relay,
+            other => panic!("expected a scope, got {other:?}"),
+        };
+
+        assert!(relay(link(
+            serde_json::json!({ "room": "r1", "pub": 0, "cap": 0, "rly": true })
+        )));
+        assert!(!relay(link(
+            serde_json::json!({ "room": "r1", "pub": 0, "cap": 0 })
+        )));
+        for powers in [
+            serde_json::json!({ "pub": 3, "cap": 0, "rly": true }),
+            serde_json::json!({ "pub": 0, "cap": 0x100, "rly": true }),
+            serde_json::json!({ "pub": 0, "cap": 0, "own": true, "rly": true }),
+            serde_json::json!({ "pub": 0, "cap": 0, "bs": true, "rly": true }),
+        ] {
+            assert_eq!(
+                link(powers.clone()).err(),
+                Some(AuthError::Unsupported),
+                "{powers}"
+            );
+        }
+
+        // Claimed by its holder rather than granted, it does not verify.
+        let token = mint(&header(), &claims(now));
+        let mut claimed = claims(now);
+        claimed["moqt"]["pub"] = serde_json::json!(0);
+        claimed["moqt"]["rly"] = serde_json::json!(true);
+        let (head, _) = token.split_once('.').expect("three segments");
+        let tail = token.rsplit('.').next().expect("a signature");
+        let rewritten = format!("{head}.{}.{tail}", segment(&claimed));
+        assert_eq!(
+            authenticator()
+                .admit([rewritten.as_bytes()], peer(), now)
+                .err(),
+            Some(AuthError::BadSignature)
+        );
+    }
+
+    #[test]
     fn a_signed_token_names_its_holder() {
         let now = at(0);
         let token = mint(&header(), &claims(now));
@@ -1144,6 +1266,70 @@ mod tests {
             authenticator().identify([token.as_bytes()], peer(), now),
             Err(AuthError::WrongIssuer)
         );
+    }
+
+    fn pinned(tenant: &str) -> Authenticator {
+        Authenticator::for_tenant(
+            "https://api.moqom.cloud",
+            tenant,
+            vec![VerificationKey {
+                id: KID.to_owned(),
+                bytes: signer().public_key().as_ref().to_vec(),
+            }],
+        )
+    }
+
+    #[test]
+    fn a_relay_pinned_to_a_tenant_refuses_every_other_tenant() {
+        let now = at(0);
+        let mut theirs = claims(now);
+        theirs["aud"] = serde_json::json!("globex");
+        let token = mint(&header(), &theirs);
+        let error = pinned("acme").identify([token.as_bytes()], peer(), now);
+        assert_eq!(error, Err(AuthError::WrongTenant));
+        assert_eq!(AuthError::WrongTenant.name(), "wrong_tenant");
+        assert_eq!(
+            AuthError::WrongTenant.code(),
+            moqom_proto::control::RequestErrorCode::UNAUTHORIZED
+        );
+    }
+
+    #[test]
+    fn a_relay_pinned_to_a_tenant_serves_that_tenant() {
+        let now = at(0);
+        let token = mint(&header(), &claims(now));
+        pinned("acme")
+            .identify([token.as_bytes()], peer(), now)
+            .expect("its own tenant's token");
+    }
+
+    #[test]
+    fn the_tenant_pin_survives_a_key_push() {
+        // Keys arrive over the link and replace the set wholesale; the pin is
+        // the operator's and must not go with them.
+        let now = at(0);
+        let authenticator = pinned("acme");
+        let count = authenticator.accept(vec![VerificationKey {
+            id: KID.to_owned(),
+            bytes: signer().public_key().as_ref().to_vec(),
+        }]);
+        assert_eq!(count, 1);
+        let mut theirs = claims(now);
+        theirs["aud"] = serde_json::json!("globex");
+        assert_eq!(
+            authenticator.identify([mint(&header(), &theirs).as_bytes()], peer(), now),
+            Err(AuthError::WrongTenant)
+        );
+    }
+
+    #[test]
+    fn an_empty_pin_is_no_pin() {
+        let now = at(0);
+        let mut theirs = claims(now);
+        theirs["aud"] = serde_json::json!("globex");
+        pinned("")
+            .identify([mint(&header(), &theirs).as_bytes()], peer(), now)
+            .expect("any tenant");
     }
 
     #[test]

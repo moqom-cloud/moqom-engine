@@ -33,7 +33,9 @@ use moqom_proto::model::{FullTrackName, GroupId, Location, TrackAlias, TrackName
 use moqom_relay::admin::Surface;
 use moqom_relay::possession::{Enforcement, Possession};
 use moqom_relay::session::RESET_SHED;
-use moqom_relay::{Authenticator, Cache, Fabric, Governor, Limits, Metrics, Quotas, Session};
+use moqom_relay::{
+    Authenticator, Cache, Fabric, Governor, Limits, Metrics, Quotas, Session, Usage,
+};
 use moqom_transport::{Server, alpn, server::with_moqt_alpn};
 use web_transport_quinn::{RecvStream, SendStream};
 
@@ -160,6 +162,40 @@ impl Relay {
             Governor::disabled(),
             tokens::authenticator(),
             Enforcement::Required,
+            Usage::disabled(),
+            None,
+        )
+    }
+
+    /// Start a relay that verifies tokens and meters every session into `usage`.
+    ///
+    /// The reporter is the caller's to start, so a test can point it at a fake
+    /// endpoint and decide when it stops.
+    pub fn metering(usage: Usage) -> Self {
+        Self::configured(
+            Limits::default(),
+            Governor::disabled(),
+            tokens::authenticator(),
+            Enforcement::Bearer,
+            usage,
+            None,
+        )
+    }
+
+    /// Start a relay that verifies tokens, meters into `usage`, and issues
+    /// direct tickets signed by [`tokens::ticket_keys`], reissuing each every
+    /// `renew`.
+    pub fn ticketing(usage: Usage, renew: std::time::Duration) -> Self {
+        Self::configured(
+            Limits::default(),
+            Governor::disabled(),
+            tokens::authenticator(),
+            Enforcement::Bearer,
+            usage,
+            Some(moqom_relay::fabric::Ticketing {
+                keys: std::sync::Arc::new(tokens::ticket_keys()),
+                renew,
+            }),
         )
     }
 
@@ -181,7 +217,14 @@ impl Relay {
         // what all but the possession tests still want: those tests are about who
         // may forward what, and making each of them mint a device key as well
         // would be ceremony that hid what they were checking.
-        Self::configured(limits, governor, authenticator, Enforcement::Bearer)
+        Self::configured(
+            limits,
+            governor,
+            authenticator,
+            Enforcement::Bearer,
+            Usage::disabled(),
+            None,
+        )
     }
 
     fn configured(
@@ -189,6 +232,8 @@ impl Relay {
         governor: Governor,
         authenticator: Authenticator,
         possession: Enforcement,
+        usage: Usage,
+        tickets: Option<moqom_relay::fabric::Ticketing>,
     ) -> Self {
         install_crypto_provider();
 
@@ -219,7 +264,12 @@ impl Relay {
             .proving(Possession::new(
                 possession,
                 Some(tokens::device::certificate_identity(&certificate)),
-            ));
+            ))
+            .metered(usage);
+        let fabric = match tickets {
+            Some(tickets) => fabric.ticketing(tickets),
+            None => fabric,
+        };
         let surface = Surface::new(metrics.clone(), fabric.clone());
         let accept = tokio::spawn({
             let fabric = fabric.clone();
@@ -634,7 +684,7 @@ impl Client {
         Announcement {
             send,
             request: id,
-            _recv: recv,
+            frames: Frames::new(recv),
         }
     }
 
@@ -776,7 +826,7 @@ impl Client {
                 Ok(Subscription {
                     alias: ok.track_alias,
                     request_id: request.request_id,
-                    _send: send,
+                    send,
                     frames,
                 })
             }
@@ -1072,11 +1122,25 @@ pub struct Subscription {
     pub alias: TrackAlias,
     /// The ID this subscription was requested with, which a joining fetch names.
     pub request_id: RequestId,
-    _send: SendStream,
+    send: SendStream,
     frames: Frames,
 }
 
 impl Subscription {
+    /// Ask the relay to stop, or resume, forwarding this track: draft-19's
+    /// FORWARD parameter on a `REQUEST_UPDATE`.
+    pub async fn forward(&mut self, forward: bool) {
+        let mut update = RequestUpdate::new(self.request_id);
+        update.parameters.push(
+            Parameter::varint(
+                param_type::FORWARD,
+                moqom_proto::varint::VarInt::from(u32::from(forward)),
+            )
+            .expect("FORWARD is an even type"),
+        );
+        write(&mut self.send, &update).await;
+    }
+
     /// Wait for the relay to say the track has ended.
     ///
     /// A subscriber cannot infer this: objects stopping is what a stalled
@@ -1168,7 +1232,29 @@ pub struct Announcement {
     send: SendStream,
     /// The ID the announcement was made under, which a renewal has to name.
     request: RequestId,
-    _recv: RecvStream,
+    frames: Frames,
+}
+
+/// A request the relay ended after it had been allowed: the code, and the
+/// reason phrase that says why.
+#[derive(Debug)]
+pub struct Ended {
+    pub code: u64,
+    pub reason: String,
+}
+
+fn ended_by(frame: &ControlFrame) -> Ended {
+    assert_eq!(
+        frame.message_type,
+        MessageType::RequestError,
+        "expected the relay to end the request"
+    );
+    let error = moqom_proto::control::RequestError::decode(&mut frame.body.clone())
+        .expect("a decodable error");
+    Ended {
+        code: error.code.get(),
+        reason: error.reason.as_str().unwrap_or_default().to_owned(),
+    }
 }
 
 impl Announcement {
@@ -1185,6 +1271,27 @@ impl Announcement {
     /// one would renew in practice.
     pub async fn renew(&mut self, token: &str) {
         write(&mut self.send, &renewal(self.request, token, None)).await;
+    }
+
+    /// The same, with a proof that the fresh credential is this client's.
+    pub async fn renew_proving(&mut self, token: &str, proof: &str) {
+        write(&mut self.send, &renewal(self.request, token, Some(proof))).await;
+    }
+
+    /// Wait for the relay to end this announcement, and say how.
+    ///
+    /// An announcement that is allowed is answered with silence, so anything
+    /// the relay writes on its stream is the relay taking it back.
+    pub async fn ended(&mut self) -> Ended {
+        ended_by(&within("the announcement to be ended", self.frames.expect()).await)
+    }
+
+    /// Assert the relay leaves this announcement alone for a while.
+    pub async fn kept(&mut self) {
+        let quiet = std::time::Duration::from_millis(300);
+        if let Ok(frame) = tokio::time::timeout(quiet, self.frames.next()).await {
+            panic!("the relay ended an announcement it should have kept: {frame:?}");
+        }
     }
 }
 
@@ -1249,6 +1356,11 @@ impl Watch {
     /// carried none would be exchanging a proven credential for an unproven one.
     pub async fn renew_proving(&mut self, token: &str, proof: &str) {
         write(&mut self.send, &renewal(self.request, token, Some(proof))).await;
+    }
+
+    /// Wait for the relay to end this watch, and say how.
+    pub async fn ended(&mut self) -> Ended {
+        ended_by(&within("the watch to be ended", self.frames.expect()).await)
     }
 
     /// The next namespace change, resolved back to a full namespace.
@@ -1441,6 +1553,11 @@ pub mod tokens {
         Ed25519KeyPair::from_seed_unchecked(&[7u8; 32]).expect("a valid Ed25519 seed")
     }
 
+    /// The direct-ticket keys a ticketing relay here signs with.
+    pub fn ticket_keys() -> moqom_relay::ticket::TicketKeys {
+        moqom_relay::ticket::TicketKeys::from_seed("ticket-test", &[11u8; 32])
+    }
+
     /// An authenticator that trusts [`signer`] and nothing else.
     pub fn authenticator() -> Authenticator {
         Authenticator::new(
@@ -1464,6 +1581,8 @@ pub mod tokens {
         pub capabilities: u32,
         pub owner: bool,
         pub backstage: bool,
+        /// Another relay's link rather than a person.
+        pub relay: bool,
     }
 
     impl Default for Grant {
@@ -1476,6 +1595,7 @@ pub mod tokens {
                 capabilities: 0x0000_7F00,
                 owner: false,
                 backstage: false,
+                relay: false,
             }
         }
     }
@@ -1488,6 +1608,39 @@ pub mod tokens {
                 capabilities: 0,
                 ..Self::default()
             }
+        }
+
+        /// A child relay's link into `room-42`, as the control plane mints one
+        /// for a relay service account.
+        pub fn relay_link() -> Self {
+            Self {
+                user: "moqom-relay",
+                relay: true,
+                ..Self::viewer()
+            }
+        }
+
+        /// This grant signed by a key the relay does not trust, under the
+        /// identifier of one it does: what somebody without the control plane's
+        /// key can make.
+        pub fn token_forged(&self) -> String {
+            let stranger =
+                Ed25519KeyPair::from_seed_unchecked(&[9u8; 32]).expect("a valid Ed25519 seed");
+            let claims = self.claims(THUMBPRINT, 0, 600);
+            sign(&stranger, &header(), &claims)
+        }
+
+        /// This grant with no signature at all, naming `none` as its algorithm.
+        pub fn token_unsigned(&self) -> String {
+            let claims = self.claims(THUMBPRINT, 0, 600);
+            let segment = |value: &serde_json::Value| {
+                URL_SAFE_NO_PAD.encode(serde_json::to_vec(value).expect("serialisable"))
+            };
+            format!(
+                "{}.{}.",
+                segment(&serde_json::json!({ "alg": "none", "typ": "MOQT", "kid": KID })),
+                segment(&claims)
+            )
         }
 
         /// The token itself, valid for ten minutes from now.
@@ -1523,17 +1676,39 @@ pub mod tokens {
             self.token_binding(&device::thumbprint(), seconds)
         }
 
+        /// A device-bound token minted `ago` seconds in the past and valid for
+        /// ten minutes from now.
+        ///
+        /// For ordering: a credential minted before the one a session holds is
+        /// one it has been superseded by, however valid it still is.
+        pub fn token_bound_to_device_minted(&self, ago: i64) -> String {
+            self.token_at(&device::thumbprint(), -ago, 600)
+        }
+
         fn token_binding(&self, thumbprint: &str, seconds: i64) -> String {
-            let issued = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("after the epoch")
-                .as_secs();
-            let claims = serde_json::json!({
+            self.token_at(thumbprint, 0, seconds)
+        }
+
+        fn token_at(&self, thumbprint: &str, minted: i64, seconds: i64) -> String {
+            let claims = self.claims(thumbprint, minted, seconds);
+            mint(&header(), &claims)
+        }
+
+        fn claims(&self, thumbprint: &str, minted: i64, seconds: i64) -> serde_json::Value {
+            let now = i64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("after the epoch")
+                    .as_secs(),
+            )
+            .expect("a representable clock");
+            let issued = now + minted;
+            let mut claims = serde_json::json!({
                 "iss": ISSUER,
                 "sub": self.user,
                 "aud": "acme",
                 "iat": issued,
-                "exp": i64::try_from(issued).expect("a representable clock") + seconds,
+                "exp": now + seconds,
                 "cnf": { "jkt": thumbprint },
                 "moqt": {
                     "room": self.room.unwrap_or_default(),
@@ -1543,11 +1718,17 @@ pub mod tokens {
                     "bs": self.backstage,
                 },
             });
-            mint(
-                &serde_json::json!({ "alg": "EdDSA", "typ": "MOQT", "kid": KID }),
-                &claims,
-            )
+            // Only when set, as the control plane omits it, so every other
+            // token here is byte for byte what it was before the claim existed.
+            if self.relay {
+                claims["moqt"]["rly"] = serde_json::json!(true);
+            }
+            claims
         }
+    }
+
+    fn header() -> serde_json::Value {
+        serde_json::json!({ "alg": "EdDSA", "typ": "MOQT", "kid": KID })
     }
 
     /// The client's half of proof of possession: a device key, and proofs made
@@ -1647,11 +1828,19 @@ pub mod tokens {
     }
 
     fn mint(header: &serde_json::Value, claims: &serde_json::Value) -> String {
+        sign(&signer(), header, claims)
+    }
+
+    fn sign(
+        key: &Ed25519KeyPair,
+        header: &serde_json::Value,
+        claims: &serde_json::Value,
+    ) -> String {
         let segment = |value: &serde_json::Value| {
             URL_SAFE_NO_PAD.encode(serde_json::to_vec(value).expect("serialisable"))
         };
         let signing = format!("{}.{}", segment(header), segment(claims));
-        let signature = signer().sign(signing.as_bytes());
+        let signature = key.sign(signing.as_bytes());
         format!("{signing}.{}", URL_SAFE_NO_PAD.encode(signature.as_ref()))
     }
 }

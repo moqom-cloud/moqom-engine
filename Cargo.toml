@@ -10,6 +10,7 @@ members = [
     "moqom-media",
     "moqom-cli",
     "moqom-loadgen",
+    "moqom-recorder",
 ]
 # cargo-fuzz needs nightly and links libFuzzer, so it cannot build under the
 # pinned stable toolchain the rest of the workspace uses. Excluded rather than
@@ -21,7 +22,7 @@ exclude = ["fuzz"]
 [workspace.package]
 edition = "2024"
 rust-version = "1.97"
-authors = ["MOQOM"]
+authors = ["Elliott Wave LLC"]
 repository = "https://github.com/moqom-cloud/moqom-engine"
 # No workspace-level `license`: this workspace spans both licence halves.
 # Apache-2.0 for the protocol and transport crates, which are what anyone

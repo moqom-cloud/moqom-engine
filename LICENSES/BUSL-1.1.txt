@@ -2,13 +2,11 @@ Business Source License 1.1
 
 Parameters
 
-Licensor:             [LEGAL ENTITY — must be substituted with the registered
-                      entity name before any public distribution. See
-                      LICENSING.md.]
+Licensor:             Elliott Wave LLC
 
 Licensed Work:        MOQOM relay, control plane, director, ingest, and
                       congestion controller.
-                      The Licensed Work is (c) 2026 [LEGAL ENTITY]
+                      The Licensed Work is (c) 2026 Elliott Wave LLC
 
 Additional Use Grant: You may make production use of the Licensed Work,
                       including for commercial purposes, provided that you do

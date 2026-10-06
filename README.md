@@ -13,9 +13,12 @@ end-to-end encryption our decisions instead of someone else's.
 | --- | --- | --- |
 | `moqom-proto` | Apache-2.0 | The draft-19 object model, all eighteen control messages, and the data plane |
 | `moqom-transport` | Apache-2.0 | QUIC and WebTransport sessions on one UDP port |
-| `moqom-client` | Apache-2.0 | A MOQT subscriber and publisher for recorders, classifiers, and the CLI |
+| `moqom-client` | Apache-2.0 | A MOQT subscriber and publisher for recorders, classifiers, and the CLI; direct (peer-to-peer) sessions in `direct` |
 | `moqom-cli` | Apache-2.0 | The `moqom` binary: `subscribe` and `publish`, using only `moqom-client` |
-| `moqom-relay` | BUSL-1.1 | The relay: announcement, subscription, fan-out, retention, authorisation |
+| `moqom-media` | Apache-2.0 | Framing coded video into MOQOM objects, shared by the CLI and the load generator |
+| `moqom-loadgen` | Apache-2.0 | Load generation and relay measurement |
+| `moqom-relay` | BUSL-1.1 | The relay: announcement, subscription, fan-out, retention, authorisation, usage metering, direct tickets |
+| `moqom-recorder` | BUSL-1.1 | The hosted recorder: joins as a subscribe-only viewer and writes what it receives |
 | `fuzz` | Apache-2.0 | Coverage-guided harnesses for the decoders |
 
 Two licences in one workspace is deliberate and [LICENSING.md](LICENSING.md)
@@ -76,17 +79,16 @@ authorization token, so this costs no reconnection. A renewal may move the
 deadline and nothing else; a token naming a different holder or a different scope
 is refused, and the session carries on under the credential it had.
 
-A token also names the device it was issued to, in `cnf.jkt`, and the relay can
-make that name mean something. Set `MOQOM_RELAY_POSSESSION=required` and every
+A token also names the device it was issued to, in `cnf.jkt`, and the relay
+makes that name mean something. By default (`MOQOM_RELAY_POSSESSION=required`) every
 place a token is checked — SETUP and each renewal — also demands an ES256
 signature from the key the thumbprint identifies, over the token it accompanies
 and over this relay's certificate, usable once. So a token read off a log or out
 of a capture is worth nothing to anybody without the Secure Enclave it was bound
-to, and one taken from a session here cannot be spent at another relay. The
-default is `observed`, which verifies a proof when one is offered and admits a
-session that offers none, because a fleet is upgraded one build at a time and a
-relay that stopped admitting the old ones would be an outage rather than a
-tightening; `bearer` turns it off. Note the shape of the other default: with no
+to, and one taken from a session here cannot be spent at another relay.
+`observed` verifies a proof when one is offered and admits a session that offers
+none, for upgrading a fleet that still has old clients; `bearer` turns it off.
+Both log a warning at startup and on every session admitted without a proof. Note the shape of the other default: with no
 keys configured there is no verified tenant to compare anything against, and such
 a relay authorises nothing at all — nor holds anybody to an expiry, nor asks
 anybody to prove anything. That is the mode the benchmarks and the two-phone rig
@@ -115,12 +117,38 @@ through the real Go control plane's admin API and asserts the phone's connection
 closes. Unbanning and ending a room travel the same link. Those need a Go
 toolchain, so they are `#[ignore]`d and run by `moqom/tools/interop.sh`.
 
+The admin surface is guarded. A listener on anything but loopback refuses to
+start unless it has a bearer token (`MOQOM_RELAY_ADMIN_TOKEN_FILE`), mutual TLS
+against an operator authority (`MOQOM_RELAY_ADMIN_CLIENT_CA`), or
+`MOQOM_RELAY_ADMIN_AUTH=probes-only`, which serves only liveness and readiness
+for a load balancer's health check. `MOQOM_RELAY_ADMIN_LOCAL_ADDR` adds a second,
+loopback-only listener with the whole surface, for an OpenZiti tunneler on the
+same machine to host as a dark service. That is how MOQOM's own relays run: probes
+on the network, metrics and sessions only to enrolled operator identities. The
+overlay itself is in `moqom/docs/OPENZITI-AND-P2P.md`.
+
+Usage is metered here (`src/usage`). Every session's connected seconds, role,
+tier and bytes are written as records every `MOQOM_RELAY_USAGE_INTERVAL` seconds
+and posted to the control plane's `/v1/usage`, queued while it is unreachable. A
+self-hosted relay reports against its own `mqk_` key (`MOQOM_RELAY_USAGE_KEY_FILE`)
+and stops admitting new sessions when that account says it is not admitting.
+
+Direct calls are metered by ticket (`src/ticket.rs`), because their media never
+reaches a relay. A participant on a direct path subscribes to its own
+`.direct/{peerUser}/{peerDevice}` track; the relay answers with an Ed25519-signed
+ticket about once a minute and counts those seconds as `direct_seconds`. Each
+peer holds the other to its tickets (`moqom-client`'s `direct` module, and the
+Swift SDK), so an app that drops the relay session loses the direct path. Keys
+come from `MOQOM_RELAY_TICKET_KEYS`; unset, no tickets are issued and nobody on
+that relay goes direct. The relay also honours `FORWARD=0` on `REQUEST_UPDATE`,
+which pauses a subscriber's relay copy while its direct path carries the media.
+The design, including the two-modified-apps limitation, is in
+`moqom/docs/OPENZITI-AND-P2P.md` under "Direct tickets and billing".
+
 **What the relay is not yet:** scheduling between the rungs of one broadcast
 under pressure, which is `moqom-cc`'s job, or forwarding datagrams; only subgroup
-streams are carried.
-The admin surface is also unauthenticated, which is why it binds separately and
-defaults off. `moqom-relay/src/lib.rs` lists the gaps and says which matter; none
-of it is ready to face the internet.
+streams are carried. `moqom-relay/src/lib.rs` lists the remaining gaps and says
+which matter.
 
 ## Development
 

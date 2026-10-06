@@ -59,7 +59,8 @@ emit_tick() {
   if [[ -n "$pid" && -r /proc/$pid/stat ]]; then
     jiffies="$(awk '{ print $14 + $15 }' "/proc/$pid/stat")"
   fi
-  metrics="$(curl -sf --max-time 2 "http://127.0.0.1:$admin_port/metrics" || true)"
+  metrics="$(curl -sf --max-time 2 -H "Authorization: Bearer $(cat "$root/admin-token")" \
+    "http://127.0.0.1:$admin_port/metrics" || true)"
   sess="$(metric "$metrics" moqom_relay_sessions)"
   shed="$(metric "$metrics" moqom_relay_subgroups_shed_total)"
   # Whole numbers for the shell arithmetic below. Prometheus may print a
@@ -142,6 +143,7 @@ case "${1:-}" in
     # because the whole question is what it is worth.
     MOQOM_RELAY_ADDR="0.0.0.0:$port" \
     MOQOM_RELAY_ADMIN_ADDR="0.0.0.0:$admin_port" \
+    MOQOM_RELAY_ADMIN_TOKEN_FILE="$root/admin-token" \
     MOQOM_RELAY_JWKS="$root/jwks.json" \
     MOQOM_RELAY_ISSUER=https://loadgen.moqom.invalid \
     MOQOM_RELAY_SHARDS="${MOQOM_LAB_SHARDS:-1}" \

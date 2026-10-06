@@ -90,7 +90,7 @@ pub struct Announcement {
     _recv: RecvStream,
 }
 
-const IMPLEMENTATION: &[u8] = b"moqom-client";
+pub(crate) const IMPLEMENTATION: &[u8] = b"moqom-client";
 
 type Inbox = HashMap<TrackAlias, mpsc::Sender<Result<Object, Error>>>;
 
@@ -219,23 +219,51 @@ impl Session {
         let len = body.len();
         Setup::decode(&mut body, len)?;
 
+        Ok(Self::assemble(
+            transport,
+            (send, frames.into_inner()),
+            endpoint,
+            Role::Client,
+        ))
+    }
+
+    /// A session over a transport whose SETUP exchange has already completed.
+    ///
+    /// Shared by the relay path and the direct one, which differ only in how
+    /// SETUP is exchanged and checked: everything after it -- subscribing,
+    /// answering subscriptions, reading subgroups -- is the same code on both, so
+    /// media cannot behave differently depending on which path carried it.
+    pub(crate) fn assemble(
+        transport: moqom_transport::Session,
+        control: (SendStream, RecvStream),
+        endpoint: quinn::Endpoint,
+        role: Role,
+    ) -> Self {
         let published = Arc::new(Mutex::new(HashMap::new()));
         let inbox = Arc::new(Mutex::new(HashMap::new()));
         spawn_publisher(transport.clone(), Arc::clone(&published));
         spawn_reader(transport.clone(), Arc::clone(&inbox));
 
-        Ok(Self {
+        Self {
             transport,
-            requests: RequestIdGenerator::new(Role::Client),
+            requests: RequestIdGenerator::new(role),
             // Not zero: the relay hands out aliases from zero, so a publisher
             // that starts at 7 makes a forgotten rewrite observable — the
             // subscriber would see 7 in a header that should carry its own 0.
             next_alias: AtomicU64::new(7),
             published,
             inbox,
-            _control: (send, frames.into_inner()),
+            _control: control,
             _endpoint: endpoint,
-        })
+        }
+    }
+
+    /// Whether the underlying connection has closed.
+    ///
+    /// Resolves with the reason once it has. A direct path watches this to fall
+    /// back as soon as the peer is gone, rather than waiting for media to stop.
+    pub async fn closed(&self) -> Error {
+        Error::Session(self.transport.closed().await)
     }
 
     fn next_request(&mut self) -> Result<moqom_proto::control::RequestId, Error> {
@@ -284,6 +312,27 @@ impl Session {
                 during: "SUBSCRIBE",
             }),
         }
+    }
+
+    /// Watch which namespaces are published under `prefix`.
+    ///
+    /// The returned [`NamespaceWatch`](crate::NamespaceWatch) holds the request
+    /// stream; dropping it withdraws the watch.
+    ///
+    /// # Errors
+    /// Opening the request stream, writing the request, or exhausting request IDs.
+    pub async fn watch(&mut self, prefix: TrackNamespace) -> Result<crate::NamespaceWatch, Error> {
+        let (mut send, recv) = self.transport.open_bi().await?;
+        let request = self.next_request()?;
+        let message = moqom_proto::control::SubscribeNamespace::new(request, prefix.clone());
+        write(&mut send, &message).await?;
+        Ok(crate::NamespaceWatch::new(
+            prefix,
+            request,
+            send,
+            Frames::new(recv),
+            self.transport.clone(),
+        ))
     }
 
     /// Announce `namespace`, returning a handle that holds the announcement.
@@ -436,7 +485,7 @@ impl Session {
 /// Bounded, and the bound is the point rather than caution: a peer that closed only
 /// the stream will never close the connection, so waiting for a reason that is not
 /// coming would hang instead of reporting the little that is known.
-async fn rejection(connection: &quinn::Connection) -> Error {
+pub(crate) async fn rejection(connection: &quinn::Connection) -> Error {
     let waited = tokio::time::timeout(REJECTION_PATIENCE, connection.closed()).await;
     match waited {
         Ok(quinn::ConnectionError::ApplicationClosed(closed)) => Error::Rejected {
@@ -461,7 +510,7 @@ const REJECTION_PATIENCE: std::time::Duration = std::time::Duration::from_secs(2
 /// relay hashes its own configured certificate the same way, so anything else here
 /// -- an intermediate, the whole chain, the public key alone -- produces a proof it
 /// refuses while looking entirely well-formed.
-fn relay_identity(connection: &quinn::Connection) -> Option<String> {
+pub(crate) fn relay_identity(connection: &quinn::Connection) -> Option<String> {
     let identity = connection.peer_identity()?;
     let chain = identity
         .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
@@ -643,6 +692,13 @@ fn spawn_reader(transport: moqom_transport::Session, inbox: Arc<Mutex<Inbox>>) {
     tokio::spawn(async move {
         loop {
             let Ok(recv) = transport.accept_uni().await else {
+                // The session is over, so every subscription on it is too.
+                // Dropping the senders is what makes `next_object` say so,
+                // rather than waiting for objects that cannot arrive.
+                inbox
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clear();
                 return;
             };
             let inbox = Arc::clone(&inbox);
@@ -754,31 +810,31 @@ async fn fill(recv: &mut RecvStream, buffer: &mut BytesMut) -> Result<bool, Erro
     }
 }
 
-async fn write<M: MessageBody>(stream: &mut SendStream, message: &M) -> Result<(), Error> {
+pub(crate) async fn write<M: MessageBody>(stream: &mut SendStream, message: &M) -> Result<(), Error> {
     let mut buf = BytesMut::new();
     write_message(&mut buf, message)?;
     stream.write_all(&buf).await.map_err(Error::write)
 }
 
 /// Reads length-delimited control messages.
-struct Frames {
+pub(crate) struct Frames {
     stream: RecvStream,
     buffer: BytesMut,
 }
 
 impl Frames {
-    fn new(stream: RecvStream) -> Self {
+    pub(crate) fn new(stream: RecvStream) -> Self {
         Self {
             stream,
             buffer: BytesMut::new(),
         }
     }
 
-    fn into_inner(self) -> RecvStream {
+    pub(crate) fn into_inner(self) -> RecvStream {
         self.stream
     }
 
-    async fn next(&mut self) -> Result<Option<ControlFrame>, Error> {
+    pub(crate) async fn next(&mut self) -> Result<Option<ControlFrame>, Error> {
         loop {
             let mut cursor = &self.buffer[..];
             match ControlFrame::decode(&mut cursor) {
@@ -797,7 +853,7 @@ impl Frames {
     }
 }
 
-fn placeholder_url() -> url::Url {
+pub(crate) fn placeholder_url() -> url::Url {
     // A raw QUIC session has no CONNECT URL; the wrapper still wants one.
     "https://localhost/"
         .parse()

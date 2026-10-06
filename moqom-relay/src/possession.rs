@@ -176,7 +176,6 @@ pub enum Enforcement {
     /// finds out here, in a log line and a metric, rather than by failing to
     /// connect — and a *bad* proof is still refused, because a peer that presents
     /// one and gets it wrong is not the same as a peer that presents none.
-    #[default]
     Observed,
 
     /// A token without a valid proof admits nobody.
@@ -184,6 +183,7 @@ pub enum Enforcement {
     /// The destination. Note what it costs: a token minted for one device cannot
     /// be pasted into another, which is the point, and is also what stops a
     /// hand-minted token from being shared between two phones.
+    #[default]
     Required,
 }
 
@@ -342,7 +342,13 @@ impl Possession {
                 // Nothing to check and nothing to complain to the peer about.
                 // The absence is worth counting, which the caller does, since it
                 // is how a deployment knows whether it can move to `Required`.
-                Enforcement::Bearer | Enforcement::Observed => Ok(()),
+                Enforcement::Bearer | Enforcement::Observed => {
+                    tracing::warn!(
+                        thumbprint,
+                        "admitted a session without proof of possession; its token would work from any device"
+                    );
+                    Ok(())
+                }
             };
         };
 

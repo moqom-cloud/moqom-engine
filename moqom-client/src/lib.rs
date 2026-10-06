@@ -13,10 +13,12 @@
 #![forbid(unsafe_code)]
 
 pub mod device;
+pub mod direct;
 mod error;
 pub mod properties;
 mod session;
 pub mod tls;
+mod watch;
 
 pub use device::{Credentials, DeviceKey, DeviceKeyError};
 pub use error::Error;
@@ -24,6 +26,7 @@ pub use properties::ObjectProperties;
 pub use session::{
     Announcement, GroupWriter, Metadata, Object, OutgoingObject, Session, Subscription,
 };
+pub use watch::{NamespaceEvent, NamespaceWatch};
 
 pub use bytes::Bytes;
 pub use moqom_proto::model::{FullTrackName, GroupId, NameError, TrackAlias, TrackNamespace};

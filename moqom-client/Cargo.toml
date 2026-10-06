@@ -24,6 +24,8 @@ tokio = { workspace = true, features = ["rt", "sync", "time"] }
 url = { workspace = true }
 web-transport-quinn = { workspace = true }
 webpki-roots = "0.26"
+# Direct paths: each endpoint presents an ephemeral certificate its peer pins.
+rcgen = { workspace = true }
 
 [dev-dependencies]
 moqom-relay = { path = "../moqom-relay" }

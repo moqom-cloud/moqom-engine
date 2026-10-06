@@ -30,7 +30,7 @@
 //! rejecting earlier anyway.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use moqom_proto::control::{DoneReason, RequestErrorCode};
@@ -46,6 +46,9 @@ use crate::policy::{Policy, Silence};
 use crate::possession::Possession;
 use crate::quota::Governor;
 use crate::roster::Roster;
+use crate::scope::Ceiling;
+use crate::ticket::TicketKeys;
+use crate::usage::{Meter, Usage};
 
 /// Identifies a session within one relay process.
 ///
@@ -64,6 +67,11 @@ impl SessionId {
     #[must_use]
     pub const fn number(self) -> u64 {
         self.0
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_tests(number: u64) -> Self {
+        Self(number)
     }
 }
 
@@ -139,6 +147,17 @@ pub struct Route {
     /// reason a count is needed at all rather than an assumption that the last
     /// one seen was the last one sent.
     pub streams: Arc<AtomicU64>,
+    /// Where the bytes written to this subscriber are billed, if anywhere.
+    ///
+    /// Carried on the route so the writer bumps an atomic it already holds,
+    /// rather than looking the subscriber up per chunk on the media path.
+    pub meter: Option<Arc<Meter>>,
+    /// Whether the subscriber wants objects, from the FORWARD parameter of its
+    /// latest `REQUEST_UPDATE`.
+    ///
+    /// Read once per subgroup, because subgroups are what is forwarded: a pause
+    /// lets the subgroup in flight finish and a resume starts at the next one.
+    pub forward: Arc<AtomicBool>,
 }
 
 impl Route {
@@ -155,7 +174,15 @@ impl Route {
             alias,
             done: Arc::new(Notify::new()),
             streams: Arc::new(AtomicU64::new(0)),
+            meter: None,
+            forward: Arc::new(AtomicBool::new(true)),
         }
+    }
+
+    /// The same route, billing what it carries to `meter`.
+    #[must_use]
+    pub fn metered(self, meter: Option<Arc<Meter>>) -> Self {
+        Self { meter, ..self }
     }
 }
 
@@ -230,6 +257,16 @@ pub enum Command {
         /// that arrives twice must land twice identically, and a delta cannot
         /// promise that.
         silence: Silence,
+    },
+    /// A moderator has narrowed what this session may hold.
+    ///
+    /// Through the command channel for the reason a mute is: narrowing means
+    /// withdrawing the session's own announcements and ending its own
+    /// subscriptions, which only its own tasks can do.
+    Regrant {
+        /// The most the session may now hold. Absolute, like a mute, so that a
+        /// repeated directive lands identically.
+        ceiling: Ceiling,
     },
 }
 
@@ -356,6 +393,21 @@ pub struct Fabric {
     roster: Roster,
     /// What the control plane has said about the rooms this relay serves.
     policy: Policy,
+    /// What each session is billed for, and whether billing admits new ones.
+    usage: Usage,
+    /// The keys direct tickets are signed with, and how often they are
+    /// reissued. `None` issues none, so no participant here can hold a direct
+    /// path a peer will keep.
+    tickets: Option<Ticketing>,
+}
+
+/// How a relay issues direct tickets. See [`crate::ticket`].
+#[derive(Clone, Debug)]
+pub struct Ticketing {
+    /// What tickets are signed with and verified against.
+    pub keys: Arc<TicketKeys>,
+    /// How often a ticket is reissued while its subscription is open.
+    pub renew: std::time::Duration,
 }
 
 /// Defaults that limit nothing and verify nothing.
@@ -378,6 +430,8 @@ impl Default for Fabric {
             clock: Arc::default(),
             roster: Roster::new(),
             policy: Policy::new(),
+            usage: Usage::disabled(),
+            tickets: None,
         }
     }
 }
@@ -441,6 +495,33 @@ impl Fabric {
             possession: Arc::new(possession),
             ..self
         }
+    }
+
+    /// The same fabric, metering every session's usage into `usage`.
+    #[must_use]
+    pub fn metered(self, usage: Usage) -> Self {
+        Self { usage, ..self }
+    }
+
+    /// What sessions are billed for.
+    #[must_use]
+    pub const fn usage(&self) -> &Usage {
+        &self.usage
+    }
+
+    /// The same fabric, issuing direct tickets.
+    #[must_use]
+    pub fn ticketing(self, tickets: Ticketing) -> Self {
+        Self {
+            tickets: Some(tickets),
+            ..self
+        }
+    }
+
+    /// How direct tickets are issued, if they are.
+    #[must_use]
+    pub const fn tickets(&self) -> Option<&Ticketing> {
+        self.tickets.as_ref()
     }
 
     /// The shared object cache.

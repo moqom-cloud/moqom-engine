@@ -50,6 +50,18 @@ tonic-prost = "0.14"
 tokio-stream = "0.1"
 http = "1"
 
+# Usage reports to the billing endpoint, which is plain HTTPS rather than the
+# link's gRPC. Already in the tree beneath tonic, so this adds code rather than
+# libraries, and it is the client the recorder uses for its object store.
+hyper = { version = "1", default-features = false, features = ["client", "http1"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+http-body-util = "0.1"
+
+# TLS on the admin port, for client certificates from an operator authority.
+# Already in the tree beneath tonic; features off so it adds no second crypto
+# provider -- the configuration it is handed names aws-lc-rs explicitly.
+tokio-rustls = { version = "0.26", default-features = false }
+
 [build-dependencies]
 # Only used when MOQOM_REGENERATE_PROTO is set. The output is checked in so that
 # building a relay needs no protoc.

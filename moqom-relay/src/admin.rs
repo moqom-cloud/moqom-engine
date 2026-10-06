@@ -11,6 +11,10 @@
 //! It is off unless `MOQOM_RELAY_ADMIN_ADDR` is set. A metrics endpoint that
 //! appears by default is one that gets exposed by accident.
 //!
+//! Every path but the two probes needs a credential unless the listener is on
+//! loopback, and an unauthenticated listener refuses to bind anywhere else. See
+//! [`crate::admin_auth`].
+//!
 //! # Why there is no HTTP library here
 //!
 //! This serves four fixed paths, answers only GET, reads no bodies, and does not
@@ -38,9 +42,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use moqom_proto::model::{Kind, Scope, TrackNamespace};
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
+use tokio::net::TcpListener;
 
+use crate::admin_auth::{Guard, Verdict};
 use crate::fabric::Fabric;
 use crate::metrics::{Gauges, Metrics};
 
@@ -94,6 +99,9 @@ impl Response {
     fn reason(&self) -> &'static str {
         match self.status {
             200 => "OK",
+            400 => "Bad Request",
+            401 => "Unauthorized",
+            403 => "Forbidden",
             404 => "Not Found",
             405 => "Method Not Allowed",
             503 => "Service Unavailable",
@@ -109,13 +117,16 @@ impl Response {
              content-type: {}\r\n\
              content-length: {}\r\n\
              cache-control: no-store\r\n\
-             connection: close\r\n\
-             \r\n",
+             connection: close\r\n",
             self.status,
             self.reason(),
             self.content_type,
             self.body.len()
         );
+        if self.status == 401 {
+            head.push_str("www-authenticate: Bearer realm=\"moqom-relay-admin\"\r\n");
+        }
+        head.push_str("\r\n");
         let mut out = head.into_bytes();
         out.extend_from_slice(self.body.as_bytes());
         out
@@ -165,7 +176,14 @@ impl Surface {
         // failure to debug.
         let path = target.split(['?', '#']).next().unwrap_or(target);
         match path {
-            "/metrics" => Response::metrics(self.metrics.expose(&self.gauges())),
+            "/metrics" => {
+                let mut exposition = self.metrics.expose(&self.gauges());
+                // Only beside the rest: a relay with metrics off exposes nothing.
+                if self.metrics.is_enabled() {
+                    exposition.push_str(&self.fabric.usage().expose());
+                }
+                Response::metrics(exposition)
+            }
             "/healthz" => Response::text(200, "ok\n"),
             "/readyz" => {
                 if self.ready.load(Ordering::Relaxed) {
@@ -177,9 +195,10 @@ impl Surface {
             "/sessions" => Response::json(self.sessions_json()),
             "/rooms" => Response::json(self.rooms_json()),
             "/tracks" => Response::json(self.tracks_json()),
+            "/geo" => Response::json(self.geo_json()),
             "/" => Response::text(
                 200,
-                "moqom-relay\n\n/metrics\n/healthz\n/readyz\n/sessions\n/rooms\n/tracks\n",
+                "moqom-relay\n\n/metrics\n/healthz\n/readyz\n/sessions\n/rooms\n/tracks\n/geo\n",
             ),
             _ => Response::text(404, "no such endpoint\n"),
         }
@@ -322,6 +341,59 @@ impl Surface {
         out
     }
 
+    /// Sessions per tenant by coarse place, with small places withheld.
+    ///
+    /// The same rule a tenant's live map is held to: an operator checking that
+    /// geolocation works has no more need of one person's city than a tenant
+    /// does. Looked up fresh on every request; see [`crate::geo`].
+    fn geo_json(&self) -> String {
+        let locator = crate::geo::Locator::shared();
+        let census = crate::geo::Surveyor::new().survey(&self.fabric, locator);
+        let disclosure = crate::geo::Disclosure::from_env();
+
+        let mut out = String::from("{\"tenants\":[");
+        for (index, (tenant, tally)) in census.tenants.iter().enumerate() {
+            if index > 0 {
+                out.push(',');
+            }
+            let shown = disclosure.disclose(tally);
+            let _ = write!(
+                out,
+                "{{\"tenant\":{},\"sessions\":{},\"publishers\":{},\"viewers\":{},\
+                 \"withheld\":{},\"places\":[",
+                json_string(tenant.as_bytes()),
+                tally.sessions(),
+                tally.publishers,
+                tally.viewers,
+                shown.withheld,
+            );
+            for (n, (place, count)) in shown.places.iter().enumerate() {
+                if n > 0 {
+                    out.push(',');
+                }
+                let _ = write!(
+                    out,
+                    "{{\"country\":{},\"region\":{},\"city\":{},\"lat\":{},\"lon\":{},\"sessions\":{}}}",
+                    json_string(place.country.as_bytes()),
+                    json_string(place.region.as_bytes()),
+                    json_string(place.city.as_bytes()),
+                    place.latitude,
+                    place.longitude,
+                    count,
+                );
+            }
+            out.push_str("]}");
+        }
+        let _ = write!(
+            out,
+            "],\"database\":{},\"min_count\":{},\"round_to\":{}}}",
+            locator.is_some(),
+            disclosure.min_count(),
+            disclosure.round_to(),
+        );
+        out
+    }
+
     /// Every room with something publishing in it.
     fn rooms_json(&self) -> String {
         let announcements = self.fabric.announcements();
@@ -358,14 +430,36 @@ impl Surface {
 
     /// Bind `addr` and answer requests until the future is dropped.
     ///
+    /// `guard` decides who may read what, and `tls`, when given, is the
+    /// configuration from [`crate::admin_auth::tls_config`] that verifies the
+    /// client certificates a guard requiring them depends on.
+    ///
     /// # Errors
-    /// [`io::Error`] if the address cannot be bound. Per-connection failures are
-    /// logged and do not stop the loop: a broken scrape must not take the
-    /// endpoint down for the next one.
-    pub async fn serve(self, addr: SocketAddr) -> io::Result<()> {
+    /// [`io::Error`] if the address cannot be bound, if `guard` is open and
+    /// `addr` is not loopback, or if `guard` needs TLS and none was given.
+    /// Per-connection failures are logged and do not stop the loop: a broken
+    /// scrape must not take the endpoint down for the next one.
+    pub async fn serve(
+        self,
+        addr: SocketAddr,
+        guard: Guard,
+        tls: Option<Arc<rustls::ServerConfig>>,
+    ) -> io::Result<()> {
+        guard
+            .permits_bind(addr)
+            .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))?;
+        if guard.needs_tls() && tls.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "client certificates are required but the admin listener has no TLS configuration",
+            ));
+        }
+        let acceptor = tls.map(tokio_rustls::TlsAcceptor::from);
+        let guard = Arc::new(guard);
+
         let listener = TcpListener::bind(addr).await?;
         let bound = listener.local_addr()?;
-        tracing::info!(%bound, "admin listening");
+        tracing::info!(%bound, guard = ?guard, tls = acceptor.is_some(), "admin listening");
 
         loop {
             let (stream, peer) = match listener.accept().await {
@@ -380,34 +474,82 @@ impl Surface {
                 }
             };
             let surface = self.clone();
+            let guard = Arc::clone(&guard);
+            let acceptor = acceptor.clone();
             tokio::spawn(async move {
-                if let Err(e) = surface.answer(stream).await {
+                if let Err(e) = surface.connection(stream, &guard, acceptor.as_ref()).await {
                     tracing::debug!(%peer, error = %e, "admin request failed");
                 }
             });
         }
     }
 
-    async fn answer(&self, mut stream: TcpStream) -> io::Result<()> {
+    /// One accepted connection: the TLS handshake if there is one, then the
+    /// request.
+    async fn connection(
+        &self,
+        stream: tokio::net::TcpStream,
+        guard: &Guard,
+        acceptor: Option<&tokio_rustls::TlsAcceptor>,
+    ) -> io::Result<()> {
+        let Some(acceptor) = acceptor else {
+            return self.answer(stream, guard, false).await;
+        };
+        // Inside the same timeout as the request, so a peer that opens a socket
+        // and never finishes the handshake is bounded exactly like one that
+        // never sends a request.
+        match tokio::time::timeout(REQUEST_TIMEOUT, acceptor.accept(stream)).await {
+            Ok(Ok(tls)) => {
+                let certified = tls.get_ref().1.peer_certificates().is_some();
+                self.answer(tls, guard, certified).await
+            }
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "handshake timed out")),
+        }
+    }
+
+    /// Answer one request on an accepted connection.
+    ///
+    /// `certified` is whether the connection carried a client certificate that
+    /// the TLS handshake verified; on a plaintext listener it is always false.
+    async fn answer<S>(&self, mut stream: S, guard: &Guard, certified: bool) -> io::Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
         let request = match tokio::time::timeout(REQUEST_TIMEOUT, read_head(&mut stream)).await {
             Ok(result) => result?,
             Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "request timed out")),
         };
 
         let response = match parse_target(&request) {
-            Some(("GET" | "HEAD", target)) => self.respond(target),
+            Some((method @ ("GET" | "HEAD"), target)) => {
+                match guard.judge(target, authorization(&request), certified) {
+                    Verdict::Allow => self.respond(target),
+                    Verdict::Unauthenticated => {
+                        tracing::info!(method, target, "admin request without a valid token");
+                        Response::text(401, "a bearer token is required\n")
+                    }
+                    Verdict::Forbidden => {
+                        tracing::info!(method, target, "admin request refused");
+                        Response::text(403, "not available on this listener without a client certificate\n")
+                    }
+                }
+            }
             Some(_) => Response::text(405, "only GET\n"),
             None => Response::text(400, "unintelligible request\n"),
         };
 
         stream.write_all(&response.encode()).await?;
         stream.flush().await?;
+        // Over TLS this sends close_notify, without which a client cannot tell a
+        // complete response from a truncated one.
+        stream.shutdown().await?;
         Ok(())
     }
 }
 
 /// Read until the end of the headers, or until the bounds say stop.
-async fn read_head(stream: &mut TcpStream) -> io::Result<String> {
+async fn read_head<S: AsyncRead + Unpin>(stream: &mut S) -> io::Result<String> {
     let mut buffer = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];
     loop {
@@ -437,6 +579,29 @@ fn parse_target(request: &str) -> Option<(&str, &str)> {
     let method = parts.next()?;
     let target = parts.next()?;
     Some((method, target))
+}
+
+/// The `Authorization` header from a request head, if it has exactly one.
+///
+/// Two of them is refused rather than resolved, because which one a proxy in
+/// front would have used is not knowable from here.
+fn authorization(request: &str) -> Option<&str> {
+    let mut found = None;
+    for line in request.lines().skip(1) {
+        if line.is_empty() {
+            break;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("authorization") {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(value.trim());
+        }
+    }
+    found
 }
 
 const fn carrier_name(carrier: moqom_proto::control::setup::Transport) -> &'static str {
@@ -548,6 +713,7 @@ fn json_string(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::fabric::SessionId;
+    use tokio::net::TcpStream;
     use tokio::sync::mpsc;
 
     fn namespace(fields: &[&str]) -> TrackNamespace {
@@ -776,6 +942,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_geo_report_says_what_rule_it_applied() {
+        let (surface, _fabric) = surface();
+        let body = surface.respond("/geo").body;
+        assert!(body.starts_with(r#"{"tenants":[]"#), "{body}");
+        assert!(body.contains(r#""min_count":"#), "{body}");
+        assert!(body.contains(r#""round_to":"#), "{body}");
+    }
+
+    #[tokio::test]
+    async fn the_geo_report_needs_a_credential() {
+        let guard = Guard::open().with_bearer(TOKEN).expect("token");
+        let refused = ask(guard, "GET /geo HTTP/1.1\r\n\r\n").await;
+        assert!(refused.starts_with("HTTP/1.1 401"), "{refused}");
+    }
+
     /// A namespace an unauthenticated peer chose ends up in this JSON, so the
     /// escaping is a correctness property and not a nicety: a room name with a
     /// quote in it must not be able to inject structure.
@@ -831,7 +1013,7 @@ mod tests {
         let addr = listener.local_addr().expect("addr");
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
-            surface.answer(stream).await.expect("answered");
+            surface.answer(stream, &Guard::open(), false).await.expect("answered");
         });
 
         let mut client = TcpStream::connect(addr).await.expect("connect");
@@ -860,7 +1042,7 @@ mod tests {
         let addr = listener.local_addr().expect("addr");
         let served = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
-            surface.answer(stream).await
+            surface.answer(stream, &Guard::open(), false).await
         });
 
         let mut client = TcpStream::connect(addr).await.expect("connect");
@@ -873,5 +1055,261 @@ mod tests {
             served.await.expect("joined").is_err(),
             "an unterminated flood is dropped, not answered"
         );
+    }
+
+    const TOKEN: &str = "an-admin-token-that-is-long-enough-1234";
+
+    /// Send `request` to a surface behind `guard` over plaintext, and return the
+    /// raw response.
+    async fn ask(guard: Guard, request: &str) -> String {
+        let (surface, _fabric) = surface();
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let _ = surface.connection(stream, &guard, None).await;
+        });
+        let mut client = TcpStream::connect(addr).await.expect("connect");
+        client.write_all(request.as_bytes()).await.expect("write");
+        let mut response = String::new();
+        let _ = client.read_to_string(&mut response).await;
+        response
+    }
+
+    #[test]
+    fn two_authorization_headers_are_ambiguous() {
+        let head = "GET / HTTP/1.1\r\nAuthorization: Bearer a\r\nauthorization: Bearer b\r\n\r\n";
+        assert_eq!(authorization(head), None);
+        let head = "GET / HTTP/1.1\r\nAUTHORIZATION:  Bearer a \r\n\r\n";
+        assert_eq!(authorization(head), Some("Bearer a"));
+        assert_eq!(authorization("GET / HTTP/1.1\r\nhost: x\r\n\r\n"), None);
+    }
+
+    #[tokio::test]
+    async fn a_token_guarded_listener_answers_probes_and_challenges_the_rest() {
+        let guard = || Guard::open().with_bearer(TOKEN).expect("token");
+
+        let probe = ask(guard(), "GET /healthz HTTP/1.1\r\n\r\n").await;
+        assert!(probe.starts_with("HTTP/1.1 200 OK"), "{probe}");
+
+        let refused = ask(guard(), "GET /sessions HTTP/1.1\r\n\r\n").await;
+        assert!(refused.starts_with("HTTP/1.1 401 Unauthorized"), "{refused}");
+        assert!(refused.contains("www-authenticate: Bearer"), "{refused}");
+        assert!(!refused.contains("\"sessions\""), "{refused}");
+
+        let wrong = ask(guard(), "GET /sessions HTTP/1.1\r\nAuthorization: Bearer nope\r\n\r\n").await;
+        assert!(wrong.starts_with("HTTP/1.1 401"), "{wrong}");
+
+        let admitted = ask(
+            guard(),
+            &format!("GET /sessions HTTP/1.1\r\nAuthorization: Bearer {TOKEN}\r\n\r\n"),
+        )
+        .await;
+        assert!(admitted.starts_with("HTTP/1.1 200 OK"), "{admitted}");
+        assert!(admitted.contains("\"sessions\":[]"), "{admitted}");
+    }
+
+    #[tokio::test]
+    async fn a_probes_only_listener_serves_nothing_else() {
+        let metrics = ask(Guard::probes_only(), "GET /metrics HTTP/1.1\r\n\r\n").await;
+        assert!(metrics.starts_with("HTTP/1.1 403 Forbidden"), "{metrics}");
+        assert!(!metrics.contains("moqom_relay"), "{metrics}");
+        let ready = ask(Guard::probes_only(), "GET /readyz HTTP/1.1\r\n\r\n").await;
+        assert!(ready.starts_with("HTTP/1.1 200 OK"), "{ready}");
+    }
+
+    /// A port nothing is listening on, for a test that has to name one up front.
+    fn free_port() -> SocketAddr {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|listener| listener.local_addr())
+            .expect("a free port")
+    }
+
+    async fn get(addr: SocketAddr, path: &str) -> String {
+        for _ in 0..100 {
+            if let Ok(mut client) = TcpStream::connect(addr).await {
+                client
+                    .write_all(format!("GET {path} HTTP/1.1\r\nhost: localhost\r\n\r\n").as_bytes())
+                    .await
+                    .expect("write");
+                let mut response = String::new();
+                let _ = client.read_to_string(&mut response).await;
+                return response;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("nothing listening on {addr}");
+    }
+
+    /// The deployed shape: probes-only on the address the load balancer checks,
+    /// and the whole surface on loopback for the overlay tunneler to host. One
+    /// surface behind both, so readiness and metrics are the same state.
+    #[tokio::test]
+    async fn one_surface_serves_a_probe_port_and_a_loopback_port_together() {
+        let (surface, _fabric) = surface();
+        let probes = free_port();
+        let local = free_port();
+        tokio::spawn(surface.clone().serve(probes, Guard::probes_only(), None));
+        tokio::spawn(surface.clone().serve(local, Guard::open(), None));
+
+        let refused = get(probes, "/metrics").await;
+        assert!(refused.starts_with("HTTP/1.1 403 Forbidden"), "{refused}");
+        let scraped = get(local, "/metrics").await;
+        assert!(scraped.starts_with("HTTP/1.1 200 OK"), "{scraped}");
+        assert!(scraped.contains("moqom_relay_uptime_seconds"), "{scraped}");
+        let sessions = get(local, "/sessions").await;
+        assert!(sessions.contains("\"sessions\":[]"), "{sessions}");
+
+        surface.draining();
+        assert!(get(probes, "/readyz").await.starts_with("HTTP/1.1 503"));
+        assert!(get(local, "/readyz").await.starts_with("HTTP/1.1 503"));
+    }
+
+    #[tokio::test]
+    async fn an_open_listener_refuses_to_bind_off_loopback() {
+        let (surface, _fabric) = surface();
+        let err = surface
+            .serve("0.0.0.0:0".parse().expect("addr"), Guard::open(), None)
+            .await
+            .expect_err("refused");
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("without authentication"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_guard_needing_certificates_refuses_to_serve_without_tls() {
+        let (surface, _fabric) = surface();
+        let guard = Guard::open().with_client_certificates().expect("guard");
+        let err = surface
+            .serve("127.0.0.1:0".parse().expect("addr"), guard, None)
+            .await
+            .expect_err("refused");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    /// An authority, a server leaf, and a client leaf it issued.
+    struct Pki {
+        ca_pem: String,
+        server_pem: String,
+        server_key_pem: String,
+        client: (rustls::pki_types::CertificateDer<'static>, rustls::pki_types::PrivateKeyDer<'static>),
+        server_ca: rustls::pki_types::CertificateDer<'static>,
+    }
+
+    impl Pki {
+        fn operator(&self) -> (rustls::pki_types::CertificateDer<'static>, rustls::pki_types::PrivateKeyDer<'static>) {
+            (self.client.0.clone(), self.client.1.clone_key())
+        }
+    }
+
+    fn pki() -> Pki {
+        let ca_key = rcgen::KeyPair::generate().expect("key");
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("params");
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca = ca_params.self_signed(&ca_key).expect("ca");
+        let issuer = rcgen::Issuer::new(ca_params, ca_key);
+
+        let server_key = rcgen::KeyPair::generate().expect("key");
+        let server = rcgen::CertificateParams::new(vec!["relay-admin".to_owned()])
+            .expect("params")
+            .signed_by(&server_key, &issuer)
+            .expect("server");
+
+        let client_key = rcgen::KeyPair::generate().expect("key");
+        let client = rcgen::CertificateParams::new(vec!["operator".to_owned()])
+            .expect("params")
+            .signed_by(&client_key, &issuer)
+            .expect("client");
+
+        Pki {
+            ca_pem: ca.pem(),
+            server_pem: server.pem(),
+            server_key_pem: server_key.serialize_pem(),
+            client: (
+                client.der().clone(),
+                rustls::pki_types::PrivateKeyDer::try_from(client_key.serialize_der()).expect("key"),
+            ),
+            server_ca: ca.der().clone(),
+        }
+    }
+
+    /// Ask a mutual-TLS guarded surface for `path`, presenting `identity` if
+    /// given. `Err` means the handshake failed.
+    async fn ask_tls(
+        pki: &Pki,
+        operator_ca_pem: &str,
+        identity: Option<(rustls::pki_types::CertificateDer<'static>, rustls::pki_types::PrivateKeyDer<'static>)>,
+        path: &str,
+    ) -> io::Result<String> {
+        let server_tls = crate::admin_auth::tls_config(
+            pki.server_pem.as_bytes(),
+            pki.server_key_pem.as_bytes(),
+            operator_ca_pem.as_bytes(),
+        )
+        .expect("server tls");
+        let acceptor = tokio_rustls::TlsAcceptor::from(server_tls);
+        let guard = Guard::open().with_client_certificates().expect("guard");
+
+        let (surface, _fabric) = surface();
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let _ = surface.connection(stream, &guard, Some(&acceptor)).await;
+        });
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(pki.server_ca.clone()).expect("root");
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let builder = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("versions")
+            .with_root_certificates(roots);
+        let client_tls = match identity {
+            Some((cert, key)) => builder.with_client_auth_cert(vec![cert], key).expect("identity"),
+            None => builder.with_no_client_auth(),
+        };
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_tls));
+        let tcp = TcpStream::connect(addr).await?;
+        let name = rustls::pki_types::ServerName::try_from("relay-admin").expect("name");
+        let mut tls = connector.connect(name, tcp).await?;
+        tls.write_all(format!("GET {path} HTTP/1.1\r\n\r\n").as_bytes()).await?;
+        let mut response = String::new();
+        tls.read_to_string(&mut response).await?;
+        Ok(response)
+    }
+
+    #[tokio::test]
+    async fn mutual_tls_admits_an_operator_certificate() {
+        let pki = pki();
+        let response = ask_tls(&pki, &pki.ca_pem, Some(pki.operator()), "/sessions")
+            .await
+            .expect("answered");
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn mutual_tls_without_a_certificate_reaches_only_the_probes() {
+        let pki = pki();
+        let refused = ask_tls(&pki, &pki.ca_pem, None, "/sessions").await.expect("answered");
+        assert!(refused.starts_with("HTTP/1.1 403"), "{refused}");
+        let probe = ask_tls(&pki, &pki.ca_pem, None, "/healthz").await.expect("answered");
+        assert!(probe.starts_with("HTTP/1.1 200 OK"), "{probe}");
+    }
+
+    #[tokio::test]
+    async fn mutual_tls_refuses_a_certificate_from_another_authority() {
+        let pki = pki();
+        // The listener trusts a different authority, so the operator certificate
+        // the client holds was issued by somebody it does not know.
+        let stranger = self::pki();
+        let outcome = ask_tls(&pki, &stranger.ca_pem, Some(pki.operator()), "/sessions").await;
+        match outcome {
+            Err(_) => {}
+            Ok(response) => assert!(
+                !response.contains("\"sessions\""),
+                "an unknown authority must not reach a protected path: {response}"
+            ),
+        }
     }
 }

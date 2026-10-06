@@ -68,6 +68,15 @@ pub mod param_type {
     /// Even, so it carries a varint. See
     /// [`setup::PRIVATE_USE_VARINT`](crate::control::setup::PRIVATE_USE_VARINT).
     pub const RELAY_HOPS: u64 = crate::control::setup::PRIVATE_USE_VARINT;
+
+    /// Whether objects are sent on a subscription at all: 0 or 1, anything
+    /// else a protocol violation (draft-19 §10.2.17).
+    ///
+    /// On a `REQUEST_UPDATE` it pauses or resumes a subscription without
+    /// ending it, which is how a subscriber that has another way to receive a
+    /// track stops paying for the relay's copy and keeps the subscription to
+    /// fall back on. Omitted there means unchanged.
+    pub const FORWARD: u64 = 0x10;
 }
 
 /// A parameter could not be constructed.

@@ -356,6 +356,20 @@ struct Inner {
     /// counts too — it is the same directive with nothing left in it — which
     /// is why the series is not a gauge of how many people are muted.
     mutes: AtomicU64,
+    /// Live sessions whose grants changed without reconnecting, by
+    /// [`crate::scope::Regrade::name`].
+    regrades: Mutex<HashMap<&'static str, u64>>,
+    /// Renewals that verified and asked for different grants, and were not
+    /// given them, by a fixed set of reasons.
+    ///
+    /// Separate from `tokens_refused`, which counts credentials that are bad.
+    /// These are good credentials asking for something this relay will not do
+    /// on a live session, and a run of them is a client or a backend minting
+    /// promotions wrongly rather than anybody failing to authenticate.
+    regrades_refused: Mutex<HashMap<&'static str, u64>>,
+    /// Requests ended because a change of grants no longer covered them, by
+    /// what kind of request it was.
+    revocations: Mutex<HashMap<&'static str, u64>>,
 
     subgroups_forwarded: AtomicU64,
     subgroups_dropped: AtomicU64,
@@ -609,6 +623,9 @@ impl Metrics {
                 directives: Mutex::new(HashMap::new()),
                 ejections: AtomicU64::new(0),
                 mutes: AtomicU64::new(0),
+                regrades: Mutex::new(HashMap::new()),
+                regrades_refused: Mutex::new(HashMap::new()),
+                revocations: Mutex::new(HashMap::new()),
                 subgroups_forwarded: AtomicU64::new(0),
                 subgroups_dropped: AtomicU64::new(0),
                 subgroups_shed: AtomicU64::new(0),
@@ -907,6 +924,29 @@ impl Metrics {
     pub fn muted(&self) {
         if let Some(inner) = self.inner() {
             inner.mutes.fetch_add(1, ORDER);
+        }
+    }
+
+    /// A live session's grants changed. `change` is a fixed set.
+    pub fn regraded(&self, change: &'static str) {
+        if let Some(inner) = self.inner() {
+            bump(&inner.regrades, change);
+        }
+    }
+
+    /// A verified renewal asked for different grants and was not given them.
+    /// `reason` is a fixed set.
+    pub fn regrade_refused(&self, reason: &'static str) {
+        if let Some(inner) = self.inner() {
+            bump(&inner.regrades_refused, reason);
+        }
+    }
+
+    /// A request was ended because the session's grants no longer cover it.
+    /// `request` is a fixed set.
+    pub fn revoked(&self, request: &'static str) {
+        if let Some(inner) = self.inner() {
+            bump(&inner.revocations, request);
         }
     }
 
@@ -1249,6 +1289,37 @@ impl Metrics {
             "Force-mutes applied to a session, including the ones that lifted a mute.",
             inner.mutes.load(ORDER),
         );
+        for (name, help, label, counts) in [
+            (
+                "moqom_relay_grants_changed_total",
+                "Live sessions whose grants changed without reconnecting, by direction.",
+                "change",
+                &inner.regrades,
+            ),
+            (
+                "moqom_relay_grant_changes_refused_total",
+                "Verified renewals asking for different grants that were not applied, by reason.",
+                "reason",
+                &inner.regrades_refused,
+            ),
+            (
+                "moqom_relay_grant_revocations_total",
+                "Requests ended because a change of grants no longer covered them, by request kind.",
+                "request",
+                &inner.revocations,
+            ),
+        ] {
+            let mut seen: Vec<(&'static str, u64)> = counts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .map(|(&key, &n)| (key, n))
+                .collect();
+            seen.sort_unstable();
+            let series: Vec<(&str, &str, u64)> =
+                seen.iter().map(|&(key, n)| (label, key, n)).collect();
+            counter(&mut out, name, help, &series);
+        }
         plain(
             &mut out,
             "gauge",
@@ -1542,6 +1613,15 @@ pub struct Gauges {
 /// `AtomicU64` is not `Copy`, so the array repeat syntax does not apply.
 fn counters<const N: usize>() -> [AtomicU64; N] {
     std::array::from_fn(|_| AtomicU64::new(0))
+}
+
+/// Count one more of `key` in a map keyed by a fixed set of names.
+fn bump(counts: &Mutex<HashMap<&'static str, u64>>, key: &'static str) {
+    *counts
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(key)
+        .or_insert(0) += 1;
 }
 
 /// A single unlabelled metric.

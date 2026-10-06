@@ -117,6 +117,33 @@ pub enum Error {
     /// The device key could not sign.
     #[error("{0}")]
     DeviceKey(#[from] crate::device::DeviceKeyError),
+
+    /// The room does not allow a direct path. See [`crate::direct::Eligibility`].
+    #[error("direct mode is not allowed here: {0}")]
+    Ineligible(#[from] crate::direct::Ineligible),
+
+    /// No direct path could be opened in time. The relay path is unaffected.
+    #[error("no direct path to the peer opened within {0:?}")]
+    Unreachable(std::time::Duration),
+
+    /// A candidate offer could not be opened: wrong room secret, tampered, not
+    /// addressed to us, or not an offer at all.
+    #[error("candidate offer refused: {0}")]
+    Offer(&'static str),
+
+    /// The peer's credentials did not verify, so this side closed the direct
+    /// session.
+    #[error("the peer's credentials were refused: {0}")]
+    PeerUnverified(String),
+
+    /// The peer refused this side's credentials and said why as it closed.
+    #[error("the peer refused this session ({code}): {reason}")]
+    PeerRejected {
+        /// The MOQT session error code.
+        code: u64,
+        /// What the peer said as it closed.
+        reason: String,
+    },
 }
 
 impl Error {

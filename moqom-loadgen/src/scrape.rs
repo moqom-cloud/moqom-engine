@@ -104,9 +104,22 @@ impl Reading {
 }
 
 /// GET `/metrics` and return the body.
+///
+/// A relay whose admin port is not on loopback requires a bearer token, read
+/// here from the file `MOQOM_RELAY_ADMIN_TOKEN_FILE` names -- the same variable
+/// the relay reads, so one path configures both ends of a lab.
 async fn fetch(addr: &str) -> Result<String, Error> {
     let mut stream = TcpStream::connect(addr).await?;
-    let request = format!("GET /metrics HTTP/1.0\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    let authorization = match std::env::var("MOQOM_RELAY_ADMIN_TOKEN_FILE") {
+        Ok(path) if !path.is_empty() => {
+            let token = std::fs::read_to_string(&path)?;
+            format!("Authorization: Bearer {}\r\n", token.trim())
+        }
+        _ => String::new(),
+    };
+    let request = format!(
+        "GET /metrics HTTP/1.0\r\nHost: {addr}\r\n{authorization}Connection: close\r\n\r\n"
+    );
     stream.write_all(request.as_bytes()).await?;
 
     // HTTP/1.0 with `Connection: close`, so the body ends when the socket does

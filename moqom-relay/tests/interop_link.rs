@@ -98,6 +98,8 @@ impl ControlPlane {
             .env("MOQOM_CONTROL_ACCOUNTS", accounts.path())
             .env("MOQOM_CONTROL_STORE", "memory")
             .env("MOQOM_CONTROL_ISSUER", ISSUER)
+            // The control plane refuses plaintext unless told; loopback only.
+            .env("MOQOM_CONTROL_ALLOW_PLAINTEXT", "true")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()

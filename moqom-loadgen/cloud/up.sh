@@ -319,6 +319,7 @@ echo "distributing the binaries"
 pull "$BUILD_HOST" "$REMOTE_ROOT/bin/moqom-relay" "$work/moqom-relay"
 pull "$BUILD_HOST" "$REMOTE_ROOT/bin/moqom-load" "$work/moqom-load"
 pull "$BUILD_HOST" "$REMOTE_ROOT/jwks.json" "$work/jwks.json"
+pull "$BUILD_HOST" "$REMOTE_ROOT/admin-token" "$work/admin-token"
 install_binaries() {
   local host="$1"
   # The build host already has them, and they are the originals rather than copies.
@@ -326,9 +327,11 @@ install_binaries() {
   push "$host" "$work/moqom-relay" /tmp/moqom-relay
   push "$host" "$work/moqom-load" /tmp/moqom-load
   push "$host" "$work/jwks.json" /tmp/jwks.json
+  push "$host" "$work/admin-token" /tmp/admin-token
   on "$host" "sudo install -m 0755 /tmp/moqom-relay $REMOTE_ROOT/bin/moqom-relay \
     && sudo install -m 0755 /tmp/moqom-load $REMOTE_ROOT/bin/moqom-load \
-    && sudo install -m 0644 /tmp/jwks.json $REMOTE_ROOT/jwks.json"
+    && sudo install -m 0644 /tmp/jwks.json $REMOTE_ROOT/jwks.json \
+    && sudo install -m 0644 /tmp/admin-token $REMOTE_ROOT/admin-token && rm -f /tmp/admin-token"
 }
 
 run_on_every_host install install_binaries

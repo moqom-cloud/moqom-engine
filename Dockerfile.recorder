@@ -1,0 +1,44 @@
+# The hosted recorder's image.
+#
+# Built from the workspace root, like the relay's, because the recorder is a
+# client of the relay built on moqom-client and the crates beneath it:
+#
+#   docker build -f Dockerfile.recorder -t moqom-recorder .
+#
+# Every workspace member is copied, not only the ones the recorder links:
+# cargo will not resolve a workspace with a member missing, and the recorder's
+# integration test runs a relay in-process, so moqom-relay is a dev-dependency
+# whose manifest has to be there either way. Prefer Cloud Build for an image
+# that will be deployed, for the same amd64 reason the relay's file gives.
+
+FROM rust:1.97.1-bookworm AS build
+
+WORKDIR /src
+
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY vendor vendor
+COPY moqom-proto moqom-proto
+COPY moqom-rans moqom-rans
+COPY moqom-rans-ffi moqom-rans-ffi
+COPY moqom-relay moqom-relay
+COPY moqom-transport moqom-transport
+COPY moqom-client moqom-client
+COPY moqom-media moqom-media
+COPY moqom-cli moqom-cli
+COPY moqom-loadgen moqom-loadgen
+COPY moqom-recorder moqom-recorder
+
+ARG VERSION=dev
+ENV MOQOM_BUILD_VERSION=${VERSION}
+RUN cargo build --release --locked -p moqom-recorder --bin moqom-recorder && \
+    strip target/release/moqom-recorder
+
+# cc for glibc, as the relay. The spool is the only thing written, and it is a
+# mounted volume: the root filesystem stays read-only.
+FROM gcr.io/distroless/cc-debian12:nonroot
+
+COPY --from=build /src/target/release/moqom-recorder /moqom-recorder
+
+USER nonroot:nonroot
+ENTRYPOINT ["/moqom-recorder"]
+CMD ["worker"]
