@@ -167,6 +167,10 @@ async fn main() -> std::process::ExitCode {
                 .unwrap_or_else(|_| "moqom_recorder=info".into()),
         )
         .init();
+    // Before any TLS configuration is built. tonic's gRPC client takes the
+    // installed provider and otherwise falls back to ring, which has no
+    // post-quantum key exchange; aws-lc-rs sends X25519MLKEM768 first.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     let result = match Cli::parse().command {
         Command::Record(args) => record(args).await,
