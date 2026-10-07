@@ -72,6 +72,16 @@
 //!   Being a relay is not a way past a parent's door, so against a parent that
 //!   verifies credentials an edge without this is anonymous and will not be able to
 //!   read the tracks it exists to serve.
+//! - `MOQOM_RELAY_LINK_URL` — the control plane's `/relay/link`, on its join
+//!   listener. Set beside `MOQOM_RELAY_UPSTREAM`, this edge links to its parent
+//!   once per room instead of once, each link on a short-lived credential minted
+//!   for that room alone, bound to a key this process generates and proved to the
+//!   parent like a client's, and renewed before it lapses. The request is
+//!   authenticated with `MOQOM_CONTROL_CREDENTIAL`, which must be a relay
+//!   service account's; `MOQOM_RELAY_UPSTREAM_TOKEN` is then unused. See
+//!   [`crate::edge`](moqom_relay::edge).
+//! - `MOQOM_RELAY_LINK_CA` — a PEM of authorities to trust for that URL as well
+//!   as the public roots.
 //! - `MOQOM_RELAY_MAX_HOP_LIMIT` — how many relays a subscription may be
 //!   forwarded through, the hop-limit draft's `MAX_HOP_LIMIT`: the budget a
 //!   request with none starts with and the most honoured on one that names more.
@@ -148,13 +158,13 @@ use moqom_relay::admin_auth::Guard;
 use moqom_relay::fabric::Ticketing;
 use moqom_relay::possession::{Enforcement, Possession};
 use moqom_relay::ticket::TicketKeys;
-use moqom_relay::upstream;
 use moqom_relay::usage::report::{Credential, Endpoint, Reporter};
 use moqom_relay::usage::{Config as UsageConfig, Hosting};
 use moqom_relay::{
     Authenticator, Cache, Fabric, Governor, Limits, Link, Metrics, Quotas, Session, Supervisor,
     Usage, VerificationKey,
 };
+use moqom_relay::{edge, upstream};
 use moqom_transport::{Server, server::with_moqt_alpn};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -286,8 +296,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // that connect to it directly, and the link retries in the background.
     if let Some(parent) = upstream()? {
         let dialer = upstream::Dialer::new(upstream_tls()?)?;
-        tracing::info!(%parent, "attaching upstream");
-        tokio::spawn(upstream::keep_attached(dialer, parent, fabric.clone()));
+        if let Some(minter) = link_minter()? {
+            tracing::info!(%parent, "linking upstream per room");
+            let edge = edge::Edge::new(
+                dialer,
+                parent,
+                fabric.clone(),
+                minter,
+                edge::Timing::default(),
+            )?;
+            tracing::info!(key = edge.thumbprint(), "room links are bound to this key");
+            drop(edge.start());
+        } else {
+            tracing::info!(%parent, "attaching upstream");
+            tokio::spawn(upstream::keep_attached(dialer, parent, fabric.clone()));
+        }
     }
 
     let surface = Surface::new(metrics, fabric.clone());
@@ -533,6 +556,27 @@ async fn shutdown() {
 
 fn env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.is_empty())
+}
+
+/// Where per-room link credentials come from, if this edge links per room.
+///
+/// # Errors
+/// A URL that is not one, no credential to ask with, or an unreadable CA.
+fn link_minter() -> Result<Option<edge::ControlPlane>, Box<dyn std::error::Error>> {
+    let Some(url) = env("MOQOM_RELAY_LINK_URL") else {
+        return Ok(None);
+    };
+    let credential = env("MOQOM_CONTROL_CREDENTIAL")
+        .ok_or("MOQOM_RELAY_LINK_URL needs MOQOM_CONTROL_CREDENTIAL to ask with")?;
+    let minter = edge::ControlPlane::new(&url, Credential::Value(credential))?;
+    Ok(Some(match env_path("MOQOM_RELAY_LINK_CA") {
+        Some(path) => {
+            let pem = std::fs::read(&path)
+                .map_err(|e| format!("reading MOQOM_RELAY_LINK_CA {}: {e}", path.display()))?;
+            minter.trusting(&pem)?
+        }
+        None => minter,
+    }))
 }
 
 /// `MAX_HOP_LIMIT`, from the environment.

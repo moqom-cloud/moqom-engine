@@ -35,7 +35,7 @@ use std::sync::{Arc, Mutex};
 
 use moqom_proto::control::{DoneReason, RequestErrorCode};
 use moqom_proto::model::{FullTrackName, TrackAlias, TrackNamespace};
-use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 
 use crate::cache::Cache;
 use crate::clock;
@@ -435,7 +435,67 @@ struct State {
     /// announcement: nothing has said the parent holds any particular track. It is
     /// somewhere to ask, tried only when nothing here holds what was asked for.
     upstream: Option<mpsc::Sender<Command>>,
+    /// Where to ask for a per-room link, if this relay links per room. See
+    /// [`Fabric::link_rooms`].
+    linker: Option<mpsc::UnboundedSender<RoomKey>>,
+    /// The per-room links to the parent, each as its link task last said.
+    links: HashMap<RoomKey, watch::Sender<LinkState>>,
 }
+
+/// The room a namespace belongs to, which is what an edge holds one link for.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RoomKey {
+    /// The customer.
+    pub tenant: String,
+    /// The room.
+    pub room: String,
+}
+
+impl RoomKey {
+    /// The room `namespace` sits in: `(tenant, "r" or "bs", room, ...)`.
+    ///
+    /// `None` for anything else, a personal channel included, which no
+    /// per-room link can carry.
+    #[must_use]
+    pub fn of(namespace: &TrackNamespace) -> Option<Self> {
+        match namespace.fields() {
+            [tenant, marker, room, ..] if marker.as_ref() == b"r" || marker.as_ref() == b"bs" => {
+                Some(Self {
+                    tenant: std::str::from_utf8(tenant).ok()?.to_owned(),
+                    room: std::str::from_utf8(room).ok()?.to_owned(),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// The room's own namespace, `(tenant, "r", room)`.
+    #[must_use]
+    pub fn namespace(&self) -> Option<TrackNamespace> {
+        TrackNamespace::from_parts([self.tenant.as_str(), "r", self.room.as_str()]).ok()
+    }
+}
+
+impl std::fmt::Display for RoomKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.tenant, self.room)
+    }
+}
+
+/// Where one room's link to the parent stands.
+#[derive(Debug, Clone)]
+pub enum LinkState {
+    /// Being established, or re-established after it dropped.
+    Connecting,
+    /// Up, and reached through this.
+    Up(mpsc::Sender<Command>),
+    /// The control plane will not issue a credential for the room, so there is
+    /// no link to wait for.
+    Refused,
+}
+
+/// How long a subscription waits for its room's link to come up.
+const LINK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The state shared between every session on one relay.
 ///
@@ -838,6 +898,80 @@ impl Fabric {
     #[must_use]
     pub fn upstream(&self) -> Option<mpsc::Sender<Command>> {
         self.lock().upstream.clone()
+    }
+
+    /// Whether this relay has a parent to ask, linked or not yet.
+    #[must_use]
+    pub fn has_parent(&self) -> bool {
+        let state = self.lock();
+        state.linker.is_some() || state.upstream.is_some()
+    }
+
+    /// Link to the parent once per room, asking `linker` for each room's link
+    /// the first time something in it is wanted.
+    ///
+    /// Replaces the single link of [`Self::attach_upstream`] for an edge whose
+    /// parent requires per-room credentials: each room's link carries a token
+    /// scoped to that room alone, so the parent can refuse anything else it is
+    /// asked on it. See [`crate::edge`].
+    pub fn link_rooms(&self, linker: mpsc::UnboundedSender<RoomKey>) {
+        self.lock().linker = Some(linker);
+    }
+
+    /// How to reach the parent for something under `namespace`.
+    ///
+    /// Without per-room links this is [`Self::upstream`]. With them it is the
+    /// link for the namespace's room, asked for if there is none and waited for
+    /// if it is coming up, for at most a few seconds: a subscription that has
+    /// to wait longer is better refused than left without an answer.
+    pub async fn upstream_for(&self, namespace: &TrackNamespace) -> Option<mpsc::Sender<Command>> {
+        let mut state = {
+            let mut guard = self.lock();
+            let Some(linker) = guard.linker.clone() else {
+                return guard.upstream.clone();
+            };
+            let room = RoomKey::of(namespace)?;
+            if let Some(link) = guard.links.get(&room) {
+                link.subscribe()
+            } else {
+                let (link, state) = watch::channel(LinkState::Connecting);
+                guard.links.insert(room.clone(), link);
+                if linker.send(room.clone()).is_err() {
+                    guard.links.remove(&room);
+                    return None;
+                }
+                state
+            }
+        };
+        let up = state.wait_for(|state| !matches!(state, LinkState::Connecting));
+        match tokio::time::timeout(LINK_WAIT, up).await {
+            Ok(Ok(state)) => match &*state {
+                LinkState::Up(commands) => Some(commands.clone()),
+                LinkState::Connecting | LinkState::Refused => None,
+            },
+            Ok(Err(_)) | Err(_) => None,
+        }
+    }
+
+    /// Record where `room`'s link stands. Called by its link task.
+    pub fn set_link(&self, room: &RoomKey, state: LinkState) {
+        if let Some(link) = self.lock().links.get(room) {
+            link.send_replace(state);
+        }
+    }
+
+    /// Forget `room`'s link, so the next subscription in it asks again.
+    pub fn forget_link(&self, room: &RoomKey) {
+        self.lock().links.remove(room);
+    }
+
+    /// Where `room`'s link stands, if there is one.
+    #[must_use]
+    pub fn link(&self, room: &RoomKey) -> Option<LinkState> {
+        self.lock()
+            .links
+            .get(room)
+            .map(|link| link.borrow().clone())
     }
 
     /// Every announced namespace, for diagnostics.

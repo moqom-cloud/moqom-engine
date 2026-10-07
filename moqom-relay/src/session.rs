@@ -57,13 +57,16 @@ use moqom_proto::varint::VarInt;
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 use web_transport_quinn::{RecvStream, SendStream};
 
-use crate::fabric::{Command, Fabric, NamespaceEvent, Pulling, Route, SessionId, UpstreamError};
+use crate::fabric::{
+    Command, Fabric, LinkState, NamespaceEvent, Pulling, RoomKey, Route, SessionId, UpstreamError,
+};
 use crate::hops::{self, Hops};
 use crate::metrics::{Ending, Fetched, Flowing, Metrics, Subscribed};
 use crate::policy::Silence;
 use crate::quota::{Lease, Principal, Refusal, Resource};
 use crate::roster::{Arrival, Departure};
 use crate::scope::{Denial, Permission, Scope};
+use crate::upstream::{Idle, Introduction, Renewal};
 use crate::{cache, media, metrics, scope};
 
 mod drafts;
@@ -905,16 +908,17 @@ impl Session {
     /// withdraws on the way out, so a subscription arriving while the link is down
     /// is refused rather than queued against a session that is gone.
     ///
-    /// `token`, when present, is offered to the parent as this relay's credential.
-    /// The parent authenticates us exactly as it authenticates anybody: being a
-    /// relay is not a way in.
+    /// `introduction` is what this relay offers the parent: its credential, the
+    /// proof that the credential is its own, and for a per-room link the room and
+    /// the renewals to pass on. The parent authenticates us exactly as it
+    /// authenticates anybody: being a relay is not a way in.
     ///
     /// # Errors
     /// [`SessionError`] if the handshake fails or the parent violates the protocol.
     pub async fn attach(
         transport: moqom_transport::Session,
         fabric: Fabric,
-        token: Option<&[u8]>,
+        introduction: Introduction,
     ) -> Result<(), SessionError> {
         let id = fabric.next_session_id();
         let (commands, command_queue) = mpsc::channel(32);
@@ -952,9 +956,16 @@ impl Session {
             meter: Arc::default(),
         };
 
-        let result = draft.bind(session.run_upstream(command_queue, token)).await;
+        let per_room = introduction.room.is_some();
+        let result = draft
+            .bind(session.run_upstream(command_queue, introduction))
+            .await;
         fabric.remove_session(id);
-        fabric.detach_upstream();
+        // A per-room link's task says where the room stands next, since only it
+        // knows whether it is reconnecting, refused, or done.
+        if !per_room {
+            fabric.detach_upstream();
+        }
         let ending = Ending::of(&result);
         fabric.metrics().session_ended(id, ending);
         tracing::info!(
@@ -982,14 +993,38 @@ impl Session {
     async fn run_upstream(
         &self,
         commands: mpsc::Receiver<Command>,
-        token: Option<&[u8]>,
+        introduction: Introduction,
     ) -> Result<(), SessionError> {
-        let (control_send, control) = self.introduce(token).await?;
+        let Introduction {
+            token,
+            proof,
+            room,
+            renewals,
+            idle,
+        } = introduction;
+        let (control_send, control) = self.introduce(token.as_deref(), proof.as_deref()).await?;
 
         // Available to subscribers only now. Published earlier, a subscription
         // could be handed to a session whose handshake was still in doubt, and a
         // refusal by the parent would arrive as a failure of this relay.
-        self.fabric.attach_upstream(self.commands.clone());
+        match &room {
+            Some(room) => self
+                .fabric
+                .set_link(room, LinkState::Up(self.commands.clone())),
+            None => self.fabric.attach_upstream(self.commands.clone()),
+        }
+        let anchor = async {
+            match (room.as_ref().and_then(RoomKey::namespace), renewals) {
+                (Some(prefix), Some(renewals)) => self.anchor(prefix, renewals).await,
+                _ => std::future::pending().await,
+            }
+        };
+        let idling = async {
+            match idle {
+                Some(idle) => self.idle_out(&idle).await,
+                None => std::future::pending().await,
+            }
+        };
 
         let peer = self.connection().remote_address();
         let live = self
@@ -1006,6 +1041,84 @@ impl Session {
             result = self.accept_requests() => result,
             result = self.accept_data() => result,
             result = self.sample_transport(live.as_deref()) => result,
+            result = anchor => result,
+            result = idling => result,
+        }
+    }
+
+    /// Hold a namespace watch on a per-room link's own room, and send each
+    /// renewed credential on it.
+    ///
+    /// A renewal travels as a `REQUEST_UPDATE` on a request stream, and a link
+    /// with nobody watching has none: its subscriptions come and go with its
+    /// viewers. The watch is the stream that lasts. What the parent sends on it,
+    /// the room's namespaces and acknowledgements, this link has no use for.
+    ///
+    /// A watch the parent ends leaves nowhere to renew, so the link carries on
+    /// until its credential runs out and the parent closes it, and its task
+    /// reconnects with a fresh one.
+    async fn anchor(
+        &self,
+        prefix: TrackNamespace,
+        mut renewals: mpsc::Receiver<Renewal>,
+    ) -> Result<(), SessionError> {
+        use moqom_proto::control::params;
+        let (mut send_stream, recv) = self.transport.open_bi().await?;
+        let request = self.allocate_request_id();
+        send(
+            &mut send_stream,
+            &SubscribeNamespace::new(request, prefix.clone()),
+        )
+        .await?;
+        let mut frames = Frames::new(recv);
+        let mut renewing = true;
+        loop {
+            tokio::select! {
+                renewal = renewals.recv(), if renewing => {
+                    let Some(renewal) = renewal else {
+                        renewing = false;
+                        continue;
+                    };
+                    let mut update = RequestUpdate::new(request);
+                    for (type_value, value) in [
+                        (params::param_type::AUTHORIZATION_TOKEN, renewal.token),
+                        (params::param_type::AUTHORIZATION_PROOF, renewal.proof),
+                    ] {
+                        update.parameters.push(
+                            params::Parameter::bytes(type_value, value)
+                                .map_err(|_| SessionError::Protocol("renewal too long for a parameter"))?,
+                        );
+                    }
+                    self.outgoing(&mut update.parameters);
+                    send(&mut send_stream, &update).await?;
+                    tracing::debug!(session = %self.id, %prefix, "renewed the link's credential");
+                }
+                frame = frames.next() => if !matches!(frame, Ok(Some(_))) {
+                    tracing::warn!(
+                        session = %self.id,
+                        %prefix,
+                        "the parent ended the link's watch; it lasts until its credential does"
+                    );
+                    return std::future::pending().await;
+                },
+            }
+        }
+    }
+
+    /// End a per-room link once nothing has been pulled over it for
+    /// `idle.after`, flagging that it ended for that reason.
+    async fn idle_out(&self, idle: &Idle) -> Result<(), SessionError> {
+        let tick = (idle.after / 4).max(Duration::from_millis(10));
+        let mut quiet_since = Instant::now();
+        loop {
+            tokio::time::sleep(tick).await;
+            let busy = !self.lock_pulled().is_empty() || !self.lock_bypassed().is_empty();
+            if busy {
+                quiet_since = Instant::now();
+            } else if quiet_since.elapsed() >= idle.after {
+                idle.idled.store(true, Ordering::Relaxed);
+                return Ok(());
+            }
         }
     }
 
@@ -1015,7 +1128,11 @@ impl Session {
     /// [`handshake`](Self::handshake) beyond the order of the messages. A quota is
     /// something this relay imposes on peers that connect to it, and the parent is
     /// not one of those; the parent charges us, on its own side, by the token below.
-    async fn introduce(&self, token: Option<&[u8]>) -> Result<(SendStream, Frames), SessionError> {
+    async fn introduce(
+        &self,
+        token: Option<&[u8]>,
+        proof: Option<&[u8]>,
+    ) -> Result<(SendStream, Frames), SessionError> {
         let mut ours = self.our_setup()?;
         if let Some(token) = token {
             ours.options
@@ -1024,6 +1141,14 @@ impl Session {
                     bytes::Bytes::copy_from_slice(token),
                 )
                 .map_err(|_| SessionError::Protocol("token too long for a setup option"))?;
+        }
+        if let Some(proof) = proof {
+            ours.options
+                .set_bytes(
+                    setup::option_type::AUTHORIZATION_PROOF,
+                    bytes::Bytes::copy_from_slice(proof),
+                )
+                .map_err(|_| SessionError::Protocol("proof too long for a setup option"))?;
         }
         let (send_stream, recv) = self.open_control(&ours).await?;
         let mut control = Frames::new(recv);
@@ -2625,7 +2750,7 @@ impl Session {
     /// An edge fetching a track it does not have is the whole of what makes a
     /// fan-out tree possible. A relay with no parent finds nobody, and one
     /// whose budget is spent may not ask the parent, which is `Err`.
-    fn source_of(
+    async fn source_of(
         &self,
         track: &FullTrackName,
         hops: Hops,
@@ -2633,12 +2758,15 @@ impl Session {
         if let Some(local) = self.fabric.publisher(track.namespace()) {
             return Ok(Some(local));
         }
-        let Some(upstream) = self.fabric.upstream() else {
+        if !self.fabric.has_parent() {
             return Ok(None);
-        };
+        }
         if !hops.may_forward() {
             return Err(OutOfHops);
         }
+        let Some(upstream) = self.fabric.upstream_for(track.namespace()).await else {
+            return Ok(None);
+        };
         tracing::debug!(
             session = %self.id,
             %track,
@@ -2693,7 +2821,7 @@ impl Session {
         // on one from a child relay, which is what makes a cycle terminate.
         let hops = self.hops_of(&request.parameters)?;
 
-        let Ok(publisher) = self.source_of(&track, hops) else {
+        let Ok(publisher) = self.source_of(&track, hops).await else {
             tracing::info!(session = %self.id, %track, "subscription refused: hop limit exceeded");
             self.fabric.metrics().subscribed(Subscribed::Refused);
             return self.hop_limit_exceeded(send_stream).await;
@@ -2776,7 +2904,7 @@ impl Session {
                 drop(slot);
 
                 self.lock_subscribed().remove(&request.request_id);
-                self.release(&track, pulling.upstream, alias).await;
+                Self::release(&publisher, &track, pulling.upstream, self.id, alias).await;
                 outcome
             }
             Err(e) if e.code == RequestErrorCode::HOP_LIMIT_EXCEEDED => {
@@ -3079,14 +3207,22 @@ impl Session {
     /// Best-effort by nature: every reason the publisher might not hear this is
     /// a reason it no longer needs to. A session that has ended has already let
     /// go of every route it held.
-    async fn release(&self, track: &FullTrackName, upstream: TrackAlias, downstream: TrackAlias) {
-        let Some(publisher) = self.fabric.publisher(track.namespace()) else {
-            return;
-        };
+    ///
+    /// Sent to `publisher`, the session the subscription was made through, and
+    /// not to whoever publishes the namespace now: for a track pulled from a
+    /// parent nobody here publishes it, and a publisher that has since been
+    /// replaced holds no route to release.
+    async fn release(
+        publisher: &mpsc::Sender<Command>,
+        track: &FullTrackName,
+        upstream: TrackAlias,
+        subscriber: SessionId,
+        downstream: TrackAlias,
+    ) {
         let released = Command::Release {
             track: track.clone(),
             upstream,
-            subscriber: self.id,
+            subscriber,
             downstream,
         };
         let _ = publisher.send(released).await;

@@ -363,6 +363,26 @@ impl Relay {
         }
     }
 
+    /// Outgoing sockets for linking to this relay, trusting its certificate.
+    pub fn dialer(&self) -> moqom_relay::upstream::Dialer {
+        install_crypto_provider();
+        let tls = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(PinnedCertificate(self.certificate.clone())))
+            .with_no_client_auth();
+        moqom_relay::upstream::Dialer::new(tls).expect("outgoing sockets")
+    }
+
+    /// This relay as somebody's parent.
+    pub fn as_parent(&self) -> moqom_relay::upstream::Parent {
+        moqom_relay::upstream::Parent {
+            host: self.addr.ip().to_string(),
+            port: self.addr.port(),
+            server_name: "localhost".to_owned(),
+            token: None,
+        }
+    }
+
     /// Start dialling `parent`, returning the task and a future that completes when
     /// the link is registered.
     fn dial(
@@ -1723,6 +1743,12 @@ pub mod tokens {
 
         fn token_binding(&self, thumbprint: &str, seconds: i64) -> String {
             self.token_at(thumbprint, 0, seconds)
+        }
+
+        /// A token bound to `thumbprint`, issued `minted` seconds from now and
+        /// expiring `seconds` from now, either of which may be negative.
+        pub fn token_for(&self, thumbprint: &str, minted: i64, seconds: i64) -> String {
+            self.token_at(thumbprint, minted, seconds)
         }
 
         fn token_at(&self, thumbprint: &str, minted: i64, seconds: i64) -> String {

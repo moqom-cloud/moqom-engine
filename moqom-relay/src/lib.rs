@@ -103,6 +103,7 @@ pub mod cache;
 pub mod catalog;
 pub mod clock;
 pub mod direct;
+pub mod edge;
 pub mod fabric;
 pub mod geo;
 pub mod hops;

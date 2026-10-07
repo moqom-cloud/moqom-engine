@@ -1170,6 +1170,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "libc",
+ "moqom-client",
  "moqom-proto",
  "moqom-transport",
  "prost",

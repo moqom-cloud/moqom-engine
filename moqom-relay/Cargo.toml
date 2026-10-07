@@ -13,6 +13,9 @@ description = "A MOQT relay: session state, subscription matching, and fan-out"
 [dependencies]
 moqom-proto = { path = "../moqom-proto" }
 moqom-transport = { path = "../moqom-transport" }
+# The device key and the proof it signs, for an edge's links to its parent: the
+# same proof a client makes, so a parent checks a link exactly as it checks one.
+moqom-client = { path = "../moqom-client" }
 bytes = { workspace = true }
 quinn = { workspace = true }
 rustls = { workspace = true }

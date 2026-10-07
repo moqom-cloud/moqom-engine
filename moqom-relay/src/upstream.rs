@@ -23,9 +23,12 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
-use crate::fabric::Fabric;
+use tokio::sync::mpsc;
+
+use crate::fabric::{Fabric, RoomKey};
 use crate::session::Session;
 
 /// How long to wait before dialling a parent again after the link fails.
@@ -81,6 +84,54 @@ impl std::fmt::Display for Parent {
     }
 }
 
+/// What a relay presents to its parent when it attaches.
+#[derive(Debug, Default)]
+pub struct Introduction {
+    /// This relay's credential, if the parent requires one.
+    pub token: Option<Vec<u8>>,
+    /// Proof that the credential is this relay's own, bound to the token and to
+    /// the parent's certificate. See [`crate::possession`].
+    pub proof: Option<Vec<u8>>,
+    /// The one room this link is for, when the relay links per room. Set, the
+    /// session registers as that room's link rather than as the relay's parent.
+    pub room: Option<RoomKey>,
+    /// Renewed credentials to hand the parent before the current one lapses.
+    /// Only used with `room`, whose namespace the renewals are sent under.
+    pub renewals: Option<mpsc::Receiver<Renewal>>,
+    /// When to end the link for want of anything to carry.
+    pub idle: Option<Idle>,
+}
+
+impl Introduction {
+    /// The single link of [`keep_attached`]: a credential, if any, and nothing
+    /// else.
+    #[must_use]
+    pub fn bearer(token: Option<&str>) -> Self {
+        Self {
+            token: token.map(|token| token.as_bytes().to_vec()),
+            ..Self::default()
+        }
+    }
+}
+
+/// A fresh credential for a link that is up, with its own proof.
+#[derive(Debug, Clone)]
+pub struct Renewal {
+    /// The token.
+    pub token: Vec<u8>,
+    /// Its proof of possession, bound to this token and the parent's certificate.
+    pub proof: Vec<u8>,
+}
+
+/// When a per-room link ends itself.
+#[derive(Debug, Clone)]
+pub struct Idle {
+    /// How long the link may carry nothing before it ends.
+    pub after: Duration,
+    /// Raised when it ended for that reason rather than any other.
+    pub idled: Arc<AtomicBool>,
+}
+
 /// Could not attach to the parent.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -121,6 +172,20 @@ pub enum Error {
 /// # Errors
 /// [`Error`] if the parent cannot be reached, or if the session ends in a fault.
 pub async fn attach(dialer: &Dialer, parent: &Parent, fabric: Fabric) -> Result<(), Error> {
+    let connection = connect(dialer, parent).await?;
+    attach_over(
+        connection,
+        fabric,
+        Introduction::bearer(parent.token.as_deref()),
+    )
+    .await
+}
+
+/// Dial the parent, trying each address its name resolves to.
+///
+/// # Errors
+/// [`Error::Unresolvable`] or [`Error::Unreachable`].
+pub async fn connect(dialer: &Dialer, parent: &Parent) -> Result<quinn::Connection, Error> {
     let addresses = tokio::net::lookup_host((parent.host.as_str(), parent.port))
         .await
         .map_err(|source| Error::Unresolvable {
@@ -139,26 +204,48 @@ pub async fn attach(dialer: &Dialer, parent: &Parent, fabric: Fabric) -> Result<
             Err(failure) => tried.push(format!("{addr}: {failure}")),
         }
     }
-    let Some(connection) = established else {
-        return Err(Error::Unreachable {
-            parent: parent.to_string(),
-            tried,
-        });
-    };
+    established.ok_or_else(|| Error::Unreachable {
+        parent: parent.to_string(),
+        tried,
+    })
+}
 
+/// What a proof for this parent must name it by: the base64url SHA-256 of the
+/// leaf certificate it presented on `connection`.
+///
+/// The parent computes the same from the certificate it serves, so a proof
+/// made here is refused by any relay but the one this connection reached.
+#[must_use]
+pub fn certificate_identity(connection: &quinn::Connection) -> Option<String> {
+    use base64::Engine as _;
+    let certificates = connection
+        .peer_identity()?
+        .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+        .ok()?;
+    let leaf = certificates.first()?;
+    let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, leaf.as_ref());
+    Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest.as_ref()))
+}
+
+/// Serve a session to the parent over `connection`, introducing this relay
+/// with `introduction`.
+///
+/// # Errors
+/// [`Error::Refused`] if the session ends in a fault.
+pub async fn attach_over(
+    connection: quinn::Connection,
+    fabric: Fabric,
+    introduction: Introduction,
+) -> Result<(), Error> {
     let transport = moqom_transport::Session::raw(
         connection,
         web_transport_quinn::proto::ConnectRequest::new(placeholder_url()),
         web_transport_quinn::proto::ConnectResponse::OK,
     );
 
-    Session::attach(
-        transport,
-        fabric,
-        parent.token.as_deref().map(str::as_bytes),
-    )
-    .await
-    .map_err(Error::from)
+    Session::attach(transport, fabric, introduction)
+        .await
+        .map_err(Error::from)
 }
 
 /// Keep a parent attached, reconnecting when the link fails.

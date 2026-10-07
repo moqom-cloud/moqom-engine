@@ -113,12 +113,42 @@ impl Endpoint {
             "" | "/" => format!("{}/v1/usage", url.trim_end_matches('/')),
             _ => url.to_owned(),
         };
+        Self::at(&url, credential)
+    }
+
+    /// Posts to exactly `url`, signed with `credential`, for a caller other than
+    /// the reporter. See [`Self::new`] for which schemes are allowed.
+    ///
+    /// # Errors
+    /// If the URL is not an `http` or `https` URL with a host.
+    pub fn at(url: &str, credential: Credential) -> Result<Self, String> {
+        let uri: Uri = url.parse().map_err(|e| format!("URL {url:?}: {e}"))?;
+        if !matches!(uri.scheme_str(), Some("http" | "https")) || uri.host().is_none() {
+            return Err(format!(
+                "URL {url:?} must be http:// or https:// with a host"
+            ));
+        }
         Ok(Self {
-            url,
+            url: url.to_owned(),
             credential,
             authorities: Vec::new(),
             tls: OnceLock::new(),
         })
+    }
+
+    /// POST `body` as JSON, returning the status and what came back.
+    ///
+    /// # Errors
+    /// An unreadable credential, or a request that did not complete within the
+    /// reporter's timeout.
+    pub(crate) async fn post_json(&self, body: Bytes) -> Result<(StatusCode, Bytes), String> {
+        let credential = self.credential.read()?;
+        if credential.is_empty() {
+            return Err("the credential is empty".to_owned());
+        }
+        tokio::time::timeout(TIMEOUT, exchange(self, &credential, body))
+            .await
+            .map_err(|_| "timed out".to_owned())?
     }
 
     /// Also trust the certificate authorities in `pem`, for an endpoint on a
@@ -442,7 +472,7 @@ fn backoff(config: &super::Config, failures: u32) -> Duration {
 
 /// A uniform draw from `[0, 1)`.
 #[allow(clippy::cast_precision_loss)] // 53 bits, which is all an f64 holds
-fn jitter() -> f64 {
+pub(crate) fn jitter() -> f64 {
     use aws_lc_rs::rand::SecureRandom as _;
     let mut bytes = [0u8; 8];
     if aws_lc_rs::rand::SystemRandom::new()
