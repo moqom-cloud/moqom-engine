@@ -26,6 +26,12 @@ struct Relay {
 
 impl Relay {
     fn start() -> Self {
+        Self::offering(moqom_transport::alpn::OFFERED)
+    }
+
+    /// A relay whose TLS offers only `alpns`, as one that predates draft-22
+    /// would.
+    fn offering(alpns: &[&[u8]]) -> Self {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let generated = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
             .expect("generating a certificate");
@@ -37,11 +43,10 @@ impl Relay {
             .with_single_cert(vec![certificate.clone()], key)
             .expect("certificate and key agree");
 
-        let server = Server::bind(
-            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
-            with_moqt_alpn(tls),
-        )
-        .expect("binding a loopback port");
+        let mut tls = with_moqt_alpn(tls);
+        tls.alpn_protocols = alpns.iter().map(|alpn| alpn.to_vec()).collect();
+        let server = Server::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), tls)
+            .expect("binding a loopback port");
         let addr = server.local_addr().expect("bound address");
         let fabric = Fabric::with_cache(Cache::new(Limits::default()));
         let accept = tokio::spawn({
@@ -373,4 +378,67 @@ async fn a_group_opened_without_properties_refuses_a_tagged_object() {
     .await
     .expect("an untagged object is accepted");
     group.finish().expect("the group closes");
+}
+
+/// The client prefers draft-22, and still works against a relay that only
+/// speaks MOQOM's draft-19.
+#[tokio::test]
+async fn the_client_speaks_whichever_draft_the_relay_picks() {
+    for (relay, expected) in [
+        (Relay::start(), moqom_proto::Draft::D22),
+        (
+            Relay::offering(&[moqom_transport::alpn::MOQT_DRAFT_19]),
+            moqom_proto::Draft::D19,
+        ),
+    ] {
+        let tls = moqom_client::tls::pinned(relay.certificate.clone());
+        let mut publisher = within(
+            "publisher connect",
+            Session::connect(relay.addr, "localhost", tls.clone(), None),
+        )
+        .await
+        .expect("publisher connects");
+        let mut subscriber = within(
+            "subscriber connect",
+            Session::connect(relay.addr, "localhost", tls, None),
+        )
+        .await
+        .expect("subscriber connects");
+        assert_eq!(publisher.draft(), expected);
+        assert_eq!(subscriber.draft(), expected);
+
+        let namespace = TrackNamespace::from_parts(["acme", "room"]).expect("a namespace");
+        let track =
+            FullTrackName::new(namespace.clone(), Bytes::from_static(b"audio")).expect("a track");
+        let mut watch = within("watch", subscriber.watch(namespace.clone()))
+            .await
+            .expect("a watch");
+        let announcement = within("announce", publisher.announce(namespace.clone()))
+            .await
+            .expect("announced");
+        let seen = within("the namespace to be seen", watch.next())
+            .await
+            .expect("a decodable event");
+        assert_eq!(
+            seen,
+            Some(moqom_client::NamespaceEvent::Available(namespace))
+        );
+
+        let mut subscription = within("subscribe", subscriber.subscribe(track))
+            .await
+            .expect("subscribed");
+        within("the relay to pull", announcement.subscribed()).await;
+        within(
+            "publish",
+            publisher.publish_group(announcement.alias(), 5, &[b"one"]),
+        )
+        .await
+        .expect("published");
+        let object = within("the object", subscription.next_object())
+            .await
+            .expect("decodes")
+            .expect("arrives");
+        assert_eq!(&object.payload[..], b"one");
+        assert_eq!(object.group.get(), 5);
+    }
 }

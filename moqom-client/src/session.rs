@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes::{Buf, Bytes, BytesMut};
+use moqom_proto::Draft;
 use moqom_proto::control::{
     ControlFrame, MessageBody, MessageType, PublishNamespace, ReasonPhrase, RequestError,
     RequestErrorCode, RequestIdGenerator, Role, Setup, Subscribe, SubscribeOk, write_message,
@@ -100,6 +101,9 @@ const INBOX_DEPTH: usize = 64;
 /// A MOQT peer that has completed SETUP.
 pub struct Session {
     transport: moqom_transport::Session,
+    /// What the handshake negotiated. Every message this session writes or
+    /// reads is in it, including those on the tasks it spawns.
+    draft: Draft,
     requests: RequestIdGenerator,
     next_alias: AtomicU64,
     published: Arc<Mutex<HashMap<TrackNamespace, PublishSlot>>>,
@@ -126,8 +130,10 @@ impl Session {
     /// Connect to `addr` over raw QUIC and exchange SETUP.
     ///
     /// `server_name` is the SNI and the name verified against the certificate,
-    /// unless `tls` skips verification. The `moqt-19` ALPN is set on `tls` here, so
-    /// a caller cannot accidentally complete a handshake that is not MOQT.
+    /// unless `tls` skips verification. The ALPN is set on `tls` here, so a
+    /// caller cannot accidentally complete a handshake that is not MOQT: it
+    /// offers `moqt-22` then `moqt-19`, and the session speaks whichever the
+    /// relay picks. See [`Self::draft`].
     ///
     /// `credentials`, when present, are sent as `AUTHORIZATION_TOKEN`, and as
     /// `AUTHORIZATION_PROOF` when they carry a device key. The proof can only be
@@ -157,6 +163,7 @@ impl Session {
         endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(crypto)));
 
         let connection = endpoint.connect(addr, server_name)?.await?;
+        let draft = negotiated(&connection)?;
         let relay = relay_identity(&connection);
         // Kept past the move below, because how a relay refuses a session is by
         // closing the connection, and the reason it gives is on the connection
@@ -168,7 +175,6 @@ impl Session {
             web_transport_quinn::proto::ConnectResponse::OK,
         );
 
-        let (mut send, recv) = transport.open_bi().await?;
         let mut ours = Setup::new();
         ours.options
             .set_bytes(
@@ -176,6 +182,16 @@ impl Session {
                 IMPLEMENTATION,
             )
             .map_err(Error::setup)?;
+        if draft == Draft::D22 {
+            // Draft-22 relays send MOQOM's private parameters only to a peer
+            // that declares it reads them; this client does.
+            ours.options
+                .set_varint(
+                    moqom_proto::control::setup::option_type::MOQOM_PARAMETERS,
+                    1,
+                )
+                .map_err(Error::setup)?;
+        }
         if let Some(credentials) = credentials {
             ours.options
                 .set_bytes(
@@ -199,32 +215,20 @@ impl Session {
                     .map_err(Error::setup)?;
             }
         }
-        write(&mut send, &ours).await?;
-
-        let mut frames = Frames::new(recv);
-        // Nothing coming back is what a refusal looks like from here: the relay
-        // decides on the credentials in the SETUP it has just read and closes
-        // instead of answering. Asking the connection why turns "the peer closed
-        // the stream" into the sentence the relay actually wrote.
-        let Some(frame) = frames.next().await? else {
-            return Err(rejection(&quic).await);
-        };
-        if frame.message_type != MessageType::Setup {
-            return Err(Error::Unexpected {
-                found: frame.message_type,
-                during: "SETUP",
-            });
-        }
-        let mut body = frame.body.clone();
-        let len = body.len();
-        Setup::decode(&mut body, len)?;
-
+        let control = draft.bind(exchange_setup(&transport, &quic, &ours)).await?;
         Ok(Self::assemble(
+            draft,
             transport,
-            (send, frames.into_inner()),
+            control,
             endpoint,
             Role::Client,
         ))
+    }
+
+    /// The draft the handshake negotiated.
+    #[must_use]
+    pub const fn draft(&self) -> Draft {
+        self.draft
     }
 
     /// A session over a transport whose SETUP exchange has already completed.
@@ -234,6 +238,7 @@ impl Session {
     /// answering subscriptions, reading subgroups -- is the same code on both, so
     /// media cannot behave differently depending on which path carried it.
     pub(crate) fn assemble(
+        draft: Draft,
         transport: moqom_transport::Session,
         control: (SendStream, RecvStream),
         endpoint: quinn::Endpoint,
@@ -241,11 +246,12 @@ impl Session {
     ) -> Self {
         let published = Arc::new(Mutex::new(HashMap::new()));
         let inbox = Arc::new(Mutex::new(HashMap::new()));
-        spawn_publisher(transport.clone(), Arc::clone(&published));
-        spawn_reader(transport.clone(), Arc::clone(&inbox));
+        spawn_publisher(draft, transport.clone(), Arc::clone(&published));
+        spawn_reader(draft, transport.clone(), Arc::clone(&inbox));
 
         Self {
             transport,
+            draft,
             requests: RequestIdGenerator::new(role),
             // Not zero: the relay hands out aliases from zero, so a publisher
             // that starts at 7 makes a forgotten rewrite observable — the
@@ -279,6 +285,11 @@ impl Session {
     /// # Errors
     /// The peer refused, answered with the wrong message, or the session failed.
     pub async fn subscribe(&mut self, track: FullTrackName) -> Result<Subscription, Error> {
+        let draft = self.draft;
+        draft.bind(self.subscribe_in_draft(track)).await
+    }
+
+    async fn subscribe_in_draft(&mut self, track: FullTrackName) -> Result<Subscription, Error> {
         let (mut send, recv) = self.transport.open_bi().await?;
         let request = Subscribe::new(self.next_request()?, track);
         write(&mut send, &request).await?;
@@ -325,8 +336,9 @@ impl Session {
         let (mut send, recv) = self.transport.open_bi().await?;
         let request = self.next_request()?;
         let message = moqom_proto::control::SubscribeNamespace::new(request, prefix.clone());
-        write(&mut send, &message).await?;
+        self.draft.bind(write(&mut send, &message)).await?;
         Ok(crate::NamespaceWatch::new(
+            self.draft,
             prefix,
             request,
             send,
@@ -348,7 +360,7 @@ impl Session {
     pub async fn announce(&mut self, namespace: TrackNamespace) -> Result<Announcement, Error> {
         let (mut send, recv) = self.transport.open_bi().await?;
         let request = PublishNamespace::new(self.next_request()?, namespace.clone());
-        write(&mut send, &request).await?;
+        self.draft.bind(write(&mut send, &request)).await?;
 
         let raw = self.next_alias.fetch_add(1, Ordering::Relaxed);
         let alias = TrackAlias::new(VarInt::new(raw)?);
@@ -418,8 +430,8 @@ impl Session {
         header.properties_present = objects.iter().any(|object| !object.properties.is_empty());
 
         let mut buf = BytesMut::new();
-        header.encode(&mut buf);
-        let mut writer = SubgroupWriter::new(&header);
+        self.draft.scope(|| header.encode(&mut buf));
+        let mut writer = SubgroupWriter::new(&header).in_draft(self.draft);
         for (index, object) in objects.iter().enumerate() {
             let payload = Bytes::copy_from_slice(object.payload);
             let encoded = if header.properties_present {
@@ -468,16 +480,74 @@ impl Session {
         header.properties_present = metadata == Metadata::Present;
 
         let mut buf = BytesMut::new();
-        header.encode(&mut buf);
+        self.draft.scope(|| header.encode(&mut buf));
         stream.write_all(&buf).await.map_err(Error::write)?;
 
         Ok(GroupWriter {
-            writer: SubgroupWriter::new(&header),
+            writer: SubgroupWriter::new(&header).in_draft(self.draft),
             properties_present: header.properties_present,
             stream,
             next: 0,
         })
     }
+}
+
+/// The draft the handshake settled on.
+///
+/// A relay that completed the handshake without choosing one of the offered
+/// protocols is not speaking MOQT, and nothing after this would make sense.
+fn negotiated(connection: &quinn::Connection) -> Result<Draft, Error> {
+    connection
+        .handshake_data()
+        .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+        .and_then(|data| data.protocol)
+        .and_then(|alpn| Draft::from_alpn(&alpn))
+        .filter(|draft| matches!(draft, Draft::D19 | Draft::D22))
+        .ok_or(Error::NoMoqt)
+}
+
+/// Open the control channel and exchange SETUP, in the ambient draft.
+///
+/// Draft-19 (MOQOM) uses one bidirectional stream the client opens; draft-22
+/// uses one unidirectional stream each way (§6.3), the client's opened here
+/// and the relay's being the first unidirectional stream it opens.
+async fn exchange_setup(
+    transport: &moqom_transport::Session,
+    quic: &quinn::Connection,
+    ours: &Setup,
+) -> Result<(SendStream, RecvStream), Error> {
+    let draft = Draft::current();
+    let (send, recv) = if draft.unidirectional_control() {
+        let mut send = transport.open_uni().await?;
+        write(&mut send, ours).await?;
+        // A relay refusing the SETUP closes rather than opening its stream.
+        let Ok(recv) = transport.accept_uni().await else {
+            return Err(rejection(quic).await);
+        };
+        (send, recv)
+    } else {
+        let (mut send, recv) = transport.open_bi().await?;
+        write(&mut send, ours).await?;
+        (send, recv)
+    };
+
+    let mut frames = Frames::new(recv);
+    // Nothing coming back is what a refusal looks like from here: the relay
+    // decides on the credentials in the SETUP it has just read and closes
+    // instead of answering. Asking the connection why turns "the peer closed
+    // the stream" into the sentence the relay actually wrote.
+    let Some(frame) = frames.next().await? else {
+        return Err(rejection(quic).await);
+    };
+    if frame.message_type != MessageType::Setup {
+        return Err(Error::Unexpected {
+            found: frame.message_type,
+            during: "SETUP",
+        });
+    }
+    let len = frame.body.len();
+    frame.parse_in(draft, |body| Setup::decode(body, len))?;
+    Ok((send, frames.into_inner()))
 }
 
 /// Why the relay closed, as an error worth showing somebody.
@@ -633,20 +703,21 @@ impl Subscription {
 }
 
 fn spawn_publisher(
+    draft: Draft,
     transport: moqom_transport::Session,
     published: Arc<Mutex<HashMap<TrackNamespace, PublishSlot>>>,
 ) {
-    tokio::spawn(async move {
+    tokio::spawn(draft.bind(async move {
         loop {
             let Ok((send, recv)) = transport.accept_bi().await else {
                 return;
             };
             let published = Arc::clone(&published);
-            tokio::spawn(async move {
+            tokio::spawn(draft.bind(async move {
                 let _ = answer_subscribe(send, recv, &published).await;
-            });
+            }));
         }
-    });
+    }));
 }
 
 async fn answer_subscribe(
@@ -688,8 +759,8 @@ async fn answer_subscribe(
     Ok(())
 }
 
-fn spawn_reader(transport: moqom_transport::Session, inbox: Arc<Mutex<Inbox>>) {
-    tokio::spawn(async move {
+fn spawn_reader(draft: Draft, transport: moqom_transport::Session, inbox: Arc<Mutex<Inbox>>) {
+    tokio::spawn(draft.bind(async move {
         loop {
             let Ok(recv) = transport.accept_uni().await else {
                 // The session is over, so every subscription on it is too.
@@ -702,11 +773,11 @@ fn spawn_reader(transport: moqom_transport::Session, inbox: Arc<Mutex<Inbox>>) {
                 return;
             };
             let inbox = Arc::clone(&inbox);
-            tokio::spawn(async move {
+            tokio::spawn(draft.bind(async move {
                 let _ = read_subgroup(recv, &inbox).await;
-            });
+            }));
         }
-    });
+    }));
 }
 
 async fn read_subgroup(mut recv: RecvStream, inbox: &Mutex<Inbox>) -> Result<(), Error> {

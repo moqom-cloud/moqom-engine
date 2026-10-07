@@ -29,6 +29,7 @@ pub enum NamespaceEvent {
 
 /// A live `SUBSCRIBE_NAMESPACE`. Dropping it withdraws the watch.
 pub struct NamespaceWatch {
+    draft: moqom_proto::Draft,
     prefix: TrackNamespace,
     request: RequestId,
     send: SendStream,
@@ -38,6 +39,7 @@ pub struct NamespaceWatch {
 
 impl NamespaceWatch {
     pub(crate) fn new(
+        draft: moqom_proto::Draft,
         prefix: TrackNamespace,
         request: RequestId,
         send: SendStream,
@@ -45,6 +47,7 @@ impl NamespaceWatch {
         transport: moqom_transport::Session,
     ) -> Self {
         Self {
+            draft,
             prefix,
             request,
             send,
@@ -69,7 +72,20 @@ impl NamespaceWatch {
     /// The relay refused the watch, sent something undecodable, or sent a
     /// suffix that cannot sit under the prefix.
     pub async fn next(&mut self) -> Result<Option<NamespaceEvent>, Error> {
-        let Some(frame) = self.frames.next().await? else {
+        let draft = self.draft;
+        draft.bind(self.next_in_draft()).await
+    }
+
+    async fn next_in_draft(&mut self) -> Result<Option<NamespaceEvent>, Error> {
+        let mut frame = self.frames.next().await?;
+        // Draft-22 accepts the watch with REQUEST_OK, and the acceptance on
+        // its own is not a change.
+        while let Some(ok) = frame.as_ref()
+            && ok.message_type == MessageType::RequestOk
+        {
+            frame = self.frames.next().await?;
+        }
+        let Some(frame) = frame else {
             return Ok(None);
         };
         let mut body = frame.body.clone();
@@ -136,6 +152,6 @@ impl NamespaceWatch {
                     .map_err(Error::setup)?,
             );
         }
-        write(&mut self.send, &update).await
+        self.draft.bind(write(&mut self.send, &update)).await
     }
 }

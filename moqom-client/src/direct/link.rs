@@ -294,7 +294,9 @@ impl DirectEndpoint {
             .with_custom_certificate_verifier(Arc::new(Pinned(offer.certificate)))
             .with_client_auth_cert(vec![self.certificate.clone()], self.key.clone_key())
             .map_err(Error::tls)?;
-        crate::tls::apply_alpn(&mut tls);
+        // Direct links are MOQOM's draft-19 at both ends, whatever a relay
+        // would negotiate.
+        tls.alpn_protocols = vec![moqom_transport::alpn::MOQT_DRAFT_19.to_vec()];
         let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls).map_err(Error::tls)?;
         let mut client = quinn::ClientConfig::new(Arc::new(crypto));
         client.transport_config(self.transport());
@@ -351,6 +353,7 @@ impl DirectEndpoint {
         admitted.finish().map_err(Error::write)?;
 
         let session = Session::assemble(
+            moqom_proto::Draft::D19,
             transport,
             (send, frames.into_inner()),
             self.endpoint.clone(),
@@ -408,6 +411,7 @@ impl DirectEndpoint {
         }
 
         let session = Session::assemble(
+            moqom_proto::Draft::D19,
             transport,
             (send, frames.into_inner()),
             self.endpoint.clone(),

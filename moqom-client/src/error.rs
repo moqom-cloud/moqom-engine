@@ -114,6 +114,11 @@ pub enum Error {
     #[error("the relay presented no certificate, so a proof cannot be bound to it")]
     NoRelayIdentity,
 
+    /// The handshake completed without settling on a MOQT draft this client
+    /// speaks.
+    #[error("the peer did not negotiate moqt-22 or moqt-19")]
+    NoMoqt,
+
     /// The device key could not sign.
     #[error("{0}")]
     DeviceKey(#[from] crate::device::DeviceKeyError),

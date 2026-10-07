@@ -6,9 +6,11 @@
 //! this crate.
 //!
 //! The protocol sequence is the same one the relay's test harness speaks:
-//! raw QUIC with the `moqt-19` ALPN, `Session::raw`, client-opened control
-//! stream, SETUP, then request streams for `PUBLISH_NAMESPACE` and `SUBSCRIBE`.
-//! Objects arrive on unidirectional streams as subgroups.
+//! raw QUIC offering `moqt-22` then `moqt-19`, `Session::raw`, the control
+//! channel (one bidirectional stream under MOQOM's draft-19, a pair of
+//! unidirectional ones under draft-22), SETUP, then request streams for
+//! `PUBLISH_NAMESPACE` and `SUBSCRIBE`. Objects arrive on unidirectional
+//! streams as subgroups.
 
 #![forbid(unsafe_code)]
 
