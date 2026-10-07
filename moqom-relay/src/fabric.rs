@@ -492,6 +492,9 @@ pub struct Fabric {
     /// reissued. `None` issues none, so no participant here can hold a direct
     /// path a peer will keep.
     tickets: Option<Ticketing>,
+    /// `MAX_HOP_LIMIT`: the budget a request with none starts with, and the
+    /// most this relay honours on a request that names one.
+    hop_limit: u64,
 }
 
 /// How a relay issues direct tickets. See [`crate::ticket`].
@@ -525,6 +528,7 @@ impl Default for Fabric {
             policy: Policy::new(),
             usage: Usage::disabled(),
             tickets: None,
+            hop_limit: crate::hops::BUDGET,
         }
     }
 }
@@ -609,6 +613,18 @@ impl Fabric {
             tickets: Some(tickets),
             ..self
         }
+    }
+
+    /// The same fabric, forwarding a request through at most `hop_limit` relays.
+    #[must_use]
+    pub fn with_hop_limit(self, hop_limit: u64) -> Self {
+        Self { hop_limit, ..self }
+    }
+
+    /// `MAX_HOP_LIMIT` for this relay. See [`crate::hops`].
+    #[must_use]
+    pub const fn hop_limit(&self) -> u64 {
+        self.hop_limit
     }
 
     /// How direct tickets are issued, if they are.

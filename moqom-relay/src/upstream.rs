@@ -47,6 +47,12 @@ const RETRY: Duration = Duration::from_secs(1);
 /// available on the other.
 const DIAL: Duration = Duration::from_secs(3);
 
+/// The drafts a link offers its parent, most preferred first.
+pub const LINK_ALPN: [&[u8]; 2] = [
+    moqom_transport::alpn::MOQT_DRAFT_22,
+    moqom_transport::alpn::MOQT_DRAFT_19,
+];
+
 /// Where a relay's parent is, and how to introduce itself.
 #[derive(Debug, Clone)]
 pub struct Parent {
@@ -194,10 +200,15 @@ impl Dialer {
     /// outgoing sockets: the relay's own listener is elsewhere and a parent never
     /// dials back.
     ///
+    /// Offers draft-22 ahead of draft-19 whatever `tls` offered, because only a
+    /// draft-22 link negotiates `HOP_LIMIT`; a parent that speaks only draft-19
+    /// still gets a link, carrying the budget in `RELAY_HOPS`.
+    ///
     /// # Errors
     /// [`std::io::Error`] if no socket can be bound, or the TLS configuration is
     /// not usable for QUIC.
-    pub fn new(tls: rustls::ClientConfig) -> std::io::Result<Self> {
+    pub fn new(mut tls: rustls::ClientConfig) -> std::io::Result<Self> {
+        tls.alpn_protocols = LINK_ALPN.iter().map(|alpn| alpn.to_vec()).collect();
         let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls)
             .map_err(|e| std::io::Error::other(format!("TLS 1.3 is required for QUIC: {e}")))?;
         let config = quinn::ClientConfig::new(Arc::new(crypto));

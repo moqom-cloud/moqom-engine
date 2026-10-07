@@ -72,6 +72,10 @@
 //!   Being a relay is not a way past a parent's door, so against a parent that
 //!   verifies credentials an edge without this is anonymous and will not be able to
 //!   read the tracks it exists to serve.
+//! - `MOQOM_RELAY_MAX_HOP_LIMIT` — how many relays a subscription may be
+//!   forwarded through, the hop-limit draft's `MAX_HOP_LIMIT`: the budget a
+//!   request with none starts with and the most honoured on one that names more.
+//!   Defaults to 3. See [`crate::hops`](moqom_relay::hops).
 //! - `MOQOM_CONTROL_ENDPOINT` — the control plane's URL. Unset means no
 //!   moderation reaches this relay: it enforces what tokens say and nothing
 //!   else, which is the mode the benches run in and not one to expose.
@@ -269,7 +273,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .governed(governor()?)
             .authenticated(authenticator()?)
             .proving(possession(identity)?)
-            .metered(usage),
+            .metered(usage)
+            .with_hop_limit(max_hop_limit()?),
     )?;
     // Held for the life of the process; dropping it detaches. Before the accept
     // loop so that a relay restarting into a room with a ban in force learns
@@ -528,6 +533,19 @@ async fn shutdown() {
 
 fn env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.is_empty())
+}
+
+/// `MAX_HOP_LIMIT`, from the environment.
+///
+/// # Errors
+/// If the value is not a number.
+fn max_hop_limit() -> Result<u64, Box<dyn std::error::Error>> {
+    let Some(value) = env("MOQOM_RELAY_MAX_HOP_LIMIT") else {
+        return Ok(moqom_relay::hops::BUDGET);
+    };
+    Ok(value
+        .parse()
+        .map_err(|e| format!("MOQOM_RELAY_MAX_HOP_LIMIT is not a number: {e}"))?)
 }
 
 /// What class of service to ask the network for, from the environment.

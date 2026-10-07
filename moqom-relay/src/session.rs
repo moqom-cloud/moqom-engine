@@ -58,7 +58,7 @@ use tokio::sync::{Notify, mpsc, oneshot, watch};
 use web_transport_quinn::{RecvStream, SendStream};
 
 use crate::fabric::{Command, Fabric, NamespaceEvent, Pulling, Route, SessionId, UpstreamError};
-use crate::hops::Hops;
+use crate::hops::{self, Hops};
 use crate::metrics::{Ending, Fetched, Flowing, Metrics, Subscribed};
 use crate::policy::Silence;
 use crate::quota::{Lease, Principal, Refusal, Resource};
@@ -468,6 +468,9 @@ async fn send<M: MessageBody>(stream: &mut SendStream, message: &M) -> Result<()
 /// its subgroup headers. A track can have several subscribers, hence the list.
 type Routes = Arc<Mutex<HashMap<TrackAlias, Vec<Route>>>>;
 
+/// A request would have to be forwarded and its hop limit is spent.
+struct OutOfHops;
+
 /// The state of one track's upstream subscription. See [`Session::pulled`].
 ///
 /// Two states rather than one because establishing a subscription is a round
@@ -483,7 +486,13 @@ enum Pull {
     /// A `watch` rather than a `oneshot` because there may be any number of
     /// waiters, and rather than a `broadcast` because a late one must still see
     /// an answer that has already been sent.
-    Pending(watch::Receiver<Option<Result<TrackAlias, UpstreamError>>>),
+    ///
+    /// With the remaining hop limit of the request that opened it, which a
+    /// later request with less to spend must not join. See [`Join::Bypass`].
+    Pending(
+        watch::Receiver<Option<Result<TrackAlias, UpstreamError>>>,
+        Hops,
+    ),
     /// Established, and carrying objects under this upstream alias.
     Ready(Upstream),
 }
@@ -543,6 +552,15 @@ enum Join {
     Waiting(watch::Receiver<Option<Result<TrackAlias, UpstreamError>>>),
     /// Establish it, and tell the waiters how it went.
     Opening(watch::Sender<Option<Result<TrackAlias, UpstreamError>>>),
+    /// Ask the parent separately, because the pending request has a larger
+    /// budget than this one.
+    ///
+    /// The hop-limit draft's aggregation rule, and the reason for it is a
+    /// cycle: a request that has gone round one returns with a smaller budget
+    /// and would otherwise wait on the very request it is part of, which can
+    /// never be answered. Asked separately it spends its own budget and is
+    /// refused when that runs out, and the refusal unwinds the cycle.
+    Bypass,
 }
 
 /// A live MOQT session with one peer.
@@ -564,6 +582,10 @@ pub struct Session {
     /// draft-22 peer only once it has said it reads them. Always true on
     /// draft-19, where every peer is MOQOM and unknown parameters are skipped.
     moqom_peer: Arc<AtomicBool>,
+    /// Whether both ends sent `HOP_LIMIT_SUPPORTED`, so the hop budget travels
+    /// as `HOP_LIMIT` (draft-elliottwave-moq-hop-limit) rather than as MOQOM's
+    /// `RELAY_HOPS`. Only ever true on draft-22.
+    hop_limit: Arc<AtomicBool>,
     /// Upstream `FETCHes` this relay has outstanding on this session, by
     /// Request ID, waiting for their data stream to arrive.
     fetching: Arc<Mutex<HashMap<RequestId, oneshot::Sender<Frames>>>>,
@@ -610,6 +632,10 @@ pub struct Session {
     /// broadcast are two upstream subscriptions, correctly, and two watching
     /// the same rung are one.
     pulled: Arc<Mutex<HashMap<FullTrackName, Pull>>>,
+    /// Upstream subscriptions opened by [`Join::Bypass`], which are not in
+    /// [`Self::pulled`] because nobody else may join them, by alias, with what
+    /// cancels each.
+    bypassed: Arc<Mutex<HashMap<TrackAlias, Arc<Notify>>>>,
     /// Tracks this peer has subscribed to, by the Request ID it used.
     ///
     /// A joining fetch names a subscription rather than a track, on purpose:
@@ -774,6 +800,7 @@ impl Session {
             transport,
             draft,
             moqom_peer: Arc::new(AtomicBool::new(draft == Draft::D19)),
+            hop_limit: Arc::default(),
             fetching: Arc::default(),
             carrier,
             fabric: fabric.clone(),
@@ -783,6 +810,7 @@ impl Session {
             commands,
             pulling: Arc::default(),
             pulled: Arc::default(),
+            bypassed: Arc::default(),
             subscribed: Arc::default(),
             principal: Arc::default(),
             permission: watch::Sender::new(None),
@@ -896,6 +924,7 @@ impl Session {
             transport,
             draft,
             moqom_peer: Arc::new(AtomicBool::new(draft == Draft::D19)),
+            hop_limit: Arc::default(),
             fetching: Arc::default(),
             // Raw QUIC: an upstream link is relay to relay inside a fleet, with no
             // browser at either end to need WebTransport.
@@ -910,6 +939,7 @@ impl Session {
             commands,
             pulling: Arc::default(),
             pulled: Arc::default(),
+            bypassed: Arc::default(),
             subscribed: Arc::default(),
             principal: Arc::default(),
             permission: watch::Sender::new(None),
@@ -954,10 +984,7 @@ impl Session {
         commands: mpsc::Receiver<Command>,
         token: Option<&[u8]>,
     ) -> Result<(), SessionError> {
-        let (mut control_send, control_recv) = self.open_control().await?;
-        let mut control = Frames::new(control_recv);
-        self.introduce(&mut control_send, &mut control, token)
-            .await?;
+        let (control_send, control) = self.introduce(token).await?;
 
         // Available to subscribers only now. Published earlier, a subscription
         // could be handed to a session whose handshake was still in doubt, and a
@@ -988,12 +1015,7 @@ impl Session {
     /// [`handshake`](Self::handshake) beyond the order of the messages. A quota is
     /// something this relay imposes on peers that connect to it, and the parent is
     /// not one of those; the parent charges us, on its own side, by the token below.
-    async fn introduce(
-        &self,
-        send_stream: &mut SendStream,
-        control: &mut Frames,
-        token: Option<&[u8]>,
-    ) -> Result<(), SessionError> {
+    async fn introduce(&self, token: Option<&[u8]>) -> Result<(SendStream, Frames), SessionError> {
         let mut ours = self.our_setup()?;
         if let Some(token) = token {
             ours.options
@@ -1003,7 +1025,8 @@ impl Session {
                 )
                 .map_err(|_| SessionError::Protocol("token too long for a setup option"))?;
         }
-        send(send_stream, &ours).await?;
+        let (send_stream, recv) = self.open_control(&ours).await?;
+        let mut control = Frames::new(recv);
 
         let frame = control.expect().await?;
         if frame.message_type != MessageType::Setup {
@@ -1017,7 +1040,7 @@ impl Session {
         // The parent is the server on this session, so its options are held to the
         // server's rules -- the mirror of what `handshake` checks of a client.
         peer.validate(Role::Server, self.carrier)?;
-        self.read_peer_options(&peer);
+        self.read_peer_options(&peer)?;
         if let Some(implementation) = peer.options.moqt_implementation() {
             tracing::debug!(
                 session = %self.id,
@@ -1025,21 +1048,27 @@ impl Session {
                 "upstream implementation"
             );
         }
-        Ok(())
+        Ok((send_stream, control))
     }
 
-    /// Open the control channel as the side that speaks first.
+    /// Open the control channel as the side that speaks first, sending `setup`
+    /// on it.
     ///
     /// Draft-22 (§6.3) uses one unidirectional stream each way, each opened
     /// by its sender; draft-19 as MOQOM speaks it uses one bidirectional
-    /// stream the client opens.
-    async fn open_control(&self) -> Result<(SendStream, RecvStream), SessionError> {
+    /// stream the client opens. On draft-22 SETUP goes out before the peer's
+    /// stream is awaited: a stream nothing has been written to does not reach
+    /// the peer, and a peer that accepts first would wait for it forever.
+    async fn open_control(&self, setup: &Setup) -> Result<(SendStream, RecvStream), SessionError> {
         if !self.draft.unidirectional_control() {
-            return Ok(self.transport.open_bi().await?);
+            let (mut send_stream, recv) = self.transport.open_bi().await?;
+            send(&mut send_stream, setup).await?;
+            return Ok((send_stream, recv));
         }
-        let send = self.transport.open_uni().await?;
+        let mut send_stream = self.transport.open_uni().await?;
+        send(&mut send_stream, setup).await?;
         let recv = self.transport.accept_uni().await?;
-        Ok((send, recv))
+        Ok((send_stream, recv))
     }
 
     /// Accept the control channel the peer opened. See [`Self::open_control`].
@@ -1070,15 +1099,71 @@ impl Session {
             ours.options
                 .set_varint(setup::option_type::MOQOM_PARAMETERS, 1)
                 .map_err(|_| SessionError::Protocol("MOQOM_PARAMETERS not encodable"))?;
+            ours.options
+                .set_bytes(setup::option_type::HOP_LIMIT_SUPPORTED, Bytes::new())
+                .map_err(|_| SessionError::Protocol("HOP_LIMIT_SUPPORTED not encodable"))?;
         }
         Ok(ours)
     }
 
-    /// Note what the peer's SETUP said about MOQOM's private parameters.
-    fn read_peer_options(&self, peer: &Setup) {
+    /// Note what the peer's SETUP said about MOQOM's private parameters and
+    /// about `HOP_LIMIT`.
+    ///
+    /// # Errors
+    /// [`SessionError::Protocol`] for a `HOP_LIMIT_SUPPORTED` that is repeated
+    /// or carries a value, which the hop-limit draft makes a protocol violation.
+    fn read_peer_options(&self, peer: &Setup) -> Result<(), SessionError> {
+        if self.draft != Draft::D22 {
+            return Ok(());
+        }
+        self.moqom_peer
+            .store(peer.options.moqom_parameters(), Ordering::Relaxed);
+        let mut supported = peer
+            .options
+            .as_parameters()
+            .as_slice()
+            .iter()
+            .filter(|option| option.type_value() == setup::option_type::HOP_LIMIT_SUPPORTED);
+        let offered = match (supported.next(), supported.next()) {
+            (None, _) => false,
+            (Some(option), None) if option.as_bytes().is_some_and(Bytes::is_empty) => true,
+            (Some(_), None) => {
+                return Err(SessionError::Protocol(
+                    "HOP_LIMIT_SUPPORTED carries a value",
+                ));
+            }
+            (Some(_), Some(_)) => {
+                return Err(SessionError::Protocol("HOP_LIMIT_SUPPORTED sent twice"));
+            }
+        };
+        self.hop_limit.store(offered, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// The hop budget of a request that arrived carrying `parameters`.
+    ///
+    /// Draft-19 skips unknown parameters, so there only `RELAY_HOPS` counts and
+    /// a stray `HOP_LIMIT` is ignored like any other unknown type.
+    ///
+    /// # Errors
+    /// [`SessionError::Protocol`] for `HOP_LIMIT` on a draft-22 session that did
+    /// not negotiate it, or repeated.
+    fn hops_of(&self, parameters: &moqom_proto::control::Parameters) -> Result<Hops, SessionError> {
+        let max = self.fabric.hop_limit();
         if self.draft == Draft::D22 {
-            self.moqom_peer
-                .store(peer.options.moqom_parameters(), Ordering::Relaxed);
+            Hops::received(parameters, self.hop_limit.load(Ordering::Relaxed), max)
+                .map_err(SessionError::Protocol)
+        } else {
+            Ok(Hops::relayed(parameters, max))
+        }
+    }
+
+    /// Which parameter this session carries a hop budget in.
+    fn carriage(&self) -> hops::Carriage {
+        if self.hop_limit.load(Ordering::Relaxed) {
+            hops::Carriage::HopLimit
+        } else {
+            hops::Carriage::RelayHops
         }
     }
 
@@ -1340,7 +1425,7 @@ impl Session {
         let len = body.len();
         let peer = Setup::decode(&mut body, len)?;
         peer.validate(Role::Client, self.carrier)?;
-        self.read_peer_options(&peer);
+        self.read_peer_options(&peer)?;
 
         self.establish_identity(&peer)?;
 
@@ -2359,7 +2444,7 @@ impl Session {
                 Pull::Ready(upstream) => Some((upstream.alias, Arc::clone(&upstream.stop))),
                 // Not yet established. The task establishing it checks the
                 // grants again when it completes, and stops it then.
-                Pull::Pending(_) => None,
+                Pull::Pending(..) => None,
             })
             .collect();
 
@@ -2515,6 +2600,54 @@ impl Session {
         .await
     }
 
+    /// Refuse a request this relay would have to forward with no hops left.
+    ///
+    /// `HOP_LIMIT_EXCEEDED` with a retry interval of zero on draft-22, since
+    /// retrying the same request would meet the same budget. Draft-19 defines
+    /// no such code, and its MOQOM clients have always read a spent budget as
+    /// `DOES_NOT_EXIST`, so they still do.
+    async fn hop_limit_exceeded(&self, send_stream: &mut SendStream) -> Result<(), SessionError> {
+        if self.draft != Draft::D22 {
+            return Self::unpublished(send_stream).await;
+        }
+        send(
+            send_stream,
+            &RequestError::new(
+                RequestErrorCode::HOP_LIMIT_EXCEEDED,
+                ReasonPhrase::truncating("hop limit exceeded"),
+            ),
+        )
+        .await
+    }
+
+    /// Who to ask for `track`: its local publisher, or failing that the parent.
+    ///
+    /// An edge fetching a track it does not have is the whole of what makes a
+    /// fan-out tree possible. A relay with no parent finds nobody, and one
+    /// whose budget is spent may not ask the parent, which is `Err`.
+    fn source_of(
+        &self,
+        track: &FullTrackName,
+        hops: Hops,
+    ) -> Result<Option<mpsc::Sender<Command>>, OutOfHops> {
+        if let Some(local) = self.fabric.publisher(track.namespace()) {
+            return Ok(Some(local));
+        }
+        let Some(upstream) = self.fabric.upstream() else {
+            return Ok(None);
+        };
+        if !hops.may_forward() {
+            return Err(OutOfHops);
+        }
+        tracing::debug!(
+            session = %self.id,
+            %track,
+            remaining = hops.remaining(),
+            "no local publisher; asking upstream"
+        );
+        Ok(Some(upstream))
+    }
+
     /// Satisfy a subscription by pulling the track from whoever publishes it.
     ///
     /// The upstream subscription is established *before* answering, so a
@@ -2558,21 +2691,13 @@ impl Session {
         // How many further relays may be asked, spent one per hop. Absent on a
         // subscription from a viewer, which is what starts a fresh budget; present
         // on one from a child relay, which is what makes a cycle terminate.
-        let hops = Hops::asked_for(&request.parameters);
+        let hops = self.hops_of(&request.parameters)?;
 
-        // Nothing local, so ask the parent -- an edge fetching a track it does not
-        // have is the whole of what makes a fan-out tree possible. A relay with no
-        // parent, or one whose budget is spent, answers as it always did.
-        let publisher = self.fabric.publisher(track.namespace()).or_else(|| {
-            let upstream = self.fabric.upstream().filter(|_| hops.may_forward())?;
-            tracing::debug!(
-                session = %self.id,
-                %track,
-                remaining = hops.remaining(),
-                "no local publisher; asking upstream"
-            );
-            Some(upstream)
-        });
+        let Ok(publisher) = self.source_of(&track, hops) else {
+            tracing::info!(session = %self.id, %track, "subscription refused: hop limit exceeded");
+            self.fabric.metrics().subscribed(Subscribed::Refused);
+            return self.hop_limit_exceeded(send_stream).await;
+        };
 
         let Some(publisher) = publisher else {
             tracing::debug!(session = %self.id, %track, "no publisher for namespace");
@@ -2653,6 +2778,11 @@ impl Session {
                 self.lock_subscribed().remove(&request.request_id);
                 self.release(&track, pulling.upstream, alias).await;
                 outcome
+            }
+            Err(e) if e.code == RequestErrorCode::HOP_LIMIT_EXCEEDED => {
+                tracing::debug!(session = %self.id, %track, error = %e, "upstream out of hops");
+                self.fabric.metrics().subscribed(Subscribed::Refused);
+                self.hop_limit_exceeded(send_stream).await
             }
             Err(e) => {
                 tracing::debug!(session = %self.id, %track, error = %e, "upstream refused");
@@ -3236,7 +3366,7 @@ impl Session {
                 // Not yet established. The subscription that is being set up
                 // will find the mute when it checks, and a `Pending` entry has
                 // nothing to cancel.
-                Pull::Pending(_) => None,
+                Pull::Pending(..) => None,
             })
             .collect();
 
@@ -3391,11 +3521,19 @@ impl Session {
             match pulled.entry(track.clone()) {
                 std::collections::hash_map::Entry::Occupied(entry) => match entry.get() {
                     Pull::Ready(upstream) => Join::Existing(upstream.alias),
-                    Pull::Pending(outcome) => Join::Waiting(outcome.clone()),
+                    // Only towards a parent: a publisher forwards nothing, so
+                    // there is no budget for a second request to it to save.
+                    Pull::Pending(_, opened)
+                        if self.facing == Facing::Upstream
+                            && hops.remaining() < opened.remaining() =>
+                    {
+                        Join::Bypass
+                    }
+                    Pull::Pending(outcome, _) => Join::Waiting(outcome.clone()),
                 },
                 std::collections::hash_map::Entry::Vacant(slot) => {
                     let (announce, outcome) = watch::channel(None);
-                    slot.insert(Pull::Pending(outcome));
+                    slot.insert(Pull::Pending(outcome, hops));
                     Join::Opening(announce)
                 }
             }
@@ -3426,11 +3564,29 @@ impl Session {
                     });
                 }));
             }
+            Join::Bypass => {
+                let session = self.clone();
+                tokio::spawn(self.draft.bind(async move {
+                    tracing::debug!(
+                        session = %session.id,
+                        %track,
+                        remaining = hops.remaining(),
+                        "pending pull has a larger budget; asking separately"
+                    );
+                    let result = session
+                        .subscribe_upstream(track.clone(), *route, hops, false)
+                        .await;
+                    let _ = ready.send(result.map(|upstream| Pulling {
+                        upstream,
+                        shared: false,
+                    }));
+                }));
+            }
             Join::Opening(announce) => {
                 let session = self.clone();
                 tokio::spawn(self.draft.bind(async move {
                     let result = session
-                        .subscribe_upstream(track.clone(), *route, hops)
+                        .subscribe_upstream(track.clone(), *route, hops, true)
                         .await;
                     if result.is_err() {
                         // Cleared rather than left pending, so the next
@@ -3510,12 +3666,14 @@ impl Session {
     /// Returns the upstream alias once the peer has answered, leaving a task
     /// holding the request stream open — closing it would cancel the
     /// subscription. Callers reach this through [`pull`](Self::pull), which is
-    /// what keeps one track to one subscription.
+    /// what keeps one track to one subscription. `shared` is false only for
+    /// [`Join::Bypass`], whose subscription nobody else may join.
     async fn subscribe_upstream(
         &self,
         track: FullTrackName,
         route: Route,
         hops: Hops,
+        shared: bool,
     ) -> Result<TrackAlias, UpstreamError> {
         let internal = |context: &str, e: &dyn std::fmt::Display| {
             UpstreamError::new(RequestErrorCode::INTERNAL_ERROR, format!("{context}: {e}"))
@@ -3532,7 +3690,7 @@ impl Session {
         // nowhere to forward a subscription to — and sending it a budget would put
         // an unknown parameter on the wire for no purpose.
         if self.facing == Facing::Upstream {
-            hops.spent().note(&mut request.parameters);
+            hops.spent().note(&mut request.parameters, self.carriage());
         }
         self.outgoing(&mut request.parameters);
         send(&mut send_stream, &request)
@@ -3561,13 +3719,17 @@ impl Session {
                 // Published before the reply goes out and before the reading
                 // task exists, so that the teardown below can only ever find a
                 // record it is entitled to remove.
-                self.lock_pulled().insert(
-                    track.clone(),
-                    Pull::Ready(Upstream {
-                        alias: upstream,
-                        stop: Arc::clone(&stop),
-                    }),
-                );
+                if shared {
+                    self.lock_pulled().insert(
+                        track.clone(),
+                        Pull::Ready(Upstream {
+                            alias: upstream,
+                            stop: Arc::clone(&stop),
+                        }),
+                    );
+                } else {
+                    self.lock_bypassed().insert(upstream, Arc::clone(&stop));
+                }
                 tracing::info!(
                     session = %self.id,
                     %track,
@@ -3863,6 +4025,12 @@ impl Session {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    fn lock_bypassed(&self) -> std::sync::MutexGuard<'_, HashMap<TrackAlias, Arc<Notify>>> {
+        self.bypassed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     fn lock_subscribed(&self) -> std::sync::MutexGuard<'_, HashMap<RequestId, FullTrackName>> {
         self.subscribed
             .lock()
@@ -3896,6 +4064,7 @@ impl Session {
         }
         let orphaned = self.lock_routes().remove(&upstream);
         self.lock_pulling().remove(&upstream);
+        self.lock_bypassed().remove(&upstream);
         drop(pulled);
 
         if ended {
@@ -3935,6 +4104,12 @@ impl Session {
         drop(routes);
 
         tracing::info!(session = %self.id, %track, %upstream, "last subscriber left");
+
+        if let Some(stop) = self.lock_bypassed().remove(&upstream) {
+            drop(pulled);
+            stop.notify_one();
+            return;
+        }
 
         // Withdrawn here rather than left for the reading task to clear on its
         // way out, and this is the whole of what makes the teardown safe. A
