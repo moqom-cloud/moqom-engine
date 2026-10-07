@@ -25,6 +25,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use moqom_media::annexb::{self, AccessUnit, Codec};
 
+mod cloudflare;
+
 /// Speak MOQT as a subscriber or a publisher.
 #[derive(Parser)]
 #[command(
@@ -44,6 +46,8 @@ enum Command {
     Publish(PublishArgs),
     /// Print this machine's device thumbprint, creating its key if needed.
     Identity(IdentityArgs),
+    /// Speak draft-16 to Cloudflare's relay.
+    Cloudflare(cloudflare::CloudflareArgs),
 }
 
 #[derive(clap::Args)]
@@ -148,6 +152,7 @@ async fn run() -> Fallible {
         Command::Subscribe(args) => subscribe(args).await,
         Command::Publish(args) => publish(args).await,
         Command::Identity(args) => identity(&args),
+        Command::Cloudflare(args) => cloudflare::run(args).await,
     }
 }
 
