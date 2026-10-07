@@ -225,7 +225,7 @@ impl Server {
             // it are ECN's, which belong to the transport.
             let tos = u32::from(dscp) << 2;
             if addr.is_ipv6() {
-                socket.set_tclass_v6(tos)?;
+                set_tclass_v6(&socket, tos)?;
             } else {
                 socket.set_tos_v4(tos)?;
             }
@@ -387,6 +387,23 @@ impl std::fmt::Display for Negotiated {
             None => write!(f, "{}", self.carrier),
         }
     }
+}
+
+/// Set the IPv6 traffic class, which carries the codepoint.
+#[cfg(not(all(target_vendor = "apple", not(target_os = "macos"))))]
+fn set_tclass_v6(socket: &socket2::Socket, tclass: u32) -> io::Result<()> {
+    socket.set_tclass_v6(tclass)
+}
+
+/// socket2 offers `IPV6_TCLASS` only on the platforms it lists, and iOS is not
+/// one. A codepoint is the relay's setting, never a phone's, so this crate
+/// still builds there for `moqom-client` and refuses the option at runtime.
+#[cfg(all(target_vendor = "apple", not(target_os = "macos")))]
+fn set_tclass_v6(_socket: &socket2::Socket, _tclass: u32) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "an IPv6 traffic class cannot be set on this platform",
+    ))
 }
 
 /// Stands in for the `CONNECT` URL a raw QUIC session never had.
