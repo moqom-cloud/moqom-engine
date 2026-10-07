@@ -1,9 +1,10 @@
 //! What a publisher said about themselves, read from a `.catalog` object.
 //!
-//! Catalogs are the one payload a relay is allowed to look at. They are JSON,
-//! they are never encrypted, and they exist so a third party — a viewer, a
-//! recorder, this process — can read a publisher's description without our
-//! client code. Media objects stay opaque; this module is not a hole in that.
+//! Catalogs are sealed end to end like the media they describe. What a relay
+//! may read is the catalog's disclosure, an object property in the shape of a
+//! catalog that names each track's kind and geometry and the locale, and
+//! nothing else; the functions here take its bytes. Media and the catalog body
+//! stay opaque; this module is not a hole in that.
 //!
 //! Two things are taken: `locale`, for the control plane, and each track's
 //! kind and geometry, which is what usage is tiered on (see [`crate::usage`]).
@@ -169,6 +170,26 @@ mod tests {
             ]
         );
         assert_eq!(tracks_in(b"not json"), None);
+    }
+
+    /// Byte for byte what `Catalog.disclosure()` writes in MoqomKit.
+    #[test]
+    fn a_disclosure_is_read_as_a_catalog() {
+        let disclosure = br#"{"keyID":9,"locale":"fr-FR","tracks":[{"height":720,"kind":"video","name":"video\/720p","width":1280},{"kind":"audio","name":"audio"}],"version":1}"#;
+        assert_eq!(locale_in(disclosure).as_deref(), Some("fr-FR"));
+        assert_eq!(
+            tracks_in(disclosure).expect("a catalog"),
+            [
+                (
+                    "video/720p".to_owned(),
+                    Described::Video {
+                        width: Some(1280),
+                        height: Some(720)
+                    }
+                ),
+                ("audio".to_owned(), Described::Other),
+            ]
+        );
     }
 
     #[test]

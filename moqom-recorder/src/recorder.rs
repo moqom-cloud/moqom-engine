@@ -857,9 +857,16 @@ impl Feed {
             Ok(true) => {
                 self.progress.objects.fetch_add(1, Ordering::Relaxed);
                 if let Some(namespace) = &self.catalog {
+                    // The disclosure, because the catalog is sealed: names and
+                    // kinds are what is filed by. The sealed body is archived
+                    // above for whoever holds the room's keys.
                     let event = Event::Catalog {
                         namespace: namespace.clone(),
-                        payload: object.payload.clone(),
+                        payload: object
+                            .properties
+                            .disclosure
+                            .clone()
+                            .unwrap_or_else(|| object.payload.clone()),
                     };
                     if self.events.send(event).await.is_err() {
                         return false;

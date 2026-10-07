@@ -50,6 +50,15 @@ pub const TEMPORAL_LAYER: u64 = 0x7A;
 /// decrypting.
 pub const SILENCE: u64 = 0x7C;
 
+/// What a sealed `.catalog` object discloses.
+///
+/// Odd, so it carries bytes: JSON in the shape of a catalog, holding the
+/// version, the `SFrame` key ID, the locale, and each track's name, kind and
+/// video geometry. The catalog itself is end-to-end encrypted; this is what a
+/// relay tiers usage on and a recorder files tracks by. `SFrame` authenticates
+/// it with the ciphertext, so it can be read on the way through and not changed.
+pub const CATALOG_DISCLOSURE: u64 = 0x7D;
+
 /// What a publisher said about one object.
 ///
 /// Every field is optional and absent means "not stated" rather than a default,
@@ -67,6 +76,8 @@ pub struct ObjectProperties {
     pub temporal_layer: Option<u64>,
     /// Whether this audio packet is silence.
     pub is_silence: Option<bool>,
+    /// On a sealed catalog, the part of it that is not secret from the relay.
+    pub disclosure: Option<Bytes>,
 }
 
 impl ObjectProperties {
@@ -115,6 +126,12 @@ impl ObjectProperties {
         if self.is_silence == Some(true) {
             push_varint(&mut properties, SILENCE, 1);
         }
+        if let Some(disclosure) = &self.disclosure
+            && !disclosure.is_empty()
+            && let Ok(parameter) = Parameter::bytes(CATALOG_DISCLOSURE, disclosure.clone())
+        {
+            properties.push(parameter);
+        }
         properties
     }
 
@@ -140,6 +157,10 @@ impl ObjectProperties {
                 .cloned(),
             temporal_layer: varint(TEMPORAL_LAYER),
             is_silence: varint(SILENCE).map(|value| value != 0),
+            disclosure: properties
+                .get(CATALOG_DISCLOSURE)
+                .and_then(Parameter::as_bytes)
+                .cloned(),
         }
     }
 }
@@ -163,6 +184,7 @@ mod tests {
             configuration: Some(Bytes::from_static(b"sps/pps")),
             temporal_layer: Some(2),
             is_silence: Some(true),
+            disclosure: Some(Bytes::from_static(br#"{"tracks":[],"version":1}"#)),
         };
         assert_eq!(
             ObjectProperties::from_wire(&properties.to_wire()),

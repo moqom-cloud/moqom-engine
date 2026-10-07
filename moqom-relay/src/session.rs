@@ -4107,10 +4107,23 @@ impl Session {
 
     /// Take a locale from a catalog object, if it changed, and the geometry of
     /// what it lists for tiering the people watching.
+    ///
+    /// From the catalog's disclosure: the catalog itself is sealed end to end.
+    /// The payload is only read when there is no disclosure, which is a
+    /// plaintext catalog from a publisher that predates sealing — ciphertext
+    /// never parses.
     fn note_catalog(&self, namespace: &TrackNamespace, object: &SubgroupObject) {
-        let SubgroupContent::Normal { payload, .. } = &object.content else {
+        let SubgroupContent::Normal {
+            payload,
+            properties,
+        } = &object.content
+        else {
             return;
         };
+        let payload = properties
+            .get(moqom_client::properties::CATALOG_DISCLOSURE)
+            .and_then(moqom_proto::control::params::Parameter::as_bytes)
+            .unwrap_or(payload);
         self.fabric.usage().catalog(self.id, namespace, payload);
         let Some(locale) = crate::catalog::locale_in(payload) else {
             return;
