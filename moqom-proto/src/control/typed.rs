@@ -590,11 +590,22 @@ fn relative_start(largest: Option<Location>, groups: u64) -> Location {
 
 /// The Token structure that carries an authorization token, per §8.9.
 ///
-/// MOQOM advertises no token cache (`MAX_AUTH_TOKEN_CACHE_SIZE` absent, so
-/// 0), which makes every alias a peer could send one it was not entitled to
-/// register. Only the two forms that carry a value are therefore accepted.
+/// All four Alias Types parse and re-encode exactly. What an alias *means*
+/// is session state, kept by [`TokenCache`](crate::control::tokens::TokenCache):
+/// a codec cannot know whether alias 1 was registered, nor whether a
+/// registration fits the cache this endpoint advertised.
+///
+/// In a parameter block a `USE_VALUE` of Token Type 0 -- what MOQOM sends --
+/// is held as [`ParamValue::Bytes`] carrying the Token Value alone, so callers
+/// reading tokens see bytes in every draft; every other form is
+/// [`ParamValue::Token`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Token {
+    /// `DELETE` (0x0): retire an alias. No type or value.
+    Delete {
+        /// Token Alias.
+        alias: u64,
+    },
     /// `REGISTER` (0x1): an alias, a type and a value.
     Register {
         /// Token Alias.
@@ -603,6 +614,11 @@ pub enum Token {
         token_type: u64,
         /// Token Value.
         value: Bytes,
+    },
+    /// `USE_ALIAS` (0x2): the type and value registered under an alias.
+    UseAlias {
+        /// Token Alias.
+        alias: u64,
     },
     /// `USE_VALUE` (0x3): a type and a value.
     UseValue {
@@ -619,11 +635,24 @@ impl Token {
     const USE_ALIAS: u64 = 0x2;
     const USE_VALUE: u64 = 0x3;
 
-    /// The value a session authorizes with.
+    /// The value carried in the structure itself: `REGISTER` and `USE_VALUE`
+    /// have one, `DELETE` and `USE_ALIAS` only name an alias.
     #[must_use]
-    pub const fn value(&self) -> &Bytes {
+    pub const fn value(&self) -> Option<&Bytes> {
         match self {
-            Self::Register { value, .. } | Self::UseValue { value, .. } => value,
+            Self::Register { value, .. } | Self::UseValue { value, .. } => Some(value),
+            Self::Delete { .. } | Self::UseAlias { .. } => None,
+        }
+    }
+
+    /// The alias the structure names, if any.
+    #[must_use]
+    pub const fn alias(&self) -> Option<u64> {
+        match self {
+            Self::Delete { alias } | Self::Register { alias, .. } | Self::UseAlias { alias } => {
+                Some(*alias)
+            }
+            Self::UseValue { .. } => None,
         }
     }
 
@@ -631,6 +660,7 @@ impl Token {
     #[must_use]
     pub fn encoded_len(&self) -> usize {
         match self {
+            Self::Delete { alias } | Self::UseAlias { alias } => 1 + varint::size_u64(*alias),
             Self::Register {
                 alias,
                 token_type,
@@ -643,6 +673,10 @@ impl Token {
     /// Append the structure, without a length prefix.
     pub fn encode<B: BufMut>(&self, buf: &mut B) {
         match self {
+            Self::Delete { alias } => {
+                varint::encode_u64(Self::DELETE, buf);
+                varint::encode_u64(*alias, buf);
+            }
             Self::Register {
                 alias,
                 token_type,
@@ -652,6 +686,10 @@ impl Token {
                 varint::encode_u64(*alias, buf);
                 varint::encode_u64(*token_type, buf);
                 buf.put_slice(value);
+            }
+            Self::UseAlias { alias } => {
+                varint::encode_u64(Self::USE_ALIAS, buf);
+                varint::encode_u64(*alias, buf);
             }
             Self::UseValue { token_type, value } => {
                 varint::encode_u64(Self::USE_VALUE, buf);
@@ -664,33 +702,50 @@ impl Token {
     /// Parse a structure occupying all of `bytes`.
     ///
     /// # Errors
-    /// [`DecodeError::Invalid`] if it is malformed, or uses an alias this
-    /// endpoint cannot have registered.
+    /// [`DecodeError::Invalid`] if it is malformed: an undefined Alias Type,
+    /// a field missing, or bytes after the alias of a `DELETE` or `USE_ALIAS`,
+    /// which have no value. §8.9 closes the session with
+    /// `KEY_VALUE_FORMATTING_ERROR` for any of these.
     pub fn decode(mut bytes: &[u8]) -> Result<Self, DecodeError> {
         let buf = &mut bytes;
-        let token = match varint::decode_u64(buf).map_err(DecodeError::in_complete_message)? {
+        let field =
+            |buf: &mut &[u8]| varint::decode_u64(buf).map_err(DecodeError::in_complete_message);
+        let token = match field(buf)? {
+            Self::DELETE => Self::Delete { alias: field(buf)? },
             Self::REGISTER => {
-                let alias = varint::decode_u64(buf).map_err(DecodeError::in_complete_message)?;
-                let token_type =
-                    varint::decode_u64(buf).map_err(DecodeError::in_complete_message)?;
+                let alias = field(buf)?;
+                let token_type = field(buf)?;
                 Self::Register {
                     alias,
                     token_type,
                     value: Bytes::copy_from_slice(buf),
                 }
             }
+            Self::USE_ALIAS => Self::UseAlias { alias: field(buf)? },
             Self::USE_VALUE => Self::UseValue {
-                token_type: varint::decode_u64(buf).map_err(DecodeError::in_complete_message)?,
+                token_type: field(buf)?,
                 value: Bytes::copy_from_slice(buf),
             },
-            Self::DELETE | Self::USE_ALIAS => {
-                return Err(DecodeError::Invalid(
-                    "token alias used, but this endpoint keeps no token cache",
-                ));
-            }
             _ => return Err(DecodeError::Invalid("undefined token Alias Type")),
         };
+        if matches!(token, Self::Delete { .. } | Self::UseAlias { .. }) && !buf.is_empty() {
+            return Err(DecodeError::Invalid(
+                "a token alias reference carries no type or value",
+            ));
+        }
         Ok(token)
+    }
+
+    /// The parameter value this token is held as; see [`Token`].
+    #[must_use]
+    pub fn into_param_value(self) -> ParamValue {
+        match self {
+            Self::UseValue {
+                token_type: 0,
+                value,
+            } => ParamValue::Bytes(value),
+            token => ParamValue::Token(token),
+        }
     }
 }
 
@@ -726,6 +781,7 @@ impl Parameter {
             (Some(Encoding::LengthPrefixed | Encoding::Token), ParamValue::Bytes(b)) => {
                 b.len() <= MAX_VALUE_LEN
             }
+            (Some(Encoding::Token), ParamValue::Token(t)) => t.encoded_len() <= MAX_VALUE_LEN,
             (Some(Encoding::Fill), ParamValue::Nested(inner)) => Context::Fill.check(inner).is_ok(),
             _ => false,
         };
@@ -740,6 +796,10 @@ impl Parameter {
             (Some(Encoding::Uint8), ParamValue::VarInt(_)) => 1,
             (Some(Encoding::Token), ParamValue::Bytes(b)) => {
                 let len = use_value(b).encoded_len();
+                VarInt::new(len as u64).map_or(9, VarInt::size) + len
+            }
+            (_, ParamValue::Token(t)) => {
+                let len = t.encoded_len();
                 VarInt::new(len as u64).map_or(9, VarInt::size) + len
             }
             (_, ParamValue::VarInt(v)) => v.size(),
@@ -761,6 +821,12 @@ impl Parameter {
             }
             (Some(Encoding::Token), ParamValue::Bytes(b)) => {
                 let token = use_value(b);
+                VarInt::new(token.encoded_len() as u64)
+                    .unwrap_or(VarInt::MAX)
+                    .encode(buf);
+                token.encode(buf);
+            }
+            (_, ParamValue::Token(token)) => {
                 VarInt::new(token.encoded_len() as u64)
                     .unwrap_or(VarInt::MAX)
                     .encode(buf);
@@ -807,7 +873,7 @@ impl Parameter {
             }
             Encoding::Token => {
                 let raw = decode_bytes(buf, MAX_VALUE_LEN)?;
-                ParamValue::Bytes(Token::decode(&raw)?.value().clone())
+                Token::decode(&raw)?.into_param_value()
             }
             Encoding::Namespace => ParamValue::Namespace(TrackNamespace::decode(buf)?),
             Encoding::LocationFilter => ParamValue::LocationFilter(LocationFilter::decode(buf)?),

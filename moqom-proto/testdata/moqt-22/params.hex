@@ -3,6 +3,10 @@
 # Integers are vi64 (leading ones give the length, 1-9 bytes).
 # Generated and checked by moqom-proto/tests/moqt22_vectors.rs.
 authorization_token 0103050300746f6b
+authorization_token_delete 0103020001
+authorization_token_register 0103090101007469636b6574
+authorization_token_typed_value 0103050302746f6b
+authorization_token_use_alias 0103020201
 expires 0108c0ea60
 fill_parameters 012307020a81f4170101
 fill_parameters_empty 01230100

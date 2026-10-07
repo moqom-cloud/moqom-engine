@@ -23,7 +23,7 @@ use bytes::Bytes;
 use moqom_proto::control::messages::namespace::{Namespace, NamespaceDone};
 use moqom_proto::control::params::param_type as p;
 use moqom_proto::control::setup::option_type;
-use moqom_proto::control::typed::{Context, LocationFilter};
+use moqom_proto::control::typed::{Context, LocationFilter, Token};
 use moqom_proto::control::{
     ControlFrame, Fetch, FetchKind, FetchOk, Goaway, MessageBody, ParamValue, Parameter,
     Parameters, Properties, Publish, PublishDone, PublishDoneStatus, PublishNamespace,
@@ -368,6 +368,34 @@ fn parameters() -> BTreeMap<String, Vec<u8>> {
         "authorization_token",
         bytes(p::AUTHORIZATION_TOKEN, b"tok"),
     );
+    let token = |t: Token| typed(p::AUTHORIZATION_TOKEN, t.into_param_value());
+    parameter(
+        o,
+        "authorization_token_register",
+        token(Token::Register {
+            alias: 1,
+            token_type: 0,
+            value: Bytes::from_static(b"ticket"),
+        }),
+    );
+    parameter(
+        o,
+        "authorization_token_use_alias",
+        token(Token::UseAlias { alias: 1 }),
+    );
+    parameter(
+        o,
+        "authorization_token_delete",
+        token(Token::Delete { alias: 1 }),
+    );
+    parameter(
+        o,
+        "authorization_token_typed_value",
+        token(Token::UseValue {
+            token_type: 2,
+            value: Bytes::from_static(b"tok"),
+        }),
+    );
     parameter(o, "rendezvous_timeout", uint(p::RENDEZVOUS_TIMEOUT, 0));
     parameter(
         o,
@@ -675,8 +703,12 @@ fn draft22_rejections() {
     assert!(reject(&[0x02, 0x08, 0x01, 0x00, 0x02]).is_fatal());
     // FILL_PARAMETERS holding FORWARD, which it does not allow.
     assert!(reject(&[0x01, 0x23, 0x03, 0x01, 0x10, 0x01]).is_fatal());
-    // A Token with Alias Type USE_ALIAS: MOQOM keeps no token cache.
-    assert!(reject(&[0x01, 0x03, 0x02, 0x02, 0x05]).is_fatal());
+    // A Token with undefined Alias Type 0x4.
+    assert!(reject(&[0x01, 0x03, 0x02, 0x04, 0x01]).is_fatal());
+    // USE_ALIAS carrying a value after its alias.
+    assert!(reject(&[0x01, 0x03, 0x03, 0x02, 0x05, 0x00]).is_fatal());
+    // REGISTER with no Token Type.
+    assert!(reject(&[0x01, 0x03, 0x02, 0x01, 0x05]).is_fatal());
 
     // FORWARD in a FETCH.
     let mut fetch = Fetch::new(rid(0), FetchKind::Filtered { track: track() });
@@ -730,4 +762,118 @@ fn draft19_and_draft22_differ_on_the_wire() {
     // Request ID 200 is 0x40c8 as a QUIC varint and 0x80c8 as vi64.
     assert_eq!(&d19[3..5], &[0x40, 0xc8]);
     assert_eq!(&d22[3..5], &[0x80, 0xc8]);
+}
+
+/// The Swift codec's token vectors (`moqom-swift/Tests/Fixtures/moqt-22`),
+/// byte for byte: each must decode to the structure it was written from and
+/// encode back unchanged.
+#[test]
+fn swift_token_alias_fixtures_round_trip() {
+    let cases: [(&str, &[u8], Token); 3] = [
+        (
+            "param-authorization-token-register",
+            &[
+                0x01, 0x03, 0x09, 0x01, 0x01, 0x00, b't', b'i', b'c', b'k', b'e', b't',
+            ],
+            Token::Register {
+                alias: 1,
+                token_type: 0,
+                value: Bytes::from_static(b"ticket"),
+            },
+        ),
+        (
+            "param-authorization-token-use-alias",
+            &[0x01, 0x03, 0x02, 0x02, 0x01],
+            Token::UseAlias { alias: 1 },
+        ),
+        (
+            "param-authorization-token",
+            &[
+                0x01, 0x03, 0x08, 0x03, 0x00, b't', b'i', b'c', b'k', b'e', b't',
+            ],
+            Token::UseValue {
+                token_type: 0,
+                value: Bytes::from_static(b"ticket"),
+            },
+        ),
+    ];
+    for (name, wire, expected) in cases {
+        let block = D22
+            .scope(|| Parameters::decode_counted(&mut &wire[..]))
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        let tokens: Vec<Token> = block.token_structures().collect();
+        assert_eq!(tokens, vec![expected], "{name}");
+        let mut again = Vec::new();
+        D22.scope(|| block.encode_counted(&mut again));
+        assert_eq!(again, wire, "{name} re-encodes differently");
+    }
+}
+
+/// Every parameter fixture of the Swift codec, when its checkout sits beside
+/// this one, decodes and re-encodes unchanged here too. Skipped without it.
+#[test]
+fn every_swift_parameter_fixture_round_trips_when_present() {
+    let dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../moqom-swift/Tests/Fixtures/moqt-22");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        eprintln!("no Swift fixtures at {}", dir.display());
+        return;
+    };
+    let mut checked = 0;
+    for entry in entries {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        if !name.starts_with("param-") || path.extension().is_none_or(|e| e != "hex") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        // One vector per uncommented line; some files hold several.
+        for line in text.lines().map(str::trim) {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let hex: String = line.split_whitespace().collect();
+            let wire: Vec<u8> = (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                .collect();
+            let block = D22
+                .scope(|| Parameters::decode_counted(&mut wire.as_slice()))
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            let mut again = Vec::new();
+            D22.scope(|| block.encode_counted(&mut again));
+            assert_eq!(again, wire, "{name} re-encodes differently");
+            checked += 1;
+        }
+    }
+    assert!(checked > 0, "no parameter fixtures in {}", dir.display());
+}
+
+/// §9.1.4: SETUP may register a token -- read as its value, MOQOM keeping no
+/// cache -- but may not refer to an alias, there being none yet.
+#[test]
+fn setup_reads_a_registration_as_its_value_and_refuses_alias_references() {
+    let body = |token: &Token| {
+        let mut value = Vec::new();
+        token.encode(&mut value);
+        let mut options = Parameters::new();
+        options.push(Parameter::bytes(option_type::AUTHORIZATION_TOKEN, value).unwrap());
+        let mut wire = Vec::new();
+        D22.scope(|| options.encode(&mut wire));
+        wire
+    };
+    let decode = |wire: &[u8]| D22.scope(|| Setup::decode(&mut &wire[..], wire.len()));
+
+    let registered = decode(&body(&Token::Register {
+        alias: 1,
+        token_type: 0,
+        value: Bytes::from_static(b"ticket"),
+    }))
+    .expect("a registration in SETUP decodes");
+    let tokens: Vec<_> = registered.options.authorization_tokens().collect();
+    assert_eq!(tokens, vec![&Bytes::from_static(b"ticket")]);
+
+    for reference in [Token::UseAlias { alias: 1 }, Token::Delete { alias: 1 }] {
+        assert!(decode(&body(&reference)).is_err(), "{reference:?}");
+    }
 }

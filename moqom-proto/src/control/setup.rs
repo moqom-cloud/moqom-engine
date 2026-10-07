@@ -476,9 +476,15 @@ impl Setup {
         for p in options.as_slice() {
             match p.as_bytes() {
                 Some(raw) if p.type_value() == option_type::AUTHORIZATION_TOKEN => {
-                    let token = Token::decode(raw)?;
+                    // §9.1.4: an alias cannot be referred to before the
+                    // session exists, so only the forms with a value belong.
+                    let Some(value) = Token::decode(raw)?.value().cloned() else {
+                        return Err(DecodeError::Invalid(
+                            "SETUP may not delete or use a token alias",
+                        ));
+                    };
                     unwrapped.push(
-                        Parameter::bytes(option_type::AUTHORIZATION_TOKEN, token.value().clone())
+                        Parameter::bytes(option_type::AUTHORIZATION_TOKEN, value)
                             .map_err(|_| DecodeError::Invalid("token value too long"))?,
                     );
                 }

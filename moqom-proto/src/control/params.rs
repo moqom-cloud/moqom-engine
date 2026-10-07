@@ -192,6 +192,10 @@ pub enum ParamValue {
     LocationFilter(crate::control::typed::LocationFilter),
     /// A parameter block in its own scope: `FILL_PARAMETERS`.
     Nested(Parameters),
+    /// A draft-22 `AUTHORIZATION_TOKEN` in any form but a `USE_VALUE` of
+    /// Token Type 0, which is [`Self::Bytes`]; see
+    /// [`Token`](crate::control::typed::Token).
+    Token(crate::control::typed::Token),
 }
 
 /// A single key-value parameter.
@@ -306,6 +310,24 @@ impl Parameter {
         }
     }
 
+    /// The value as a draft-22 Token structure, if this is an
+    /// `AUTHORIZATION_TOKEN`: a bare value reads as the `USE_VALUE` of Token
+    /// Type 0 it was carried as.
+    #[must_use]
+    pub fn as_token(&self) -> Option<crate::control::typed::Token> {
+        if self.type_value != param_type::AUTHORIZATION_TOKEN {
+            return None;
+        }
+        match &self.value {
+            ParamValue::Bytes(value) => Some(crate::control::typed::Token::UseValue {
+                token_type: 0,
+                value: value.clone(),
+            }),
+            ParamValue::Token(token) => Some(token.clone()),
+            _ => None,
+        }
+    }
+
     /// The nested block, if this is `FILL_PARAMETERS`.
     #[must_use]
     pub const fn as_nested(&self) -> Option<&Parameters> {
@@ -324,6 +346,7 @@ impl Parameter {
             ParamValue::Namespace(ns) => ns.encode(&mut out),
             ParamValue::LocationFilter(f) => f.encode(&mut out),
             ParamValue::Nested(p) => p.encode_counted(&mut out),
+            ParamValue::Token(t) => t.encode(&mut out),
         }
         Some(out)
     }
@@ -502,11 +525,28 @@ impl Parameters {
     /// [`param_type::AUTHORIZATION_TOKEN`].
     ///
     /// [`SetupOptions::authorization_tokens`]: crate::control::setup::SetupOptions::authorization_tokens
+    ///
+    /// A draft-22 token carries its value only when it is a `USE_VALUE` or a
+    /// `REGISTER`. One that refers to an alias has none here, and is resolved
+    /// against the session's [`TokenCache`] through [`Self::token_structures`];
+    /// a caller that reads only this sees no token for it, which fails closed.
+    ///
+    /// [`TokenCache`]: crate::control::tokens::TokenCache
     pub fn authorization_tokens(&self) -> impl Iterator<Item = &Bytes> {
         self.0
             .iter()
             .filter(|p| p.type_value == param_type::AUTHORIZATION_TOKEN)
-            .filter_map(Parameter::as_bytes)
+            .filter_map(|p| match &p.value {
+                ParamValue::Bytes(value) => Some(value),
+                ParamValue::Token(token) => token.value(),
+                _ => None,
+            })
+    }
+
+    /// Every authorization token as the Token structure it arrived as, in
+    /// the order sent, aliases included.
+    pub fn token_structures(&self) -> impl Iterator<Item = crate::control::typed::Token> + '_ {
+        self.0.iter().filter_map(Parameter::as_token)
     }
 
     /// The proof of possession accompanying those tokens, if any.
