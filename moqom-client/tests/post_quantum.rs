@@ -261,7 +261,7 @@ async fn the_client_retries_for_a_server_with_neither_share_it_sent() {
 /// Drive a client and server `rustls` connection to completion in memory.
 ///
 /// QUIC hides the handshake's shape from quinn's caller; plain TLS over the
-/// same configs shows whether it needed a HelloRetryRequest.
+/// same configs shows whether it needed a `HelloRetryRequest`.
 fn handshake_in_memory(
     client: rustls::ClientConfig,
     server: rustls::ServerConfig,
@@ -333,11 +333,15 @@ fn only_a_server_without_x25519_costs_a_round_trip() {
         let (client, server) =
             handshake_in_memory(client, in_memory_server(&groups, certificate, key));
         assert_eq!(
-            client.negotiated_key_exchange_group().map(|g| g.name()),
+            client
+                .negotiated_key_exchange_group()
+                .map(rustls::crypto::SupportedKxGroup::name),
             Some(group)
         );
         assert_eq!(
-            server.negotiated_key_exchange_group().map(|g| g.name()),
+            server
+                .negotiated_key_exchange_group()
+                .map(rustls::crypto::SupportedKxGroup::name),
             Some(group)
         );
         assert_eq!(client.handshake_kind(), Some(kind), "{group:?}");
