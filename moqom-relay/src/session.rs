@@ -67,6 +67,7 @@ use crate::scope::{Denial, Permission, Scope};
 use crate::{cache, media, metrics, scope};
 
 mod drafts;
+mod track_status;
 
 /// Identifies this build in Setup Options, for the other end's logs.
 const IMPLEMENTATION: &[u8] = concat!("moqom-relay/", env!("CARGO_PKG_VERSION")).as_bytes();
@@ -1499,8 +1500,13 @@ impl Session {
     /// Only [`SessionError::Decode`], for a body that is not a `REQUEST_UPDATE`.
     /// That is a malformed message rather than a rejected credential, and it is
     /// handled where every other malformed message on a request stream is.
+    /// And [`SessionError::Protocol`] for a draft-22 token alias, after the
+    /// session has been closed with the code §8.9 gives it.
     fn renew_credential(&self, frame: &ControlFrame) -> Result<(), SessionError> {
         let update = RequestUpdate::decode(&mut frame.body.clone())?;
+        if self.draft == Draft::D22 {
+            self.refuse_token_aliases(&update.parameters)?;
+        }
         let tokens: Vec<&[u8]> = update
             .parameters
             .authorization_tokens()
@@ -2097,6 +2103,8 @@ impl Session {
             MessageType::SubscribeNamespace => Resource::Watch,
             MessageType::Subscribe => Resource::Subscription,
             MessageType::Fetch => Resource::Fetch,
+            // A one-shot query like a FETCH, and charged as one.
+            MessageType::TrackStatus if self.draft == Draft::D22 => Resource::Fetch,
             other => {
                 tracing::debug!(session = %self.id, ?other, "unsupported request");
                 let outcome = send(
@@ -2161,6 +2169,7 @@ impl Session {
                 self.on_subscribe(&frame, &mut send_stream, &mut frames, lease)
                     .await
             }
+            MessageType::TrackStatus => self.on_track_status(&frame, &mut send_stream).await,
             _ => self.on_fetch(&frame, &mut send_stream).await,
         };
 

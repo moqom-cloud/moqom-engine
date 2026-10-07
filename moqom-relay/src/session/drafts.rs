@@ -20,6 +20,7 @@
 use std::time::Duration;
 
 use moqom_proto::control::params::param_type;
+use moqom_proto::control::tokens::TokenCache;
 use moqom_proto::control::typed::{Context, LocationFilter};
 use moqom_proto::control::{Parameters, PublishStateNotify, RequestOk};
 use moqom_proto::data::FetchReader;
@@ -333,6 +334,28 @@ impl Session {
         {
             extras.fills.push(task);
         }
+    }
+
+    /// Hold a draft-22 request's tokens to the token cache this relay
+    /// advertised, which is none: it sends no `MAX_AUTH_TOKEN_CACHE_SIZE`, so
+    /// the limit is 0 (§9.1.3) and nothing is ever registered. A `REGISTER`
+    /// therefore overflows and a `USE_ALIAS` or `DELETE` names an unknown
+    /// alias, and §8.9 closes the session for either.
+    ///
+    /// # Errors
+    /// [`SessionError::Protocol`], once the session is closed with the
+    /// specific code.
+    pub(super) fn refuse_token_aliases(&self, parameters: &Parameters) -> Result<(), SessionError> {
+        let mut cache = TokenCache::default();
+        for token in parameters.token_structures() {
+            if let Err(e) = cache.apply(&token) {
+                tracing::info!(session = %self.id, error = %e, "closing: token alias misuse");
+                self.transport
+                    .close(e.session_code(), e.to_string().as_bytes());
+                return Err(SessionError::Protocol("authorization token alias misuse"));
+            }
+        }
+        Ok(())
     }
 
     /// `SUBSCRIBE_OK` or `REQUEST_OK` parameters: `LARGEST_OBJECT`, which a

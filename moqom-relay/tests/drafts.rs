@@ -13,11 +13,11 @@ use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use moqom_proto::control::params::param_type as p;
-use moqom_proto::control::typed::LocationFilter;
+use moqom_proto::control::typed::{LocationFilter, Token};
 use moqom_proto::control::{
     ControlFrame, Fetch, FetchKind, FetchOk, MessageBody, MessageType, ParamValue, Parameter,
-    Parameters, PublishNamespace, PublishStateNotify, RequestError, RequestId, RequestOk, Setup,
-    Subscribe, SubscribeOk, write_message_in,
+    Parameters, PublishNamespace, PublishStateNotify, RequestError, RequestErrorCode, RequestId,
+    RequestOk, RequestUpdate, Setup, Subscribe, SubscribeOk, TrackStatus, write_message_in,
 };
 use moqom_proto::data::{
     FetchHeader, FetchObject, FetchReader, FetchRecord, FetchWriter, GroupOrder, SubgroupHeader,
@@ -582,4 +582,129 @@ async fn an_unknown_parameter_is_a_protocol_violation() {
 
     let closed = closed_reason(&viewer.session).await;
     assert_eq!(closed.code, 0x3, "PROTOCOL_VIOLATION (§12.1)");
+}
+
+impl Peer {
+    /// Ask after `track`, and read the one answer before the stream's end.
+    async fn track_status(&mut self, track: &FullTrackName) -> Result<RequestOk, RequestError> {
+        let request = TrackStatus::new(self.request_id(), track.clone());
+        let (_send, mut frames) = self.request(&request).await;
+        let frame = within("an answer to TRACK_STATUS", frames.expect()).await;
+        let answer = match frame.message_type {
+            MessageType::RequestOk => Ok(frame
+                .parse_in(D22, RequestOk::decode)
+                .expect("a REQUEST_OK")),
+            MessageType::RequestError => Err(frame
+                .parse_in(D22, RequestError::decode)
+                .expect("a REQUEST_ERROR")),
+            other => panic!("{other:?} in answer to TRACK_STATUS"),
+        };
+        assert!(
+            within("the stream's FIN", frames.next()).await.is_none(),
+            "§9.13: the stream ends after the answer"
+        );
+        answer
+    }
+}
+
+#[tokio::test]
+async fn track_status_reports_the_largest_object_and_creates_no_subscription() {
+    let relay = Relay::start();
+    let mut publisher = Client::connect(&relay).await;
+    let _announced = publisher.announce(&namespace(&["room"])).await;
+    let name = track(&["room"], "video");
+    let alias = TrackAlias::new(VarInt::from_u32(1));
+    let mut early = Client::connect(&relay).await;
+    let (early_subscription, _served) =
+        tokio::join!(early.subscribe(&name), publisher.answer_subscription(alias));
+    let _early_subscription = early_subscription.expect("subscribed");
+    publisher
+        .publish_group(alias, GroupId::ZERO, &[b"g0o0", b"g0o1"])
+        .await;
+    early.read_subgroup().await;
+
+    let mut viewer = Peer::connect(&relay).await;
+    let ok = viewer.track_status(&name).await.expect("REQUEST_OK");
+    assert_eq!(
+        ok.parameters
+            .get(p::LARGEST_OBJECT)
+            .and_then(Parameter::as_location),
+        Some(location(0, 1)),
+        "the LARGEST_OBJECT a SUBSCRIBE_OK would carry"
+    );
+    ok.check_properties(true)
+        .expect("properties are allowed on TRACK_STATUS_OK");
+
+    // §9.13: no Objects follow.
+    publisher
+        .publish_group(alias, GroupId::new(VarInt::from_u32(1)), &[b"g1o0"])
+        .await;
+    early.read_subgroup().await;
+    let opened =
+        tokio::time::timeout(Duration::from_millis(300), viewer.session.accept_uni()).await;
+    assert!(opened.is_err(), "a status query receives no objects");
+}
+
+#[tokio::test]
+async fn track_status_of_a_published_track_with_nothing_seen_omits_the_largest_object() {
+    let relay = Relay::start();
+    let mut publisher = Peer::connect(&relay).await;
+    let _announced = publisher.announce(&namespace(&["room"])).await;
+
+    let mut viewer = Peer::connect(&relay).await;
+    let ok = viewer
+        .track_status(&track(&["room"], "video"))
+        .await
+        .expect("REQUEST_OK");
+    assert!(
+        ok.parameters.get(p::LARGEST_OBJECT).is_none(),
+        "§9.20.17: omitted when no Objects have been seen"
+    );
+    let asked =
+        tokio::time::timeout(Duration::from_millis(300), publisher.session.accept_bi()).await;
+    assert!(asked.is_err(), "the publisher is not asked to subscribe");
+}
+
+#[tokio::test]
+async fn track_status_of_an_unpublished_track_does_not_exist() {
+    let relay = Relay::start();
+    let mut viewer = Peer::connect(&relay).await;
+    let refused = viewer
+        .track_status(&track(&["nobody"], "video"))
+        .await
+        .expect_err("nobody publishes it");
+    assert_eq!(refused.code, RequestErrorCode::DOES_NOT_EXIST);
+}
+
+/// The relay sends no `MAX_AUTH_TOKEN_CACHE_SIZE`, so its limit is 0 and
+/// §8.9 closes the session for any use of the cache.
+#[tokio::test]
+async fn a_relay_without_a_token_cache_closes_on_any_alias() {
+    let register = Token::Register {
+        alias: 1,
+        token_type: 0,
+        value: Bytes::from_static(b"ticket"),
+    };
+    for (token, code, error) in [
+        (register, 0x13, "AUTH_TOKEN_CACHE_OVERFLOW"),
+        (
+            Token::UseAlias { alias: 1 },
+            0x17,
+            "UNKNOWN_AUTH_TOKEN_ALIAS",
+        ),
+        (Token::Delete { alias: 1 }, 0x17, "UNKNOWN_AUTH_TOKEN_ALIAS"),
+    ] {
+        let relay = Relay::start();
+        let mut publisher = Peer::connect(&relay).await;
+        let id = publisher.next_request;
+        let (mut stream, _frames) = publisher.announce(&namespace(&["room"])).await;
+        let mut update = RequestUpdate::new(RequestId::new(id).unwrap());
+        update.parameters.push(typed(
+            p::AUTHORIZATION_TOKEN,
+            ParamValue::Token(token.clone()),
+        ));
+        write(&mut stream, &update).await;
+        let closed = closed_reason(&publisher.session).await;
+        assert_eq!(closed.code, code, "{error} for {token:?}");
+    }
 }
