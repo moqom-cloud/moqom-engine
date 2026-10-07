@@ -497,6 +497,11 @@ impl Permission {
             Self::Nothing => return Err(Denial::Unauthenticated),
             Self::Scoped(scope) => scope,
         };
+        // A relay link reads, and is not metered for it; publishing on one
+        // would be media nobody is billed for.
+        if scope.relay {
+            return Err(Denial::Publishing);
+        }
         let fields = namespace.fields();
         let [tenant, marker, rest @ ..] = fields else {
             return Err(Denial::Shape);
@@ -584,7 +589,9 @@ impl Permission {
             // Anyone in the tenant may follow a named person's own channel. It
             // is deliberately not a room, so there is no membership to check —
             // and the name has to be complete enough to name somebody, or this
-            // would be a way to list the customer's users.
+            // would be a way to list the customer's users. Not on a relay link,
+            // which is minted for one room and reads nothing outside it.
+            PERSONAL if scope.relay => Err(Denial::Room),
             PERSONAL => Ok(()),
             ROOM => {
                 if scope.is_own_room(area) {
@@ -672,6 +679,39 @@ mod tests {
         assert!(!viewer().same_seat(&link));
         assert!(!link.same_seat(&viewer()));
         assert!(link.same_seat(&link.clone()));
+    }
+
+    /// A link is minted for one room: it reads that room and nothing else, not
+    /// even the personal channels any viewer in the tenant may follow, and it
+    /// announces nothing, not even its own personal channel.
+    #[test]
+    fn a_relay_link_reads_its_room_and_nothing_else() {
+        let link = permission(Scope {
+            user: Arc::from("moqom-relay"),
+            relay: true,
+            ..viewer()
+        });
+        assert_eq!(
+            link.may_read(&namespace(&["acme", "r", "room-42", "ada", "device-1"])),
+            Ok(())
+        );
+        assert_eq!(
+            link.may_read(&namespace(&["acme", "r", "room-7"])),
+            Err(Denial::Room)
+        );
+        assert_eq!(
+            link.may_read(&namespace(&["acme", "u", "ada", "device-1"])),
+            Err(Denial::Room)
+        );
+        assert_eq!(
+            permission(viewer()).may_read(&namespace(&["acme", "u", "ada", "device-1"])),
+            Ok(()),
+            "a viewer still follows personal channels"
+        );
+        assert_eq!(
+            link.may_announce(&namespace(&["acme", "u", "moqom-relay", "device-1"])),
+            Err(Denial::Publishing)
+        );
     }
 
     #[test]

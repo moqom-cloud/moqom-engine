@@ -877,8 +877,12 @@ impl Keys {
         // claim beside any power would be an unmetered session that can
         // publish or moderate, which the control plane never mints, so it is
         // refused rather than given either half.
+        //
+        // And it names a room. A link is minted per room so that a parent can
+        // refuse whatever the edge asks for outside it; one naming none would
+        // be an unmetered read of the whole tenant.
         let m = &claims.moqt;
-        if m.rly && (m.publish != 0 || m.cap != 0 || m.own || m.bs) {
+        if m.rly && (m.publish != 0 || m.cap != 0 || m.own || m.bs || m.room.is_empty()) {
             return Err(AuthError::Unsupported);
         }
         let permission = Permission::scoped(scope::Scope {
@@ -1139,6 +1143,8 @@ mod tests {
             serde_json::json!({ "room": "r1", "pub": 0, "cap": 0 })
         )));
         for powers in [
+            serde_json::json!({ "pub": 0, "cap": 0, "rly": true }),
+            serde_json::json!({ "room": "", "pub": 0, "cap": 0, "rly": true }),
             serde_json::json!({ "pub": 3, "cap": 0, "rly": true }),
             serde_json::json!({ "pub": 0, "cap": 0x100, "rly": true }),
             serde_json::json!({ "pub": 0, "cap": 0, "own": true, "rly": true }),
