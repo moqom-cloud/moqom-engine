@@ -454,6 +454,12 @@ impl Parameters {
         self.0.insert(at, param);
     }
 
+    /// Keep only the parameters `keep` accepts. Order is preserved, so the
+    /// list stays encodable.
+    pub fn retain(&mut self, keep: impl FnMut(&Parameter) -> bool) {
+        self.0.retain(keep);
+    }
+
     /// The parameters, in ascending type order.
     #[must_use]
     pub fn as_slice(&self) -> &[Parameter] {

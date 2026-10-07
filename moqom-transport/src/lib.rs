@@ -63,6 +63,15 @@ pub mod alpn {
     /// peer, because they will not complete a handshake.
     pub const MOQT_DRAFT_19: &[u8] = b"moqt-19";
 
+    /// MOQT as specified by `draft-ietf-moq-transport-22`.
+    pub const MOQT_DRAFT_22: &[u8] = b"moqt-22";
+
+    /// MOQT as specified by `draft-ietf-moq-transport-16`.
+    ///
+    /// Client side only, for relays that stopped there; never offered by a
+    /// server here, so it is not a [`Dialect`](super::Dialect).
+    pub const MOQT_DRAFT_16: &[u8] = b"moqt-16";
+
     /// MOQT as it will be once the specification is published.
     ///
     /// Deliberately **not** offered. Claiming it before the RFC exists would
@@ -78,8 +87,10 @@ pub mod alpn {
     /// What we offer, in preference order.
     ///
     /// MOQT first: a peer that can speak it directly should, since HTTP/3 buys
-    /// nothing but overhead for a client that is not a browser.
-    pub const OFFERED: &[&[u8]] = &[MOQT_DRAFT_19, H3];
+    /// nothing but overhead for a client that is not a browser. Among the
+    /// drafts, newest first: a server's list is its preference, so a client
+    /// offering both gets -22.
+    pub const OFFERED: &[&[u8]] = &[MOQT_DRAFT_22, MOQT_DRAFT_19, H3];
 }
 
 /// Which version of the MOQT message grammar a session speaks.
@@ -91,8 +102,10 @@ pub mod alpn {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum Dialect {
-    /// `draft-ietf-moq-transport-19`.
+    /// `draft-ietf-moq-transport-19`, as MOQOM deployed it.
     Draft19,
+    /// `draft-ietf-moq-transport-22`.
+    Draft22,
 }
 
 impl Dialect {
@@ -101,7 +114,7 @@ impl Dialect {
     /// The offered ALPN list is checked against this, so adding a dialect and
     /// forgetting to offer it is a test failure rather than a peer that
     /// mysteriously cannot connect.
-    pub const ALL: &'static [Self] = &[Self::Draft19];
+    pub const ALL: &'static [Self] = &[Self::Draft22, Self::Draft19];
 
     /// The identifier this dialect is negotiated under.
     ///
@@ -111,6 +124,16 @@ impl Dialect {
     pub const fn token(self) -> &'static [u8] {
         match self {
             Self::Draft19 => alpn::MOQT_DRAFT_19,
+            Self::Draft22 => alpn::MOQT_DRAFT_22,
+        }
+    }
+
+    /// The codec draft this dialect is spoken in.
+    #[must_use]
+    pub const fn draft(self) -> moqom_proto::Draft {
+        match self {
+            Self::Draft19 => moqom_proto::Draft::D19,
+            Self::Draft22 => moqom_proto::Draft::D22,
         }
     }
 
@@ -119,6 +142,7 @@ impl Dialect {
     pub fn from_token(token: &[u8]) -> Option<Self> {
         match token {
             alpn::MOQT_DRAFT_19 => Some(Self::Draft19),
+            alpn::MOQT_DRAFT_22 => Some(Self::Draft22),
             _ => None,
         }
     }
@@ -128,6 +152,7 @@ impl std::fmt::Display for Dialect {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::Draft19 => "moqt-19",
+            Self::Draft22 => "moqt-22",
         })
     }
 }
@@ -250,6 +275,8 @@ mod tests {
     #[test]
     fn alpn_selects_the_carrier() {
         assert_eq!(Carrier::from_alpn(b"moqt-19"), Some(Carrier::Quic));
+        assert_eq!(Carrier::from_alpn(b"moqt-22"), Some(Carrier::Quic));
+        assert_eq!(Carrier::from_alpn(b"moqt-16"), None);
         assert_eq!(Carrier::from_alpn(b"h3"), Some(Carrier::WebTransport));
     }
 }

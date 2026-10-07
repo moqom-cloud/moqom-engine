@@ -22,6 +22,12 @@
 //! [`FetchReader`](crate::data::FetchReader) and their writers) store their
 //! draft and re-open the scope on every call.
 //!
+//! A session task can instead be wrapped whole in [`Draft::bind`], which
+//! opens the scope around each poll of its future and closes it before the
+//! poll returns. That keeps the same guarantee — no other task on the thread
+//! ever runs inside it — while letting session code call the codec anywhere
+//! without naming the draft.
+//!
 //! Outside any scope the draft is [`Draft::D19`], which is what every call
 //! site that predates this module was written against.
 //!
@@ -49,6 +55,9 @@
 
 use std::cell::Cell;
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 /// A MOQT draft this crate can encode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -133,6 +142,43 @@ impl Draft {
         let _restore = Restore(CURRENT.with(|c| c.replace(self)));
         f()
     }
+
+    /// `future`, with `self` as the ambient draft whenever it is polled.
+    ///
+    /// Each poll is a [`Draft::scope`], so the draft is in force for exactly
+    /// the synchronous stretches of the future and never leaks to whatever
+    /// the executor runs next. A future spawned from inside is a separate task
+    /// and must be bound itself.
+    pub fn bind<F: Future>(self, future: F) -> Bound<F> {
+        Bound {
+            draft: self,
+            future: Box::pin(future),
+        }
+    }
+}
+
+/// A future running in a draft. See [`Draft::bind`].
+#[must_use = "futures do nothing unless polled"]
+pub struct Bound<F> {
+    draft: Draft,
+    future: Pin<Box<F>>,
+}
+
+impl<F: Future> Future for Bound<F> {
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
+        let this = self.get_mut();
+        this.draft.scope(|| this.future.as_mut().poll(cx))
+    }
+}
+
+impl<F> fmt::Debug for Bound<F> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Bound")
+            .field("draft", &self.draft)
+            .finish_non_exhaustive()
+    }
 }
 
 impl fmt::Display for Draft {
@@ -166,6 +212,20 @@ mod tests {
             Draft::D16.scope(|| assert_eq!(Draft::current(), Draft::D16));
             assert_eq!(Draft::current(), Draft::D22);
         });
+        assert_eq!(Draft::current(), Draft::D19);
+    }
+
+    #[test]
+    fn bind_scopes_each_poll() {
+        use std::task::Waker;
+        let mut seen = Vec::new();
+        let mut future = Draft::D22.bind(async {
+            seen.push(Draft::current());
+        });
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(Pin::new(&mut future).poll(&mut cx).is_ready());
+        drop(future);
+        assert_eq!(seen, [Draft::D22]);
         assert_eq!(Draft::current(), Draft::D19);
     }
 
