@@ -51,6 +51,12 @@ The crate documentation (`src/lib.rs`) lists these, in short:
   side's certificate, because TLS 1.3 clients finish before servers judge them.
 - With datagrams off, none are sent or received, and the maximum datagram size
   reads zero.
+- An endpoint binds `[::]` on the requested port, dual-stack, or falls back to
+  IPv4 alone on a host without IPv6. Probe targets and dial addresses can be
+  either family. The reflexive address reported is the IPv4 one when STUN
+  returned both.
+- TLS prefers the hybrid X25519MLKEM768 key exchange, with X25519 as the
+  fallback.
 
 ## Testing
 

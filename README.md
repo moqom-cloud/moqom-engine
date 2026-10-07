@@ -150,6 +150,28 @@ which pauses a subscriber's relay copy while its direct path carries the media.
 The design, including the two-modified-apps limitation, is in
 `moqom/docs/OPENZITI-AND-P2P.md` under "Direct tickets and billing".
 
+Key exchange prefers post-quantum. The workspace enables rustls's
+`prefer-post-quantum`, so every TLS configuration here offers the hybrid
+X25519MLKEM768 first and plain X25519 second. That covers the relay listener,
+the client, relay links, direct paths, and gRPC. `moqom-client/tests/post_quantum.rs`
+completes real handshakes and asserts the negotiated group, for both the
+listener and both ends of a direct path. A classical peer still connects:
+X25519 costs no extra round trip, and only a peer with neither group pays for a
+HelloRetryRequest. Certificates are still classical.
+
+Direct paths are dual-stack. The socket binds `[::]` with IPv4 mapped onto it,
+or IPv4 alone where the host has no IPv6. It gathers a host candidate and a
+STUN reflexive address for each family it can reach, and probes and dials
+either. `moqom-client/tests/ipv6.rs` runs on `::1`.
+
+Draft-22 authorization tokens parse in all four Alias Types (§8.9), and
+`moqom_proto::control::tokens::TokenCache` keeps the alias state with the
+accounting of §9.1.3. The relay advertises no token cache, so a registration or
+an alias reference in a `REQUEST_UPDATE` closes the session with the error
+code §8.9 gives it. A draft-22 `TRACK_STATUS` is answered from what the relay
+holds: the `LARGEST_OBJECT` a `SUBSCRIBE_OK` would carry, behind the same
+checks. The relay neither forwards the query nor subscribes to answer it.
+
 **What the relay is not yet:** scheduling between the rungs of one broadcast
 under pressure, which is `moqom-cc`'s job, or forwarding datagrams; only subgroup
 streams are carried. `moqom-relay/src/lib.rs` lists the remaining gaps and says
