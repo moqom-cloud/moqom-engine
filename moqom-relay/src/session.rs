@@ -37,6 +37,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use bytes::{Buf, Bytes, BytesMut};
+use moqom_proto::Draft;
+use moqom_proto::control::codes;
 use moqom_proto::control::{
     ControlFrame, DoneReason, Fetch, FetchKind, FetchOk, MessageBody, MessageType, Namespace,
     NamespaceDone, Publish, PublishDone, PublishDoneStatus, PublishNamespace, ReasonPhrase,
@@ -63,6 +65,8 @@ use crate::quota::{Lease, Principal, Refusal, Resource};
 use crate::roster::{Arrival, Departure};
 use crate::scope::{Denial, Permission, Scope};
 use crate::{cache, media, metrics, scope};
+
+mod drafts;
 
 /// Identifies this build in Setup Options, for the other end's logs.
 const IMPLEMENTATION: &[u8] = concat!("moqom-relay/", env!("CARGO_PKG_VERSION")).as_bytes();
@@ -247,6 +251,29 @@ pub(crate) mod code {
     pub const EXCESSIVE_LOAD: u32 = 0x04;
 }
 
+/// The draft a connection negotiated, from its ALPN.
+///
+/// [`Draft::D19`] for WebTransport, whose ALPN is `h3`: the draft would come
+/// from `WT-Available-Protocols`, which nothing here negotiates yet, and every
+/// MOQOM browser client speaks draft-19.
+pub(crate) fn draft_of(transport: &moqom_transport::Session) -> Draft {
+    let connection: &quinn::Connection = transport;
+    connection
+        .handshake_data()
+        .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+        .and_then(|data| data.protocol)
+        .and_then(|protocol| Draft::from_alpn(&protocol))
+        .unwrap_or(Draft::D19)
+}
+
+/// The wire code for closing `transport` for the reason MOQOM numbers `code`.
+///
+/// Draft-19 sessions keep MOQOM's numbering, which deployed clients match on;
+/// draft-22 sessions use §12.2's.
+pub(crate) fn close_code(transport: &moqom_transport::Session, code: u32) -> u32 {
+    codes::session_close(draft_of(transport), code)
+}
+
 /// The track a relay pushes a participant's own restrictions to.
 ///
 /// Reserved, like `.catalog` and `.control`, and named under the participant's
@@ -357,7 +384,7 @@ fn policy_payload(silence: Silence) -> Bytes {
 /// desynchronised the stream and nothing after it can be trusted, whereas a body
 /// that fails to parse is one message's problem. Everything this yields is a
 /// complete frame, so callers only ever deal with the second kind.
-struct Frames {
+pub(super) struct Frames {
     stream: RecvStream,
     buffer: BytesMut,
     /// Set once the peer has finished the stream, so a subsequent short read is
@@ -486,6 +513,26 @@ struct Held {
     issued: Option<SystemTime>,
 }
 
+/// The per-subscription state [`Session::hold`] watches, shared with the
+/// route the publisher's session writes through.
+struct Holding {
+    ending: Arc<Notify>,
+    streams: Arc<AtomicU64>,
+    forward: Arc<AtomicBool>,
+    window: Arc<Mutex<crate::fabric::GroupWindow>>,
+}
+
+impl Holding {
+    fn of(route: &Route) -> Self {
+        Self {
+            ending: Arc::clone(&route.done),
+            streams: Arc::clone(&route.streams),
+            forward: Arc::clone(&route.forward),
+            window: Arc::clone(&route.window),
+        }
+    }
+}
+
 /// What a new subscriber must do to start receiving a track, decided under the
 /// [`Session::pulled`] lock and carried out after it is released.
 enum Join {
@@ -505,6 +552,20 @@ enum Join {
 pub struct Session {
     id: SessionId,
     transport: moqom_transport::Session,
+    /// The draft negotiated for this connection. Every task this session
+    /// runs is bound to it (see [`Draft::bind`]), so codec calls anywhere in
+    /// them encode in it without naming it.
+    draft: Draft,
+    /// Whether the peer advertised `MOQOM_PARAMETERS` in SETUP.
+    ///
+    /// Draft-22 closes the session on any Message Parameter it does not
+    /// define, so the private ones (relay hops, authorization proof) go to a
+    /// draft-22 peer only once it has said it reads them. Always true on
+    /// draft-19, where every peer is MOQOM and unknown parameters are skipped.
+    moqom_peer: Arc<AtomicBool>,
+    /// Upstream `FETCHes` this relay has outstanding on this session, by
+    /// Request ID, waiting for their data stream to arrive.
+    fetching: Arc<Mutex<HashMap<RequestId, oneshot::Sender<Frames>>>>,
     carrier: setup::Transport,
     fabric: Fabric,
     routes: Routes,
@@ -706,9 +767,13 @@ impl Session {
         };
         let id = fabric.next_session_id();
         let (commands, command_queue) = mpsc::channel(32);
+        let draft = draft_of(&transport);
         let session = Self {
             id,
             transport,
+            draft,
+            moqom_peer: Arc::new(AtomicBool::new(draft == Draft::D19)),
+            fetching: Arc::default(),
             carrier,
             fabric: fabric.clone(),
             routes: Routes::default(),
@@ -729,7 +794,7 @@ impl Session {
             meter: Arc::default(),
         };
 
-        let result = session.run(command_queue).await;
+        let result = draft.bind(session.run(command_queue)).await;
         fabric.remove_session(id);
         fabric.usage().end(id);
         // Before the log line below, so that a relay reporting upstream says
@@ -749,33 +814,41 @@ impl Session {
             "session ended"
         );
 
+        let close = |code, reason: &[u8]| {
+            session
+                .transport
+                .close(codes::session_close(draft, code), reason);
+        };
         match &result {
-            Ok(()) => session.transport.close(0, b"bye"),
-            Err(SessionError::Protocol(reason)) => session
-                .transport
-                .close(code::PROTOCOL_VIOLATION, reason.as_bytes()),
-            Err(SessionError::Unauthenticated(e)) => session
-                .transport
-                .close(code::UNAUTHORIZED, e.name().as_bytes()),
+            Ok(()) => close(0, b"bye"),
+            Err(SessionError::Protocol(reason)) => {
+                close(code::PROTOCOL_VIOLATION, reason.as_bytes());
+            }
+            // Draft-22 makes a message that does not decode, an unknown
+            // parameter included, a protocol violation of the session.
+            Err(SessionError::Decode(e)) if draft == Draft::D22 => {
+                close(code::PROTOCOL_VIOLATION, e.to_string().as_bytes());
+            }
+            Err(SessionError::Unauthenticated(e)) => close(code::UNAUTHORIZED, e.name().as_bytes()),
             // The reason phrase is the one the moderator's tool will be asked
             // about, so it says which rule rather than merely "no".
-            Err(SessionError::Refused(refusal)) => session
-                .transport
-                .close(code::UNAUTHORIZED, refusal.to_string().as_bytes()),
+            Err(SessionError::Refused(refusal)) => {
+                close(code::UNAUTHORIZED, refusal.to_string().as_bytes());
+            }
             // `UNAUTHORIZED` like the two above, because there is no separate
             // code for it, so the reason phrase is what tells a client which of
             // the three this was — and the right response differs: a credential
             // that never verified should stop a client, and one that merely got
             // old should send it back with a fresh token. Reconnecting with the
             // same token is the one thing that cannot work.
-            Err(SessionError::CredentialExpired) => session.transport.close(
+            Err(SessionError::CredentialExpired) => close(
                 code::UNAUTHORIZED,
                 b"credential expired; renew and reconnect",
             ),
             // The retry-after goes in the close reason, since a session that is
             // being closed has no request stream left to carry it. A client that
             // reads it waits; one that does not is no worse off than before.
-            Err(SessionError::OverLimit(refusal)) => session.transport.close(
+            Err(SessionError::OverLimit(refusal)) => close(
                 code::EXCESSIVE_LOAD,
                 format!(
                     "{} retry_after_ms={}",
@@ -784,7 +857,7 @@ impl Session {
                 )
                 .as_bytes(),
             ),
-            Err(_) => session.transport.close(code::INTERNAL, b"session failed"),
+            Err(_) => close(code::INTERNAL, b"session failed"),
         }
         result
     }
@@ -816,9 +889,13 @@ impl Session {
     ) -> Result<(), SessionError> {
         let id = fabric.next_session_id();
         let (commands, command_queue) = mpsc::channel(32);
+        let draft = draft_of(&transport);
         let session = Self {
             id,
             transport,
+            draft,
+            moqom_peer: Arc::new(AtomicBool::new(draft == Draft::D19)),
+            fetching: Arc::default(),
             // Raw QUIC: an upstream link is relay to relay inside a fleet, with no
             // browser at either end to need WebTransport.
             carrier: setup::Transport::Quic,
@@ -844,7 +921,7 @@ impl Session {
             meter: Arc::default(),
         };
 
-        let result = session.run_upstream(command_queue, token).await;
+        let result = draft.bind(session.run_upstream(command_queue, token)).await;
         fabric.remove_session(id);
         fabric.detach_upstream();
         let ending = Ending::of(&result);
@@ -855,12 +932,17 @@ impl Session {
             error = result.as_ref().err().map(tracing::field::display),
             "upstream session ended"
         );
-        match &result {
-            Ok(()) => session.transport.close(0, b"bye"),
-            Err(SessionError::Protocol(reason)) => session
+        let close = |code, reason: &[u8]| {
+            session
                 .transport
-                .close(code::PROTOCOL_VIOLATION, reason.as_bytes()),
-            Err(_) => session.transport.close(code::INTERNAL, b"session failed"),
+                .close(codes::session_close(draft, code), reason);
+        };
+        match &result {
+            Ok(()) => close(0, b"bye"),
+            Err(SessionError::Protocol(reason)) => {
+                close(code::PROTOCOL_VIOLATION, reason.as_bytes());
+            }
+            Err(_) => close(code::INTERNAL, b"session failed"),
         }
         result
     }
@@ -871,7 +953,7 @@ impl Session {
         commands: mpsc::Receiver<Command>,
         token: Option<&[u8]>,
     ) -> Result<(), SessionError> {
-        let (mut control_send, control_recv) = self.transport.open_bi().await?;
+        let (mut control_send, control_recv) = self.open_control().await?;
         let mut control = Frames::new(control_recv);
         self.introduce(&mut control_send, &mut control, token)
             .await?;
@@ -911,13 +993,7 @@ impl Session {
         control: &mut Frames,
         token: Option<&[u8]>,
     ) -> Result<(), SessionError> {
-        let mut ours = Setup::new();
-        ours.options
-            .set_bytes(setup::option_type::MOQT_IMPLEMENTATION, IMPLEMENTATION)
-            .map_err(|_| SessionError::Protocol("implementation string too long"))?;
-        ours.options
-            .set_varint(setup::option_type::MAX_FILTER_RANGES, MAX_FILTER_RANGES)
-            .map_err(|_| SessionError::Protocol("filter range limit not encodable"))?;
+        let mut ours = self.our_setup()?;
         if let Some(token) = token {
             ours.options
                 .set_bytes(
@@ -940,6 +1016,7 @@ impl Session {
         // The parent is the server on this session, so its options are held to the
         // server's rules -- the mirror of what `handshake` checks of a client.
         peer.validate(Role::Server, self.carrier)?;
+        self.read_peer_options(&peer);
         if let Some(implementation) = peer.options.moqt_implementation() {
             tracing::debug!(
                 session = %self.id,
@@ -948,6 +1025,87 @@ impl Session {
             );
         }
         Ok(())
+    }
+
+    /// Open the control channel as the side that speaks first.
+    ///
+    /// Draft-22 (§6.3) uses one unidirectional stream each way, each opened
+    /// by its sender; draft-19 as MOQOM speaks it uses one bidirectional
+    /// stream the client opens.
+    async fn open_control(&self) -> Result<(SendStream, RecvStream), SessionError> {
+        if !self.draft.unidirectional_control() {
+            return Ok(self.transport.open_bi().await?);
+        }
+        let send = self.transport.open_uni().await?;
+        let recv = self.transport.accept_uni().await?;
+        Ok((send, recv))
+    }
+
+    /// Accept the control channel the peer opened. See [`Self::open_control`].
+    ///
+    /// Under draft-22 the first unidirectional stream to arrive is taken as
+    /// the peer's control stream, and its first message must be SETUP, which
+    /// [`Self::handshake`] checks. Ours is opened straight away rather than
+    /// after reading theirs, as §6.3 allows either side to send first.
+    async fn accept_control(&self) -> Result<(SendStream, RecvStream), SessionError> {
+        if !self.draft.unidirectional_control() {
+            return Ok(self.transport.accept_bi().await?);
+        }
+        let recv = self.transport.accept_uni().await?;
+        let send = self.transport.open_uni().await?;
+        Ok((send, recv))
+    }
+
+    /// Our SETUP, with what both directions of the handshake announce.
+    fn our_setup(&self) -> Result<Setup, SessionError> {
+        let mut ours = Setup::new();
+        ours.options
+            .set_bytes(setup::option_type::MOQT_IMPLEMENTATION, IMPLEMENTATION)
+            .map_err(|_| SessionError::Protocol("implementation string too long"))?;
+        ours.options
+            .set_varint(setup::option_type::MAX_FILTER_RANGES, MAX_FILTER_RANGES)
+            .map_err(|_| SessionError::Protocol("filter range limit not encodable"))?;
+        if self.draft == Draft::D22 {
+            ours.options
+                .set_varint(setup::option_type::MOQOM_PARAMETERS, 1)
+                .map_err(|_| SessionError::Protocol("MOQOM_PARAMETERS not encodable"))?;
+        }
+        Ok(ours)
+    }
+
+    /// Note what the peer's SETUP said about MOQOM's private parameters.
+    fn read_peer_options(&self, peer: &Setup) {
+        if self.draft == Draft::D22 {
+            self.moqom_peer
+                .store(peer.options.moqom_parameters(), Ordering::Relaxed);
+        }
+    }
+
+    /// Remove MOQOM's private parameters from an outgoing message unless the
+    /// peer negotiated them.
+    fn outgoing(&self, parameters: &mut moqom_proto::control::Parameters) {
+        if !self.moqom_peer.load(Ordering::Relaxed) {
+            parameters.retain(|p| !moqom_proto::control::typed::is_private(p.type_value()));
+        }
+    }
+
+    /// Accept a request that draft-19 accepts with silence.
+    ///
+    /// Draft-22 answers `PUBLISH_NAMESPACE`, `SUBSCRIBE_NAMESPACE` and a
+    /// `REQUEST_UPDATE` of either with `REQUEST_OK` (§9.14, §9.15, §9.5);
+    /// MOQOM's draft-19 clients take the open stream as the acceptance and
+    /// would read a `REQUEST_OK` as a protocol error.
+    async fn acknowledge(&self, send_stream: &mut SendStream) -> Result<(), SessionError> {
+        if self.draft == Draft::D22 {
+            send(send_stream, &moqom_proto::control::RequestOk::new()).await?;
+        }
+        Ok(())
+    }
+
+    /// The draft this session speaks.
+    #[must_use]
+    pub const fn draft(&self) -> Draft {
+        self.draft
     }
 
     /// This session's identifier within the relay.
@@ -979,7 +1137,7 @@ impl Session {
     }
 
     async fn run(&self, commands: mpsc::Receiver<Command>) -> Result<(), SessionError> {
-        let (mut control_send, control_recv) = self.transport.accept_bi().await?;
+        let (mut control_send, control_recv) = self.accept_control().await?;
         let mut control = Frames::new(control_recv);
         // Held for the rest of this function. Dropping it is what frees the
         // slot, and `run` returning is the one thing that happens on every path
@@ -1181,6 +1339,7 @@ impl Session {
         let len = body.len();
         let peer = Setup::decode(&mut body, len)?;
         peer.validate(Role::Client, self.carrier)?;
+        self.read_peer_options(&peer);
 
         self.establish_identity(&peer)?;
 
@@ -1204,13 +1363,7 @@ impl Session {
             );
         }
 
-        let mut ours = Setup::new();
-        ours.options
-            .set_bytes(setup::option_type::MOQT_IMPLEMENTATION, IMPLEMENTATION)
-            .map_err(|_| SessionError::Protocol("implementation string too long"))?;
-        ours.options
-            .set_varint(setup::option_type::MAX_FILTER_RANGES, MAX_FILTER_RANGES)
-            .map_err(|_| SessionError::Protocol("filter range limit not encodable"))?;
+        let ours = self.our_setup()?;
         send(send_stream, &ours).await?;
         Ok(session)
     }
@@ -1611,7 +1764,10 @@ impl Session {
             let silence = self.silence();
             if !silence.is_empty() {
                 let session = self.clone();
-                tokio::spawn(async move { session.tell_policy(silence).await });
+                tokio::spawn(
+                    self.draft
+                        .bind(async move { session.tell_policy(silence).await }),
+                );
             }
         }
     }
@@ -1691,7 +1847,10 @@ impl Session {
         let silence = self.silence();
         if !silence.is_empty() {
             let session = self.clone();
-            tokio::spawn(async move { session.tell_policy(silence).await });
+            tokio::spawn(
+                self.draft
+                    .bind(async move { session.tell_policy(silence).await }),
+            );
         }
     }
 
@@ -1898,7 +2057,10 @@ impl Session {
         loop {
             let (send_stream, recv) = self.transport.accept_bi().await?;
             let session = self.clone();
-            tokio::spawn(async move { session.serve_request(send_stream, recv).await });
+            tokio::spawn(
+                self.draft
+                    .bind(async move { session.serve_request(send_stream, recv).await }),
+            );
         }
     }
 
@@ -1906,7 +2068,10 @@ impl Session {
         loop {
             let recv = self.transport.accept_uni().await?;
             let session = self.clone();
-            tokio::spawn(async move { session.forward_subgroup(recv).await });
+            tokio::spawn(
+                self.draft
+                    .bind(async move { session.forward_subgroup(recv).await }),
+            );
         }
     }
 
@@ -1999,8 +2164,22 @@ impl Session {
             _ => self.on_fetch(&frame, &mut send_stream).await,
         };
 
-        if let Err(e) = outcome {
-            tracing::debug!(session = %self.id, error = %e, "request failed");
+        match outcome {
+            // Draft-22 makes a malformed request, an unknown parameter
+            // included, a violation of the whole session (§9.20), where
+            // draft-19 as MOQOM speaks it confines it to the request.
+            Err(SessionError::Decode(e)) if self.draft == Draft::D22 => {
+                tracing::info!(session = %self.id, error = %e, "closing: malformed request");
+                self.transport
+                    .close(codes::session::PROTOCOL_VIOLATION, e.to_string().as_bytes());
+            }
+            Err(SessionError::Protocol(reason)) if self.draft == Draft::D22 => {
+                tracing::info!(session = %self.id, reason, "closing: protocol violation");
+                self.transport
+                    .close(codes::session::PROTOCOL_VIOLATION, reason.as_bytes());
+            }
+            Err(e) => tracing::debug!(session = %self.id, error = %e, "request failed"),
+            Ok(()) => {}
         }
         let _ = send_stream.finish();
     }
@@ -2037,6 +2216,7 @@ impl Session {
         self.fabric.metrics().announced();
         self.fabric
             .announce(self.id, request.namespace.clone(), self.commands.clone());
+        self.acknowledge(send_stream).await?;
 
         // How this stream ends is how the withdrawal is characterised, and it is
         // the only place the difference is observable. A `FIN` is the publisher
@@ -2061,6 +2241,9 @@ impl Session {
                     Ok(None) => break (Ok(()), DoneReason::Stopped),
                     Ok(Some(frame)) if frame.message_type == MessageType::RequestUpdate => {
                         if let Err(e) = self.renew_credential(&frame) {
+                            break (Err(e), DoneReason::Vanished);
+                        }
+                        if let Err(e) = self.acknowledge(send_stream).await {
                             break (Err(e), DoneReason::Vanished);
                         }
                     }
@@ -2212,6 +2395,10 @@ impl Session {
 
         let (existing, mut events) = self.fabric.watch(self.id, prefix.clone());
         tracing::info!(session = %self.id, %prefix, "watching namespaces");
+        if let Err(e) = self.acknowledge(send_stream).await {
+            self.fabric.unwatch(self.id, &prefix);
+            return Err(e);
+        }
         // A host demoted to the audience stops being entitled to the backstage
         // queue they were watching, and this is what ends that watch. The room's
         // own watch survives a demotion, which is what keeps the roster going.
@@ -2234,7 +2421,15 @@ impl Session {
                     }
                     Some(NamespaceEvent::Gone(namespace, reason)) => {
                         if let Some(suffix) = suffix_of(&namespace, &prefix) {
-                            send(send_stream, &NamespaceDone::because(suffix, reason)).await?;
+                            // The trailing reason is MOQOM's, and a draft-22
+                            // peer that did not negotiate it would find a
+                            // body longer than the message it knows.
+                            let done = if self.moqom_peer.load(Ordering::Relaxed) {
+                                NamespaceDone::because(suffix, reason)
+                            } else {
+                                NamespaceDone::new(suffix)
+                            };
+                            send(send_stream, &done).await?;
                         }
                     }
                 },
@@ -2249,6 +2444,9 @@ impl Session {
                     // whether or not it publishes or subscribes to anything.
                     Ok(Some(frame)) if frame.message_type == MessageType::RequestUpdate => {
                         if let Err(e) = self.renew_credential(&frame) {
+                            break Err(e);
+                        }
+                        if let Err(e) = self.acknowledge(send_stream).await {
                             break Err(e);
                         }
                     }
@@ -2295,6 +2493,19 @@ impl Session {
         }
     }
 
+    /// The answer to a subscription for a track this relay cannot reach,
+    /// which a refusal it would rather not reveal also gives.
+    async fn unpublished(send_stream: &mut SendStream) -> Result<(), SessionError> {
+        send(
+            send_stream,
+            &RequestError::new(
+                RequestErrorCode::DOES_NOT_EXIST,
+                ReasonPhrase::truncating("namespace is not published here"),
+            ),
+        )
+        .await
+    }
+
     /// Satisfy a subscription by pulling the track from whoever publishes it.
     ///
     /// The upstream subscription is established *before* answering, so a
@@ -2332,14 +2543,7 @@ impl Session {
         if self.withheld(&track) {
             tracing::info!(session = %self.id, %track, "subscription refused: force-muted");
             self.fabric.metrics().subscribed(Subscribed::Refused);
-            return send(
-                send_stream,
-                &RequestError::new(
-                    RequestErrorCode::DOES_NOT_EXIST,
-                    ReasonPhrase::truncating("namespace is not published here"),
-                ),
-            )
-            .await;
+            return Self::unpublished(send_stream).await;
         }
 
         // How many further relays may be asked, spent one per hop. Absent on a
@@ -2364,22 +2568,17 @@ impl Session {
         let Some(publisher) = publisher else {
             tracing::debug!(session = %self.id, %track, "no publisher for namespace");
             self.fabric.metrics().subscribed(Subscribed::NoPublisher);
-            return send(
-                send_stream,
-                &RequestError::new(
-                    RequestErrorCode::DOES_NOT_EXIST,
-                    ReasonPhrase::truncating("namespace is not published here"),
-                ),
-            )
-            .await;
+            return Self::unpublished(send_stream).await;
         };
 
+        let mut extras = drafts::Extras::none();
         let alias = self.allocate_alias();
-        let route =
+        let mut route =
             Route::new(self.transport.clone(), self.id, alias).metered(self.meter.get().cloned());
-        let ending = Arc::clone(&route.done);
-        let streams = Arc::clone(&route.streams);
-        let forward = Arc::clone(&route.forward);
+        if self.draft == Draft::D22 {
+            route = self.prepare_route(route, &request, &track, &mut extras)?;
+        }
+        let holding = Holding::of(&route);
         let (ready, answered) = oneshot::channel();
         let command = Command::Subscribe {
             track: track.clone(),
@@ -2410,7 +2609,22 @@ impl Session {
                 // a subscription that was refused.
                 self.lock_subscribed()
                     .insert(request.request_id, track.clone());
-                send(send_stream, &SubscribeOk::new(alias)).await?;
+                let mut ok = SubscribeOk::new(alias);
+                if self.draft == Draft::D22 {
+                    ok.parameters = self.largest_parameters(&track);
+                }
+                send(send_stream, &ok).await?;
+                // After SUBSCRIBE_OK, whose LARGEST_OBJECT the fill range is
+                // measured against, and only for a subscription not paused
+                // (§3.4.1).
+                if self.draft == Draft::D22 && holding.forward.load(Ordering::Relaxed) {
+                    self.fill_requested(
+                        request.request_id,
+                        &request.parameters,
+                        &track,
+                        &mut extras,
+                    );
+                }
 
                 // `slot` is held rather than stored, now that the subscription
                 // and its request stream end together: the limit counts
@@ -2420,7 +2634,7 @@ impl Session {
                     meter.watch(&track);
                 }
                 let outcome = self
-                    .hold(&track, send_stream, frames, &ending, &streams, &forward)
+                    .hold(&track, send_stream, frames, holding, &mut extras)
                     .await;
                 if let Some(meter) = meter {
                     meter.unwatch(&track);
@@ -2625,13 +2839,28 @@ impl Session {
         track: &FullTrackName,
         send_stream: &mut SendStream,
         frames: &mut Frames,
-        ending: &Notify,
-        streams: &AtomicU64,
-        forward: &AtomicBool,
+        holding: Holding,
+        extras: &mut drafts::Extras,
     ) -> Result<(), SessionError> {
+        let Holding {
+            ending,
+            streams,
+            forward,
+            window,
+        } = holding;
         let mut grants = self.permission.subscribe();
+        let mut notices = extras.notices.take();
         loop {
             tokio::select! {
+                Some(notice) = async {
+                    match notices.as_mut() {
+                        Some(notices) => notices.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    self.notify_subscriber(track, notice, send_stream).await?;
+                }
+
                 changed = grants.changed() => {
                     if changed.is_err() {
                         continue;
@@ -2684,6 +2913,18 @@ impl Session {
                         if let Some(wanted) = forwarding(&frame)? {
                             forward.store(wanted, Ordering::Relaxed);
                         }
+                        if self.draft == Draft::D22 {
+                            let paused = !forward.load(Ordering::Relaxed);
+                            self.update_subscription(
+                                &frame,
+                                track,
+                                &window,
+                                paused,
+                                extras,
+                                send_stream,
+                            )
+                            .await?;
+                        }
                     }
                     Ok(Some(_)) => return Err(SessionError::Protocol(
                         "unexpected message on a SUBSCRIBE stream",
@@ -2725,6 +2966,10 @@ impl Session {
         send_stream: &mut SendStream,
     ) -> Result<(), SessionError> {
         let request = Fetch::decode(&mut frame.body.clone())?;
+        if let FetchKind::Filtered { track } = &request.kind {
+            let track = track.clone();
+            return self.on_fetch_filtered(request, track, send_stream).await;
+        }
         let cache = self.fabric.cache();
 
         let refuse = |code, reason: &str| RequestError::new(code, ReasonPhrase::truncating(reason));
@@ -2799,13 +3044,13 @@ impl Session {
         // objects are still going out. A fetch of several groups is a lot of
         // bytes, and holding this task on the write would make the cancel
         // unreadable until the write it is trying to cancel had finished.
-        tokio::spawn(async move {
+        tokio::spawn(self.draft.bind(async move {
             if let Err(e) = session.write_fetch(request_id, &records, order).await {
                 tracing::debug!(session = %session.id, error = %e, "fetch delivery failed");
             } else {
                 tracing::info!(session = %session.id, objects = count, "fetch delivered");
             }
-        });
+        }));
         Ok(())
     }
 
@@ -2849,7 +3094,7 @@ impl Session {
                 Some((track, start, FetchEnd::Through(live)))
             }
 
-            // Only a draft-22 decoder produces this, and no session speaks it yet.
+            // Draft-22's form, answered by `on_fetch_filtered` instead.
             FetchKind::Filtered { .. } => None,
         }
     }
@@ -2900,6 +3145,19 @@ impl Session {
                 subscriber,
                 downstream,
             } => self.release_route(&track, upstream, subscriber, downstream),
+            Command::Fetch {
+                track,
+                start,
+                end,
+                deadline,
+                reply,
+            } => {
+                let session = self.clone();
+                tokio::spawn(self.draft.bind(async move {
+                    let answer = session.fetch_upstream(track, start, end, deadline).await;
+                    let _ = reply.send(answer);
+                }));
+            }
             Command::Restrict { silence } => self.restrict(silence),
             Command::Regrant { ceiling } => {
                 // The current permission, capped. Never the token's grants
@@ -2944,7 +3202,10 @@ impl Session {
         self.fabric.metrics().muted();
 
         let session = self.clone();
-        tokio::spawn(async move { session.tell_policy(silence).await });
+        tokio::spawn(
+            self.draft
+                .bind(async move { session.tell_policy(silence).await }),
+        );
     }
 
     /// Cancel every upstream subscription a mute stops, and report how many.
@@ -3137,7 +3398,7 @@ impl Session {
             }
             Join::Waiting(mut outcome) => {
                 let session = self.clone();
-                tokio::spawn(async move {
+                tokio::spawn(self.draft.bind(async move {
                     // Waits for the first subscriber's round trip rather than
                     // starting a second one. A sender dropped without an answer
                     // means that task died, which the subscriber sees the same
@@ -3154,11 +3415,11 @@ impl Session {
                         Ok(upstream) => session.share(upstream, *route, &track),
                         Err(e) => Err(e),
                     });
-                });
+                }));
             }
             Join::Opening(announce) => {
                 let session = self.clone();
-                tokio::spawn(async move {
+                tokio::spawn(self.draft.bind(async move {
                     let result = session
                         .subscribe_upstream(track.clone(), *route, hops)
                         .await;
@@ -3184,7 +3445,7 @@ impl Session {
                     if !session.still_publishes(&track) {
                         session.stop_pulls_under(track.namespace());
                     }
-                });
+                }));
             }
         }
     }
@@ -3264,6 +3525,7 @@ impl Session {
         if self.facing == Facing::Upstream {
             hops.spent().note(&mut request.parameters);
         }
+        self.outgoing(&mut request.parameters);
         send(&mut send_stream, &request)
             .await
             .map_err(|e| internal("could not send SUBSCRIBE", &e))?;
@@ -3305,14 +3567,20 @@ impl Session {
                 );
 
                 let session = self.clone();
-                tokio::spawn(async move {
+                tokio::spawn(self.draft.bind(async move {
                     // `send_stream` moves in deliberately: holding it is what
                     // keeps the subscription alive, and dropping it resets the
                     // stream, which is how this end unsubscribes.
                     let hold = send_stream;
                     let ended = tokio::select! {
                         () = stop.notified() => false,
-                        () = async { while let Ok(Some(_)) = frames.next().await {} } => true,
+                        () = async {
+                            while let Ok(Some(frame)) = frames.next().await {
+                                if frame.message_type == MessageType::PublishStateNotify {
+                                    session.relay_notice(upstream, &frame);
+                                }
+                            }
+                        } => true,
                     };
                     drop(hold);
                     if ended {
@@ -3326,7 +3594,7 @@ impl Session {
                         );
                     }
                     session.stop_pulling(&track, upstream, ended);
-                });
+                }));
                 Ok(upstream)
             }
             MessageType::RequestError => {
@@ -3359,8 +3627,47 @@ impl Session {
     /// It does look, on a copy, to fill the cache — see [`Tee`]. That parse is
     /// downstream of the fan-out in every sense: it reads bytes already sent, and
     /// a stream it cannot parse costs a cache miss rather than a dropped forward.
+    /// Open an outlet per route. Subscribers in this session's draft get the
+    /// bytes as they came; each other draft gets one re-encoding, shared by
+    /// its subscribers.
+    fn open_outlets(
+        &self,
+        routes: Vec<Route>,
+        header: &SubgroupHeader,
+        metrics: &Metrics,
+    ) -> (Vec<Outlet>, Vec<(drafts::Transcoder, Vec<Outlet>)>) {
+        let mut outlets: Vec<Outlet> = Vec::new();
+        let mut foreign: Vec<(drafts::Transcoder, Vec<Outlet>)> = Vec::new();
+        for route in routes {
+            let outlet = Outlet::open(&route, header, metrics.clone());
+            if route.draft == self.draft {
+                outlets.push(outlet);
+            } else if let Some((_, list)) =
+                foreign.iter_mut().find(|(t, _)| t.target() == route.draft)
+            {
+                list.push(outlet);
+            } else {
+                foreign.push((
+                    drafts::Transcoder::new(header, self.draft, route.draft),
+                    vec![outlet],
+                ));
+            }
+        }
+        (outlets, foreign)
+    }
+
     async fn forward_subgroup(&self, recv: RecvStream) {
         let mut frames = Frames::new(recv);
+        // The answer to a FETCH this relay sent upstream arrives on a
+        // unidirectional stream too, and only its type tells it apart.
+        match drafts::stream_type(&mut frames).await {
+            Ok(drafts::FETCH_HEADER) => return self.accept_fetch_stream(frames).await,
+            Ok(_) => {}
+            Err(e) => {
+                tracing::debug!(session = %self.id, error = %e, "unreadable data stream");
+                return;
+            }
+        }
         // A subgroup stream is not length-delimited, so the header is read
         // directly rather than through `Frames::next`. The buffering is shared,
         // which is why anything read past the header has to be picked up below
@@ -3376,10 +3683,20 @@ impl Session {
         let metrics = self.fabric.metrics();
         // A paused subscriber is skipped for the whole subgroup rather than cut
         // off inside one, so what it does receive is always whole.
+        let group = header.group.get();
         let routes: Vec<Route> = self
             .routes_for(header.track_alias)
             .into_iter()
-            .filter(|route| route.forward.load(Ordering::Relaxed))
+            .filter(|route| {
+                let window = route.window();
+                if window.ended_by(group) {
+                    // Past the end of its Location filter: the subscription
+                    // is complete, which its own session reports.
+                    route.done.notify_one();
+                    return false;
+                }
+                route.forward.load(Ordering::Relaxed) && window.admits(group)
+            })
             .collect();
         // Looked up before the early return below, so that a subgroup arriving on
         // a track nobody is watching still counts as the publisher being alive.
@@ -3403,10 +3720,7 @@ impl Session {
         }
         metrics.subgroup_forwarded();
 
-        let mut outlets: Vec<Outlet> = routes
-            .into_iter()
-            .map(|route| Outlet::open(&route, &header, metrics.clone()))
-            .collect();
+        let (mut outlets, mut foreign) = self.open_outlets(routes, &header, metrics);
         let meter = self.meter.get().cloned();
 
         let leftover = frames.take_buffered();
@@ -3422,6 +3736,7 @@ impl Session {
                 tee.absorb(&leftover);
             }
             fan_out(&mut outlets, &leftover, metrics);
+            drafts::fan_out_foreign(&mut foreign, &leftover, metrics);
         }
 
         let mut chunk = [0u8; 8192];
@@ -3429,7 +3744,7 @@ impl Session {
         // the objects still belong in history, and a subscriber arriving a moment
         // later wants them. Only a stream nobody is watching *and* nothing is
         // retaining is abandoned.
-        while !outlets.is_empty() || tee.is_some() {
+        while !outlets.is_empty() || !foreign.is_empty() || tee.is_some() {
             match frames.stream.read(&mut chunk).await {
                 Ok(Some(0) | None) | Err(_) => break,
                 Ok(Some(n)) => {
@@ -3443,7 +3758,9 @@ impl Session {
                     if let Some(tee) = &mut tee {
                         tee.absorb(&chunk[..n]);
                     }
-                    fan_out(&mut outlets, &Bytes::copy_from_slice(&chunk[..n]), metrics);
+                    let bytes = Bytes::copy_from_slice(&chunk[..n]);
+                    fan_out(&mut outlets, &bytes, metrics);
+                    drafts::fan_out_foreign(&mut foreign, &bytes, metrics);
                 }
             }
         }
@@ -3815,7 +4132,7 @@ pub const RESET_SHED: u32 = 0x02;
 /// the pace for the whole room, and worse, would back the pressure all the way
 /// up to the publisher's phone. Deduplicating the pull upstream made that
 /// sharper rather than milder: there is now one read loop feeding everybody.
-struct Outlet {
+pub(super) struct Outlet {
     chunks: mpsc::Sender<Bytes>,
     /// Raised when this copy is abandoned, so the writer resets its stream
     /// instead of finishing it. Separate from closing the queue because the
@@ -3877,7 +4194,7 @@ impl Outlet {
         let abandoned = Arc::clone(&abandon);
         let progress = Arc::clone(&wrote);
 
-        tokio::spawn(async move {
+        tokio::spawn(route.draft.bind(async move {
             let Ok(mut stream) = session.open_uni().await else {
                 metrics.fanout_failed();
                 return;
@@ -3949,7 +4266,7 @@ impl Outlet {
             }
 
             let _ = stream.reset(RESET_SHED);
-        });
+        }));
 
         Self {
             chunks,
@@ -4018,7 +4335,7 @@ fn note(progress: &AtomicU64, opened: Instant) {
 /// Egress is counted where the bytes are actually written, so it exceeds
 /// ingress by the fan-out ratio. That ratio is the whole reason a relay exists,
 /// and the two counters together are the only place it is visible.
-fn fan_out(outlets: &mut Vec<Outlet>, bytes: &Bytes, metrics: &Metrics) {
+pub(super) fn fan_out(outlets: &mut Vec<Outlet>, bytes: &Bytes, metrics: &Metrics) {
     outlets.retain(|outlet| match outlet.offer(bytes.clone()) {
         Handoff::Taken => true,
         Handoff::Shed => {

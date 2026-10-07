@@ -439,7 +439,7 @@ pub struct Closed {
     pub reason: String,
 }
 
-async fn closed_reason(session: &moqom_transport::Session) -> Closed {
+pub async fn closed_reason(session: &moqom_transport::Session) -> Closed {
     let error = within("the relay to close the session", session.closed()).await;
     match error {
         web_transport_quinn::SessionError::ConnectionError(
@@ -1524,6 +1524,42 @@ pub fn namespace(fields: &[&str]) -> TrackNamespace {
 pub fn track(fields: &[&str], name: &str) -> FullTrackName {
     FullTrackName::new(namespace(fields), Bytes::copy_from_slice(name.as_bytes()))
         .expect("a valid track name")
+}
+
+/// A raw QUIC session to `relay` offering only `alpn`, before any MOQT.
+///
+/// For a peer speaking a draft [`Client`] does not: the caller owns the
+/// framing from the first byte. The endpoint is returned because dropping it
+/// closes the connection.
+pub async fn dial(relay: &Relay, alpn: &[u8]) -> (quinn::Endpoint, moqom_transport::Session) {
+    install_crypto_provider();
+    let mut tls = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(PinnedCertificate(relay.certificate.clone())))
+        .with_no_client_auth();
+    tls.alpn_protocols = vec![alpn.to_vec()];
+    let crypto =
+        quinn::crypto::rustls::QuicClientConfig::try_from(tls).expect("a TLS 1.3 configuration");
+    let mut endpoint = quinn::Endpoint::client(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("binding a client socket");
+    endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(crypto)));
+
+    let connection = within("the QUIC handshake", async {
+        endpoint
+            .connect(relay.addr, "localhost")
+            .expect("a connectable address")
+            .await
+            .expect("the relay accepts")
+    })
+    .await;
+    let session = moqom_transport::Session::raw(
+        connection,
+        web_transport_quinn::proto::ConnectRequest::new(
+            url::Url::parse("https://localhost/").expect("a constant URL"),
+        ),
+        web_transport_quinn::proto::ConnectResponse::OK,
+    );
+    (endpoint, session)
 }
 
 /// Session credentials, minted the way the Go control plane mints them.

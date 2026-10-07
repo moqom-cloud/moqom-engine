@@ -32,7 +32,7 @@
 //!   See [`moqom_relay::admin_auth`].
 //! - `MOQOM_RELAY_ADMIN_LOCAL_ADDR` — a second admin listener, serving the
 //!   whole surface with no authentication, on a loopback address only (any
-//!   other refuses to start). For an OpenZiti tunneler beside the relay to host
+//!   other refuses to start). For an `OpenZiti` tunneler beside the relay to host
 //!   as a dark service, so the network-facing port can be `probes-only`. It
 //!   shares state with the first: readiness and metrics are the same.
 //! - `MOQOM_RELAY_TENANT` — serve this one tenant: every token issued for

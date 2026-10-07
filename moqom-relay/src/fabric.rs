@@ -158,6 +158,48 @@ pub struct Route {
     /// Read once per subgroup, because subgroups are what is forwarded: a pause
     /// lets the subgroup in flight finish and a resume starts at the next one.
     pub forward: Arc<AtomicBool>,
+    /// The draft the subscriber's session speaks, which is what the subgroup
+    /// streams to it are written in. When it differs from the publisher's,
+    /// the fan-out re-encodes instead of copying.
+    pub draft: moqom_proto::Draft,
+    /// The groups the subscriber's Location filter admits, if it narrowed
+    /// them. Read once per subgroup, like [`Self::forward`].
+    pub window: Arc<Mutex<GroupWindow>>,
+    /// Where the publisher's `PUBLISH_STATE_NOTIFY` parameters go, for a
+    /// subscriber whose draft has that message.
+    pub notices: Option<mpsc::UnboundedSender<moqom_proto::control::Parameters>>,
+}
+
+/// The groups a subscription's Location filter admits.
+///
+/// Subgroups are what the fan-out forwards, so this is applied a group at a
+/// time: a filter ending mid-group delivers that whole group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GroupWindow {
+    /// The first group admitted.
+    pub first: u64,
+    /// The last group admitted, or `None` for an open end.
+    pub last: Option<u64>,
+}
+
+impl GroupWindow {
+    /// Every group.
+    pub const ALL: Self = Self {
+        first: 0,
+        last: None,
+    };
+
+    /// Whether objects of `group` are delivered.
+    #[must_use]
+    pub fn admits(self, group: u64) -> bool {
+        group >= self.first && self.last.is_none_or(|last| group <= last)
+    }
+
+    /// Whether every group from `group` on is past the end.
+    #[must_use]
+    pub fn ended_by(self, group: u64) -> bool {
+        self.last.is_some_and(|last| group > last)
+    }
 }
 
 impl Route {
@@ -169,6 +211,7 @@ impl Route {
         alias: TrackAlias,
     ) -> Self {
         Self {
+            draft: crate::session::draft_of(&session),
             session,
             subscriber,
             alias,
@@ -176,7 +219,31 @@ impl Route {
             streams: Arc::new(AtomicU64::new(0)),
             meter: None,
             forward: Arc::new(AtomicBool::new(true)),
+            window: Arc::new(Mutex::new(GroupWindow::ALL)),
+            notices: None,
         }
+    }
+
+    /// The same route, passing the publisher's state notifications to
+    /// `notices`.
+    #[must_use]
+    pub fn notifying(
+        self,
+        notices: mpsc::UnboundedSender<moqom_proto::control::Parameters>,
+    ) -> Self {
+        Self {
+            notices: Some(notices),
+            ..self
+        }
+    }
+
+    /// The groups currently admitted.
+    #[must_use]
+    pub fn window(&self) -> GroupWindow {
+        *self
+            .window
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// The same route, billing what it carries to `meter`.
@@ -195,6 +262,16 @@ impl std::fmt::Debug for Route {
             .field("alias", &self.alias)
             .finish_non_exhaustive()
     }
+}
+
+/// The records an upstream FETCH produced.
+#[derive(Debug, Default)]
+pub struct Upstreamed {
+    /// In stream order, as far as they arrived.
+    pub records: Vec<moqom_proto::data::FetchRecord>,
+    /// Whether the stream finished: `false` if the deadline cut it short or
+    /// the peer refused or reset it.
+    pub complete: bool,
 }
 
 /// Something one session asks another to do.
@@ -226,6 +303,22 @@ pub enum Command {
         hops: Hops,
         /// Completed once upstream has answered.
         ready: oneshot::Sender<Result<Pulling, UpstreamError>>,
+    },
+    /// FETCH a range of `track` from this session's peer, on behalf of a
+    /// draft-22 request this relay cannot answer from its cache alone
+    /// (draft-22 §3.2.3).
+    Fetch {
+        /// The track.
+        track: FullTrackName,
+        /// The first location wanted.
+        start: moqom_proto::model::Location,
+        /// The last location wanted, inclusive, or `None` for as far as the
+        /// peer has.
+        end: Option<moqom_proto::model::Location>,
+        /// When the requester stops waiting: its Fill Timeout.
+        deadline: tokio::time::Instant,
+        /// What arrived by then.
+        reply: oneshot::Sender<Upstreamed>,
     },
     /// A subscriber has gone. Stop routing this track to it, and stop pulling
     /// the track altogether if it was the last one watching.

@@ -57,8 +57,10 @@ pub trait Closes: Send + Sync {
 }
 
 impl Closes for moqom_transport::Session {
+    /// `code` is MOQOM's; a draft-22 session is closed with §12.2's number
+    /// for the same reason.
     fn close(&self, code: u32, reason: &[u8]) {
-        moqom_transport::Session::close(self, code, reason);
+        moqom_transport::Session::close(self, crate::session::close_code(self, code), reason);
     }
 }
 
