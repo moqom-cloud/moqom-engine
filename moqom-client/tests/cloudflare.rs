@@ -87,9 +87,8 @@ impl Scripted {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let generated = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
         let certificate = generated.cert.der().clone();
-        let key =
-            rustls::pki_types::PrivateKeyDer::try_from(generated.signing_key.serialize_der())
-                .unwrap();
+        let key = rustls::pki_types::PrivateKeyDer::try_from(generated.signing_key.serialize_der())
+            .unwrap();
         let mut tls = rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(vec![certificate.clone()], key)
@@ -125,15 +124,18 @@ impl Scripted {
             panic!("the client must open with CLIENT_SETUP");
         };
         let mut ours = Parameters::new();
-        ours.push(
-            Parameter::varint(setup_param::MAX_REQUEST_ID, VarInt::from_u32(limit)).unwrap(),
-        );
+        ours.push(Parameter::varint(setup_param::MAX_REQUEST_ID, VarInt::from_u32(limit)).unwrap());
         control.write(&Message::ServerSetup(ours)).await;
         (connection, control, parameters)
     }
 }
 
-async fn publish_subgroup(connection: &quinn::Connection, alias: u32, group: u32, payloads: &[&[u8]]) {
+async fn publish_subgroup(
+    connection: &quinn::Connection,
+    alias: u32,
+    group: u32,
+    payloads: &[&[u8]],
+) {
     let bytes = Draft::D16.scope(|| {
         let header = SubgroupHeader::new(
             TrackAlias::new(VarInt::from_u32(alias)),
@@ -171,10 +173,18 @@ async fn setup_carries_the_token_as_the_path_and_nothing_private() {
     session.expect("the session is established");
 
     let bytes = |t| setup.get(t).and_then(Parameter::as_bytes).cloned();
-    assert_eq!(bytes(setup_param::PATH), Some(Bytes::from_static(b"/header.claims.signature")));
-    assert_eq!(bytes(setup_param::AUTHORITY), Some(Bytes::from_static(b"localhost")));
     assert_eq!(
-        setup.get(setup_param::MAX_REQUEST_ID).and_then(Parameter::as_varint),
+        bytes(setup_param::PATH),
+        Some(Bytes::from_static(b"/header.claims.signature"))
+    );
+    assert_eq!(
+        bytes(setup_param::AUTHORITY),
+        Some(Bytes::from_static(b"localhost"))
+    );
+    assert_eq!(
+        setup
+            .get(setup_param::MAX_REQUEST_ID)
+            .and_then(Parameter::as_varint),
         Some(VarInt::from_u32(0)),
         "the relay may not make requests of a subscriber"
     );
@@ -209,7 +219,11 @@ async fn a_subscription_receives_objects_until_publish_done() {
         let Message::Subscribe(request) = control.read().await else {
             panic!("expected SUBSCRIBE");
         };
-        assert_eq!(request.request_id.get(), 0, "a client's first request ID is 0");
+        assert_eq!(
+            request.request_id.get(),
+            0,
+            "a client's first request ID is 0"
+        );
         assert_eq!(request.track, track("1.m4s"));
         assert_eq!(
             request
@@ -242,7 +256,10 @@ async fn a_subscription_receives_objects_until_publish_done() {
     let mut subscription = subscription.expect("subscribed");
     assert_eq!(
         subscription.largest,
-        Some(Location::new(GroupId::new(VarInt::from_u32(3)), ObjectId::ZERO))
+        Some(Location::new(
+            GroupId::new(VarInt::from_u32(3)),
+            ObjectId::ZERO
+        ))
     );
 
     publish_subgroup(&connection, 9, 4, &[b"moof", b"mdat"]).await;
@@ -294,7 +311,9 @@ async fn a_client_at_the_request_limit_says_so_and_waits() {
             let mut message = control.read().await;
             if let Message::RequestsBlocked(at) = message {
                 assert_eq!(at.get(), 1, "blocked on the limit the relay set");
-                control.write(&Message::MaxRequestId(VarInt::from_u32(3))).await;
+                control
+                    .write(&Message::MaxRequestId(VarInt::from_u32(3)))
+                    .await;
                 message = control.read().await;
             }
             let Message::Subscribe(request) = message else {
@@ -321,7 +340,11 @@ async fn a_client_at_the_request_limit_says_so_and_waits() {
         second
     };
     let (_second, (answered, unsubscribed)) = tokio::join!(client_side, relay_side);
-    assert_eq!(answered, vec![0, 2], "even IDs, the second after the limit rose");
+    assert_eq!(
+        answered,
+        vec![0, 2],
+        "even IDs, the second after the limit rose"
+    );
     assert!(matches!(
         unsubscribed,
         Message::Unsubscribe { request_id } if request_id.get() == 0
@@ -334,13 +357,19 @@ async fn a_client_at_the_request_limit_says_so_and_waits() {
 #[ignore = "needs the network and MOQOM_CF_DEMO_TOKEN"]
 async fn live_cloudflare_demo() {
     let token = std::env::var("MOQOM_CF_DEMO_TOKEN").expect("MOQOM_CF_DEMO_TOKEN is set");
-    let session = within("connecting to Cloudflare", Session::connect(DEMO_HOST, DEMO_PORT, &token))
-        .await
-        .expect("Cloudflare accepts the session");
+    let session = within(
+        "connecting to Cloudflare",
+        Session::connect(DEMO_HOST, DEMO_PORT, &token),
+    )
+    .await
+    .expect("Cloudflare accepts the session");
 
-    let mut init = within("subscribing to 0.mp4", session.subscribe(track("0.mp4"), None))
-        .await
-        .expect("Cloudflare accepts the subscription");
+    let mut init = within(
+        "subscribing to 0.mp4",
+        session.subscribe(track("0.mp4"), None),
+    )
+    .await
+    .expect("Cloudflare accepts the subscription");
     let mut media = within(
         "subscribing to 1.m4s",
         session.subscribe(track("1.m4s"), Some(Filter::LargestObject)),
@@ -359,7 +388,9 @@ async fn live_cloudflare_demo() {
         .expect("the subscription is live");
     eprintln!(
         "1.m4s: group {} object {}, {} bytes",
-        object.group, object.object, object.payload.len()
+        object.group,
+        object.object,
+        object.payload.len()
     );
     assert!(!object.payload.is_empty());
 

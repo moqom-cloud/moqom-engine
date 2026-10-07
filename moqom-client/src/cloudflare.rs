@@ -29,7 +29,7 @@ use std::time::Duration;
 use bytes::{Bytes, BytesMut};
 use moqom_proto::Draft;
 use moqom_proto::control::d16::{
-    ClientRequestIds, Filter, Message, TrackRequest, largest_object, setup_param,
+    ClientRequestIds, Message, TrackRequest, largest_object, setup_param,
 };
 use moqom_proto::control::{Parameter, Parameters, RequestId};
 use moqom_proto::data::{SubgroupContent, SubgroupHeader, SubgroupReader};
@@ -38,9 +38,11 @@ use moqom_proto::model::{FullTrackName, Location, TrackAlias};
 use moqom_proto::varint::VarInt;
 use tokio::sync::{Notify, mpsc, oneshot};
 
+pub use moqom_proto::control::d16::Filter;
+
 use crate::Error;
 use crate::properties::ObjectProperties;
-use crate::session::{IMPLEMENTATION, Object};
+use crate::session::{IMPLEMENTATION, Object, rejection};
 use crate::tls::install_crypto_provider;
 
 /// Cloudflare's draft-16 relay.
@@ -68,7 +70,7 @@ const INBOX_DEPTH: usize = 64;
 /// How a subscription ended, from `PUBLISH_DONE`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ended {
-    /// §13.4.3: 0x2 TRACK_ENDED, 0x3 SUBSCRIPTION_ENDED, 0x4 GOING_AWAY, ….
+    /// §13.4.3: 0x2 `TRACK_ENDED`, 0x3 `SUBSCRIPTION_ENDED`, 0x4 `GOING_AWAY`, ….
     pub status: u64,
     /// Data streams the relay opened for the subscription.
     pub stream_count: u64,
@@ -104,7 +106,9 @@ struct Shared {
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// A live draft-16 subscription. Dropping it sends `UNSUBSCRIBE`.
@@ -190,7 +194,9 @@ impl Session {
             }
             Ok(Some(other)) => {
                 connection.close(PROTOCOL_VIOLATION.into(), b"expected SERVER_SETUP");
-                return Err(Error::Setup(format!("expected SERVER_SETUP, got {other:?}")));
+                return Err(Error::Setup(format!(
+                    "expected SERVER_SETUP, got {other:?}"
+                )));
             }
             Ok(None) | Err(_) => return Err(crate::session::rejection(&connection).await),
         }
@@ -258,9 +264,7 @@ impl Session {
                 code: code.get(),
                 reason: reason.to_string(),
             }),
-            other => Err(Error::Protocol(format!(
-                "{other:?} in answer to SUBSCRIBE"
-            ))),
+            other => Err(Error::Protocol(format!("{other:?} in answer to SUBSCRIBE"))),
         }
     }
 
@@ -299,14 +303,26 @@ impl Session {
         }
     }
 
+    /// A failed write means the relay closed the session, which says why
+    /// more usefully than the write does: an unacceptable token is refused
+    /// by closing after `SERVER_SETUP`, so the first `SUBSCRIBE` is what fails.
     async fn send(&self, message: &Message) -> Result<(), Error> {
-        write(&mut *self.control.lock().await, message).await
+        match write(&mut *self.control.lock().await, message).await {
+            Err(_) => Err(rejection(&self.connection).await),
+            ok => ok,
+        }
     }
 
     fn fault(&self) -> Error {
         match lock(&self.shared.fault).clone() {
             Some(reason) => Error::Protocol(reason),
-            None => Error::Closed,
+            None => match self.connection.close_reason() {
+                Some(quinn::ConnectionError::ApplicationClosed(closed)) => Error::Rejected {
+                    code: closed.error_code.into_inner(),
+                    reason: String::from_utf8_lossy(&closed.reason).into_owned(),
+                },
+                _ => Error::Closed,
+            },
         }
     }
 }
@@ -362,14 +378,17 @@ fn client_setup(authority: &str, token: &str) -> Result<Parameters, Error> {
     parameters.push(
         Parameter::bytes(setup_param::PATH, Bytes::from(format!("/{token}"))).map_err(setup)?,
     );
-    parameters.push(Parameter::varint(setup_param::MAX_REQUEST_ID, VarInt::from_u32(0)).map_err(setup)?);
+    parameters
+        .push(Parameter::varint(setup_param::MAX_REQUEST_ID, VarInt::from_u32(0)).map_err(setup)?);
     parameters.push(
-        Parameter::bytes(setup_param::AUTHORITY, Bytes::copy_from_slice(authority.as_bytes()))
-            .map_err(setup)?,
+        Parameter::bytes(
+            setup_param::AUTHORITY,
+            Bytes::copy_from_slice(authority.as_bytes()),
+        )
+        .map_err(setup)?,
     );
-    parameters.push(
-        Parameter::bytes(setup_param::MOQT_IMPLEMENTATION, IMPLEMENTATION).map_err(setup)?,
-    );
+    parameters
+        .push(Parameter::bytes(setup_param::MOQT_IMPLEMENTATION, IMPLEMENTATION).map_err(setup)?);
     Ok(parameters)
 }
 
@@ -403,6 +422,10 @@ async fn read_message(
 
 /// Route control messages until the stream ends, closing the session on one
 /// this subset may not receive.
+/// How long an ended control stream waits for the connection close that
+/// normally explains it.
+const CLOSE_PATIENCE: Duration = Duration::from_secs(2);
+
 async fn read_control(
     connection: quinn::Connection,
     mut recv: quinn::RecvStream,
@@ -412,18 +435,29 @@ async fn read_control(
     let fault = loop {
         let message = match read_message(&mut recv, &mut buffer).await {
             Ok(Some(message)) => message,
-            Ok(None) => break "the relay closed the control stream".to_owned(),
+            // Usually because the connection is closing, whose code and
+            // reason [`Session::fault`] reports better than this would.
+            Ok(None) => {
+                if tokio::time::timeout(CLOSE_PATIENCE, connection.closed())
+                    .await
+                    .is_ok()
+                {
+                    break None;
+                }
+                connection.close(PROTOCOL_VIOLATION.into(), b"control stream ended");
+                break Some("the relay ended the control stream".to_owned());
+            }
             Err(e) => {
                 connection.close(PROTOCOL_VIOLATION.into(), b"undecodable control message");
-                break format!("undecodable control message: {e}");
+                break Some(format!("undecodable control message: {e}"));
             }
         };
         if let Err(violation) = route(&shared, message) {
             connection.close(PROTOCOL_VIOLATION.into(), violation.as_bytes());
-            break violation;
+            break Some(violation);
         }
     };
-    *lock(&shared.fault) = Some(fault);
+    *lock(&shared.fault) = fault;
     // Nothing more will be answered: fail every request still waiting, and
     // end every subscription.
     lock(&shared.pending).clear();
@@ -442,7 +476,9 @@ fn route(shared: &Shared, message: Message) -> Result<(), String> {
         | Message::RequestError { request_id, .. }
         | Message::RequestOk { request_id, .. } => {
             let Some(waiting) = lock(&shared.pending).remove(&request_id) else {
-                return Err(format!("an answer to request {request_id}, which is not open"));
+                return Err(format!(
+                    "an answer to request {request_id}, which is not open"
+                ));
             };
             let _ = waiting.send(message);
         }
@@ -464,10 +500,11 @@ fn route(shared: &Shared, message: Message) -> Result<(), String> {
                 },
             );
         }
-        // The relay is blocked on the limit of 0 we set, which is the point.
-        Message::RequestsBlocked(_) => {}
-        // GOAWAY: the relay is leaving. Subscriptions run until it does.
-        Message::Unsupported {
+        // REQUESTS_BLOCKED: the relay is blocked on the limit of 0 we set,
+        // which is the point. GOAWAY: the relay is leaving, and subscriptions
+        // run until it does.
+        Message::RequestsBlocked(_)
+        | Message::Unsupported {
             message_type: 0x10, ..
         } => {}
         other => return Err(format!("unexpected {other:?}")),
