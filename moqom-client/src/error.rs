@@ -114,6 +114,11 @@ pub enum Error {
     #[error("the relay presented no certificate, so a proof cannot be bound to it")]
     NoRelayIdentity,
 
+    /// The peer sent something the protocol does not allow at that point, and
+    /// the session was closed for it.
+    #[error("protocol violation: {0}")]
+    Protocol(String),
+
     /// The handshake completed without settling on a MOQT draft this client
     /// speaks.
     #[error("the peer did not negotiate moqt-22 or moqt-19")]

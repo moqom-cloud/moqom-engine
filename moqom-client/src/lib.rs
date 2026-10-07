@@ -14,6 +14,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod cloudflare;
 pub mod device;
 pub mod direct;
 mod error;
