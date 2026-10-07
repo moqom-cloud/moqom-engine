@@ -1120,10 +1120,7 @@ fn spawn_live(
             }
             let mut line = format!("live         t+{}s", began.elapsed().as_secs());
             if let Some(progress) = &progress {
-                line.push_str(&format!(
-                    "  objects={}",
-                    progress.load(Ordering::Relaxed)
-                ));
+                line.push_str(&format!("  objects={}", progress.load(Ordering::Relaxed)));
             }
             if let Some(addr) = &metrics {
                 match Reading::take(addr).await {
@@ -1131,9 +1128,7 @@ fn spawn_live(
                         let sess = reading.get("moqom_relay_sessions");
                         let shed = previous.as_ref().map_or_else(
                             || reading.get("moqom_relay_subgroups_shed_total"),
-                            |before| {
-                                before.growth(&reading, "moqom_relay_subgroups_shed_total")
-                            },
+                            |before| before.growth(&reading, "moqom_relay_subgroups_shed_total"),
                         );
                         let dt = previous_at.elapsed().as_secs_f64().max(0.001);
                         let gbit = previous.as_ref().map_or(0.0, |before| {

@@ -139,7 +139,11 @@ fn address(value: &[u8], xor: Option<[u8; 12]>) -> Option<SocketAddr> {
 ///
 /// # Errors
 /// No answer within `patience`, or the socket refusing.
-pub fn reflexive(socket: &UdpSocket, server: SocketAddr, patience: Duration) -> io::Result<SocketAddr> {
+pub fn reflexive(
+    socket: &UdpSocket,
+    server: SocketAddr,
+    patience: Duration,
+) -> io::Result<SocketAddr> {
     let mut transaction = [0u8; 12];
     SystemRandom::new()
         .fill(&mut transaction)

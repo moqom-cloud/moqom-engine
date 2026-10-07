@@ -38,10 +38,10 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use super::punch::Puncher;
 use super::verify::admissible;
 use super::{CandidateOffer, Eligibility, IpExposure, PeerCredentials, PeerVerifier, VerifiedPeer};
+use crate::Error;
 use crate::device::{Credentials, certificate_identity};
 use crate::session::{Frames, IMPLEMENTATION, Session, placeholder_url, relay_identity, write};
 use crate::tls::install_crypto_provider;
-use crate::Error;
 
 /// The name in each endpoint's certificate. Nothing checks it -- both sides pin
 /// the certificate itself -- but TLS needs a server name to send.
@@ -160,11 +160,11 @@ impl DirectEndpoint {
             }
         }
 
-        let generated = rcgen::generate_simple_self_signed(vec![SERVER_NAME.to_owned()])
-            .map_err(Error::tls)?;
+        let generated =
+            rcgen::generate_simple_self_signed(vec![SERVER_NAME.to_owned()]).map_err(Error::tls)?;
         let certificate = generated.cert.der().clone();
-        let key = PrivateKeyDer::try_from(generated.signing_key.serialize_der())
-            .map_err(Error::tls)?;
+        let key =
+            PrivateKeyDer::try_from(generated.signing_key.serialize_der()).map_err(Error::tls)?;
         let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, certificate.as_ref());
         let mut fingerprint = [0u8; 32];
         fingerprint.copy_from_slice(digest.as_ref());
@@ -173,7 +173,8 @@ impl DirectEndpoint {
         let probes = socket.try_clone()?;
         let runtime = quinn::default_runtime()
             .ok_or_else(|| Error::Io(std::io::Error::other("no async runtime")))?;
-        let endpoint = quinn::Endpoint::new(quinn::EndpointConfig::default(), None, socket, runtime)?;
+        let endpoint =
+            quinn::Endpoint::new(quinn::EndpointConfig::default(), None, socket, runtime)?;
 
         Ok(Self {
             config,
@@ -369,8 +370,7 @@ impl DirectEndpoint {
             .with_single_cert(vec![self.certificate.clone()], self.key.clone_key())
             .map_err(Error::tls)?;
         tls.alpn_protocols = vec![moqom_transport::alpn::MOQT_DRAFT_19.to_vec()];
-        let crypto =
-            quinn::crypto::rustls::QuicServerConfig::try_from(tls).map_err(Error::tls)?;
+        let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls).map_err(Error::tls)?;
         let mut server = quinn::ServerConfig::with_crypto(Arc::new(crypto));
         server.transport_config(self.transport());
         self.endpoint.set_server_config(Some(server));
@@ -512,7 +512,10 @@ fn host_candidates(socket: &UdpSocket) -> std::io::Result<Vec<SocketAddr>> {
         candidates.push(SocketAddr::new(local.ip(), bound.port()));
     }
     if candidates.is_empty() {
-        candidates.push(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), bound.port()));
+        candidates.push(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            bound.port(),
+        ));
     }
     Ok(candidates)
 }
@@ -572,7 +575,9 @@ impl rustls::client::danger::ServerCertVerifier for Pinned {
         _cert: &CertificateDer<'_>,
         _dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Err(rustls::Error::General("TLS 1.2 is not used over QUIC".into()))
+        Err(rustls::Error::General(
+            "TLS 1.2 is not used over QUIC".into(),
+        ))
     }
 
     fn verify_tls13_signature(
@@ -610,7 +615,9 @@ impl rustls::server::danger::ClientCertVerifier for Pinned {
         _cert: &CertificateDer<'_>,
         _dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Err(rustls::Error::General("TLS 1.2 is not used over QUIC".into()))
+        Err(rustls::Error::General(
+            "TLS 1.2 is not used over QUIC".into(),
+        ))
     }
 
     fn verify_tls13_signature(

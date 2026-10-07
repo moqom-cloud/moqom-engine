@@ -257,7 +257,9 @@ async fn a_paused_subscription_is_not_forwarded_until_resumed() {
     );
     let mut subscription = subscription.expect("the relay accepts the subscription");
 
-    publisher.publish_group(upstream, GroupId::ZERO, &[b"before"]).await;
+    publisher
+        .publish_group(upstream, GroupId::ZERO, &[b"before"])
+        .await;
     let (_header, payloads) = subscriber.read_subgroup().await;
     assert_eq!(payloads, vec![bytes::Bytes::from_static(b"before")]);
 
@@ -272,7 +274,10 @@ async fn a_paused_subscription_is_not_forwarded_until_resumed() {
         subscriber.read_subgroup(),
     )
     .await;
-    assert!(quiet.is_err(), "a paused subscription must not be forwarded");
+    assert!(
+        quiet.is_err(),
+        "a paused subscription must not be forwarded"
+    );
 
     subscription.forward(true).await;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;

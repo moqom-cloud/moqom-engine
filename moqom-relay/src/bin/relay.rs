@@ -665,13 +665,18 @@ fn authenticator() -> Result<Authenticator, Box<dyn std::error::Error>> {
         let verifies =
             env_path("MOQOM_RELAY_JWKS").is_some() || env("MOQOM_CONTROL_ENDPOINT").is_some();
         let allowed = matches!(
-            env("MOQOM_RELAY_ALLOW_ANY_ISSUER").as_deref().map(str::to_ascii_lowercase).as_deref(),
+            env("MOQOM_RELAY_ALLOW_ANY_ISSUER")
+                .as_deref()
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
             Some("1" | "true" | "yes")
         );
         if verifies && !allowed {
-            return Err("MOQOM_RELAY_ISSUER is unset; a relay that verifies tokens pins their \
+            return Err(
+                "MOQOM_RELAY_ISSUER is unset; a relay that verifies tokens pins their \
                         issuer by default. Set it, or set MOQOM_RELAY_ALLOW_ANY_ISSUER=true"
-                .into());
+                    .into(),
+            );
         }
         tracing::warn!("no MOQOM_RELAY_ISSUER, so tokens from any issuer are accepted");
     }
@@ -815,16 +820,27 @@ fn admin_guard() -> Result<(Guard, Option<Arc<rustls::ServerConfig>>), Box<dyn s
         None => false,
         Some("probes-only") => true,
         Some(other) => {
-            return Err(format!("MOQOM_RELAY_ADMIN_AUTH must be probes-only or unset, not {other:?}").into());
+            return Err(format!(
+                "MOQOM_RELAY_ADMIN_AUTH must be probes-only or unset, not {other:?}"
+            )
+            .into());
         }
     };
     let token = env_path("MOQOM_RELAY_ADMIN_TOKEN_FILE");
     let client_ca = env_path("MOQOM_RELAY_ADMIN_CLIENT_CA");
 
-    let mut guard = if probes_only { Guard::probes_only() } else { Guard::open() };
+    let mut guard = if probes_only {
+        Guard::probes_only()
+    } else {
+        Guard::open()
+    };
     if let Some(path) = &token {
-        let secret = std::fs::read_to_string(path)
-            .map_err(|e| format!("reading MOQOM_RELAY_ADMIN_TOKEN_FILE {}: {e}", path.display()))?;
+        let secret = std::fs::read_to_string(path).map_err(|e| {
+            format!(
+                "reading MOQOM_RELAY_ADMIN_TOKEN_FILE {}: {e}",
+                path.display()
+            )
+        })?;
         guard = guard
             .with_bearer(&secret)
             .map_err(|e| format!("MOQOM_RELAY_ADMIN_TOKEN_FILE {}: {e}", path.display()))?;
@@ -840,14 +856,22 @@ fn admin_guard() -> Result<(Guard, Option<Arc<rustls::ServerConfig>>), Box<dyn s
                         MOQOM_RELAY_ADMIN_CERT and MOQOM_RELAY_ADMIN_KEY, or MOQOM_RELAY_CERT and MOQOM_RELAY_KEY"
                 .into());
         };
-        let read = |path: &PathBuf| std::fs::read(path).map_err(|e| format!("reading {}: {e}", path.display()));
-        tls = Some(moqom_relay::admin_auth::tls_config(&read(&cert)?, &read(&key)?, &read(ca)?)?);
+        let read = |path: &PathBuf| {
+            std::fs::read(path).map_err(|e| format!("reading {}: {e}", path.display()))
+        };
+        tls = Some(moqom_relay::admin_auth::tls_config(
+            &read(&cert)?,
+            &read(&key)?,
+            &read(ca)?,
+        )?);
     }
 
     if token.is_some() && tls.is_none() {
         // Worth saying, not worth refusing: on a VPC the alternative to a token
         // in the clear is usually no token at all.
-        tracing::warn!("the admin token travels in plaintext; set MOQOM_RELAY_ADMIN_CLIENT_CA for TLS");
+        tracing::warn!(
+            "the admin token travels in plaintext; set MOQOM_RELAY_ADMIN_CLIENT_CA for TLS"
+        );
     }
     Ok((guard, tls))
 }

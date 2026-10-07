@@ -810,7 +810,10 @@ async fn fill(recv: &mut RecvStream, buffer: &mut BytesMut) -> Result<bool, Erro
     }
 }
 
-pub(crate) async fn write<M: MessageBody>(stream: &mut SendStream, message: &M) -> Result<(), Error> {
+pub(crate) async fn write<M: MessageBody>(
+    stream: &mut SendStream,
+    message: &M,
+) -> Result<(), Error> {
     let mut buf = BytesMut::new();
     write_message(&mut buf, message)?;
     stream.write_all(&buf).await.map_err(Error::write)

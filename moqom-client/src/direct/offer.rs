@@ -135,7 +135,8 @@ impl CandidateOffer {
             return Err(Error::Offer("truncated"));
         }
         let (nonce, ciphertext) = rest.split_at(NONCE_LEN);
-        let nonce = Nonce::try_assume_unique_for_key(nonce).map_err(|_| Error::Offer("truncated"))?;
+        let nonce =
+            Nonce::try_assume_unique_for_key(nonce).map_err(|_| Error::Offer("truncated"))?;
         let mut buffer = ciphertext.to_vec();
         let plain = secret
             .key
@@ -292,7 +293,9 @@ mod tests {
     #[test]
     fn an_offer_sealed_with_a_known_nonce_matches_the_shared_vector() {
         let secret = RoomSecret::new(&[1u8; 32], "acme/room-42").expect("secret");
-        let sealed = offer().seal_with(&secret, [3u8; NONCE_LEN]).expect("sealed");
+        let sealed = offer()
+            .seal_with(&secret, [3u8; NONCE_LEN])
+            .expect("sealed");
         let hex = sealed.iter().fold(String::new(), |mut hex, byte| {
             use std::fmt::Write as _;
             let _ = write!(hex, "{byte:02x}");

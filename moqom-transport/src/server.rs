@@ -153,12 +153,7 @@ impl Server {
         let port = first.local_addr()?;
         let mut servers = vec![first];
         for _ in 1..shards.get() {
-            servers.push(Self::new(Self::endpoint(
-                port,
-                config.clone(),
-                dscp,
-                true,
-            )?));
+            servers.push(Self::new(Self::endpoint(port, config.clone(), dscp, true)?));
         }
         Ok(servers)
     }

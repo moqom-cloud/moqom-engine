@@ -504,7 +504,10 @@ impl Surface {
                 self.answer(tls, guard, certified).await
             }
             Ok(Err(e)) => Err(e),
-            Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "handshake timed out")),
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "handshake timed out",
+            )),
         }
     }
 
@@ -531,7 +534,10 @@ impl Surface {
                     }
                     Verdict::Forbidden => {
                         tracing::info!(method, target, "admin request refused");
-                        Response::text(403, "not available on this listener without a client certificate\n")
+                        Response::text(
+                            403,
+                            "not available on this listener without a client certificate\n",
+                        )
                     }
                 }
             }
@@ -1013,7 +1019,10 @@ mod tests {
         let addr = listener.local_addr().expect("addr");
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
-            surface.answer(stream, &Guard::open(), false).await.expect("answered");
+            surface
+                .answer(stream, &Guard::open(), false)
+                .await
+                .expect("answered");
         });
 
         let mut client = TcpStream::connect(addr).await.expect("connect");
@@ -1093,11 +1102,18 @@ mod tests {
         assert!(probe.starts_with("HTTP/1.1 200 OK"), "{probe}");
 
         let refused = ask(guard(), "GET /sessions HTTP/1.1\r\n\r\n").await;
-        assert!(refused.starts_with("HTTP/1.1 401 Unauthorized"), "{refused}");
+        assert!(
+            refused.starts_with("HTTP/1.1 401 Unauthorized"),
+            "{refused}"
+        );
         assert!(refused.contains("www-authenticate: Bearer"), "{refused}");
         assert!(!refused.contains("\"sessions\""), "{refused}");
 
-        let wrong = ask(guard(), "GET /sessions HTTP/1.1\r\nAuthorization: Bearer nope\r\n\r\n").await;
+        let wrong = ask(
+            guard(),
+            "GET /sessions HTTP/1.1\r\nAuthorization: Bearer nope\r\n\r\n",
+        )
+        .await;
         assert!(wrong.starts_with("HTTP/1.1 401"), "{wrong}");
 
         let admitted = ask(
@@ -1192,12 +1208,20 @@ mod tests {
         ca_pem: String,
         server_pem: String,
         server_key_pem: String,
-        client: (rustls::pki_types::CertificateDer<'static>, rustls::pki_types::PrivateKeyDer<'static>),
+        client: (
+            rustls::pki_types::CertificateDer<'static>,
+            rustls::pki_types::PrivateKeyDer<'static>,
+        ),
         server_ca: rustls::pki_types::CertificateDer<'static>,
     }
 
     impl Pki {
-        fn operator(&self) -> (rustls::pki_types::CertificateDer<'static>, rustls::pki_types::PrivateKeyDer<'static>) {
+        fn operator(
+            &self,
+        ) -> (
+            rustls::pki_types::CertificateDer<'static>,
+            rustls::pki_types::PrivateKeyDer<'static>,
+        ) {
             (self.client.0.clone(), self.client.1.clone_key())
         }
     }
@@ -1227,7 +1251,8 @@ mod tests {
             server_key_pem: server_key.serialize_pem(),
             client: (
                 client.der().clone(),
-                rustls::pki_types::PrivateKeyDer::try_from(client_key.serialize_der()).expect("key"),
+                rustls::pki_types::PrivateKeyDer::try_from(client_key.serialize_der())
+                    .expect("key"),
             ),
             server_ca: ca.der().clone(),
         }
@@ -1238,7 +1263,10 @@ mod tests {
     async fn ask_tls(
         pki: &Pki,
         operator_ca_pem: &str,
-        identity: Option<(rustls::pki_types::CertificateDer<'static>, rustls::pki_types::PrivateKeyDer<'static>)>,
+        identity: Option<(
+            rustls::pki_types::CertificateDer<'static>,
+            rustls::pki_types::PrivateKeyDer<'static>,
+        )>,
         path: &str,
     ) -> io::Result<String> {
         let server_tls = crate::admin_auth::tls_config(
@@ -1266,14 +1294,17 @@ mod tests {
             .expect("versions")
             .with_root_certificates(roots);
         let client_tls = match identity {
-            Some((cert, key)) => builder.with_client_auth_cert(vec![cert], key).expect("identity"),
+            Some((cert, key)) => builder
+                .with_client_auth_cert(vec![cert], key)
+                .expect("identity"),
             None => builder.with_no_client_auth(),
         };
         let connector = tokio_rustls::TlsConnector::from(Arc::new(client_tls));
         let tcp = TcpStream::connect(addr).await?;
         let name = rustls::pki_types::ServerName::try_from("relay-admin").expect("name");
         let mut tls = connector.connect(name, tcp).await?;
-        tls.write_all(format!("GET {path} HTTP/1.1\r\n\r\n").as_bytes()).await?;
+        tls.write_all(format!("GET {path} HTTP/1.1\r\n\r\n").as_bytes())
+            .await?;
         let mut response = String::new();
         tls.read_to_string(&mut response).await?;
         Ok(response)
@@ -1291,9 +1322,13 @@ mod tests {
     #[tokio::test]
     async fn mutual_tls_without_a_certificate_reaches_only_the_probes() {
         let pki = pki();
-        let refused = ask_tls(&pki, &pki.ca_pem, None, "/sessions").await.expect("answered");
+        let refused = ask_tls(&pki, &pki.ca_pem, None, "/sessions")
+            .await
+            .expect("answered");
         assert!(refused.starts_with("HTTP/1.1 403"), "{refused}");
-        let probe = ask_tls(&pki, &pki.ca_pem, None, "/healthz").await.expect("answered");
+        let probe = ask_tls(&pki, &pki.ca_pem, None, "/healthz")
+            .await
+            .expect("answered");
         assert!(probe.starts_with("HTTP/1.1 200 OK"), "{probe}");
     }
 

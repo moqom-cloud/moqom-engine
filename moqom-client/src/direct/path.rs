@@ -28,8 +28,8 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
-use crate::session::{Object, Subscription};
 use crate::Error;
+use crate::session::{Object, Subscription};
 
 /// Which path an object arrived over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

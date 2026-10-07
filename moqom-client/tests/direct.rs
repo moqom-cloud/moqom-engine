@@ -18,8 +18,8 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bytes::Bytes;
 use moqom_client::direct::{
-    CandidateOffer, DirectConfig, DirectEndpoint, DualSubscription, Eligibility, IpExposure,
-    Path, PathSettings, PeerCredentials, RoomSecret, VerifiedPeer,
+    CandidateOffer, DirectConfig, DirectEndpoint, DualSubscription, Eligibility, IpExposure, Path,
+    PathSettings, PeerCredentials, RoomSecret, VerifiedPeer,
 };
 use moqom_client::{
     Announcement, Credentials, DeviceKey, Error, FullTrackName, Session, Subscription,
@@ -85,7 +85,11 @@ fn token(user: &str, room: &str, key: &DeviceKey, publish: u32) -> Vec<u8> {
         URL_SAFE_NO_PAD.encode(claims.to_string())
     );
     let signature = signer().sign(signing_input.as_bytes());
-    format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(signature.as_ref())).into_bytes()
+    format!(
+        "{signing_input}.{}",
+        URL_SAFE_NO_PAD.encode(signature.as_ref())
+    )
+    .into_bytes()
 }
 
 /// `user/device`, with the device derived from the key the way the relay does.
@@ -165,8 +169,16 @@ fn install_provider() {
 /// relay on the room's track.
 fn exchange(ada: &Device, bob: &Device) -> (CandidateOffer, CandidateOffer) {
     let secret = RoomSecret::new(&[5u8; 32], &format!("{TENANT}/{ROOM}")).expect("a secret");
-    let from_ada = ada.endpoint.offer_to(&bob.me).seal(&secret).expect("sealed");
-    let from_bob = bob.endpoint.offer_to(&ada.me).seal(&secret).expect("sealed");
+    let from_ada = ada
+        .endpoint
+        .offer_to(&bob.me)
+        .seal(&secret)
+        .expect("sealed");
+    let from_bob = bob
+        .endpoint
+        .offer_to(&ada.me)
+        .seal(&secret)
+        .expect("sealed");
     (
         CandidateOffer::open(&from_bob, &secret, &ada.me).expect("ada opens bob's offer"),
         CandidateOffer::open(&from_ada, &secret, &bob.me).expect("bob opens ada's offer"),
@@ -195,8 +207,14 @@ async fn two_devices_admit_each_other_and_exchange_media_directly() {
     let (mut ada_session, bob_seen_by_ada) = at_ada.expect("ada admits bob");
     let (mut bob_session, ada_seen_by_bob) = at_bob.expect("bob admits ada");
 
-    assert_eq!(format!("{}/{}", bob_seen_by_ada.user, bob_seen_by_ada.device), bob.me);
-    assert_eq!(format!("{}/{}", ada_seen_by_bob.user, ada_seen_by_bob.device), ada.me);
+    assert_eq!(
+        format!("{}/{}", bob_seen_by_ada.user, bob_seen_by_ada.device),
+        bob.me
+    );
+    assert_eq!(
+        format!("{}/{}", ada_seen_by_bob.user, ada_seen_by_bob.device),
+        ada.me
+    );
     assert_eq!(ada_seen_by_bob.room.as_deref(), Some(ROOM));
 
     let (namespace, track) = track();
@@ -243,12 +261,18 @@ async fn a_viewer_is_refused_a_direct_path() {
     .await;
     match at_ada {
         Err(Error::PeerUnverified(reason)) => {
-            assert!(reason.contains("viewers never use direct paths"), "{reason}");
+            assert!(
+                reason.contains("viewers never use direct paths"),
+                "{reason}"
+            );
         }
         Err(other) => panic!("refused for the wrong reason: {other}"),
         Ok(_) => panic!("a viewer was admitted to a direct path"),
     }
-    assert!(at_viewer.is_err(), "the viewer believes it has a direct path");
+    assert!(
+        at_viewer.is_err(),
+        "the viewer believes it has a direct path"
+    );
 }
 
 /// A token for another room is refused even though it verifies.
@@ -284,8 +308,14 @@ async fn a_peer_presenting_another_certificate_is_never_reached() {
         tokio::join!(ada.establish(&for_ada), bob.establish(&for_bob))
     })
     .await;
-    assert!(at_ada.is_err(), "ada connected to a certificate it was not offered");
-    assert!(at_bob.is_err(), "bob connected to a peer that refused its certificate");
+    assert!(
+        at_ada.is_err(),
+        "ada connected to a certificate it was not offered"
+    );
+    assert!(
+        at_bob.is_err(),
+        "bob connected to a peer that refused its certificate"
+    );
 }
 
 /// Refused before the network is touched, for each rule.
@@ -324,8 +354,11 @@ impl Relay {
             .with_no_client_auth()
             .with_single_cert(vec![certificate.clone()], key)
             .expect("certificate and key agree");
-        let server = Server::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), with_moqt_alpn(tls))
-            .expect("binding a loopback port");
+        let server = Server::bind(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            with_moqt_alpn(tls),
+        )
+        .expect("binding a loopback port");
         let addr = server.local_addr().expect("bound address");
         let fabric = Fabric::with_cache(Cache::new(Limits::default()));
         let accept = tokio::spawn({
@@ -429,7 +462,11 @@ async fn a_dual_subscription_moves_to_the_direct_path_and_falls_back_to_the_rela
         },
     );
     dual.attach_direct(direct_subscription);
-    assert_eq!(dual.path(), Path::Relay, "a new direct path starts on probation");
+    assert_eq!(
+        dual.path(),
+        Path::Relay,
+        "a new direct path starts on probation"
+    );
 
     // Group 0 on both paths, direct first.
     within(
@@ -473,7 +510,11 @@ async fn a_dual_subscription_moves_to_the_direct_path_and_falls_back_to_the_rela
         .await
         .expect("no relay failure")
         .expect("not ended");
-    assert_eq!(&recovered.object.payload[..], b"g1-a", "the relay's group 0 is not repeated");
+    assert_eq!(
+        &recovered.object.payload[..],
+        b"g1-a",
+        "the relay's group 0 is not repeated"
+    );
     assert_eq!(recovered.path, Path::Relay);
     assert_eq!(dual.path(), Path::Relay);
     assert!(!dual.has_direct());

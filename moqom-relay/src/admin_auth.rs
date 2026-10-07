@@ -182,7 +182,12 @@ impl Guard {
     /// certificate that failed verification never gets this far: the handshake
     /// refuses it.
     #[must_use]
-    pub fn judge(&self, path: &str, authorization: Option<&str>, client_certificate: bool) -> Verdict {
+    pub fn judge(
+        &self,
+        path: &str,
+        authorization: Option<&str>,
+        client_certificate: bool,
+    ) -> Verdict {
         if is_probe(path) {
             return Verdict::Allow;
         }
@@ -268,7 +273,9 @@ pub fn tls_config(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| tls(&e))?;
     if certs.is_empty() {
-        return Err(GuardError::Tls("no certificate in the admin certificate file".into()));
+        return Err(GuardError::Tls(
+            "no certificate in the admin certificate file".into(),
+        ));
     }
     let key = rustls_pemfile::private_key(&mut &server_key_pem[..])
         .map_err(|e| tls(&e))?
@@ -276,10 +283,14 @@ pub fn tls_config(
 
     let mut roots = rustls::RootCertStore::empty();
     for certificate in rustls_pemfile::certs(&mut &client_ca_pem[..]) {
-        roots.add(certificate.map_err(|e| tls(&e))?).map_err(|e| tls(&e))?;
+        roots
+            .add(certificate.map_err(|e| tls(&e))?)
+            .map_err(|e| tls(&e))?;
     }
     if roots.is_empty() {
-        return Err(GuardError::Tls("the operator authority file holds no certificates".into()));
+        return Err(GuardError::Tls(
+            "the operator authority file holds no certificates".into(),
+        ));
     }
 
     // Explicit provider, as everywhere else in the relay: more than one is
@@ -320,7 +331,12 @@ mod tests {
         assert!(open.permits_bind(addr("[::1]:9090")).is_ok());
         assert!(open.permits_bind(addr("[::ffff:127.0.0.1]:9090")).is_ok());
 
-        for refused in ["0.0.0.0:9090", "[::]:9090", "10.0.0.4:9090", "[::ffff:10.0.0.4]:9090"] {
+        for refused in [
+            "0.0.0.0:9090",
+            "[::]:9090",
+            "10.0.0.4:9090",
+            "[::ffff:10.0.0.4]:9090",
+        ] {
             assert_eq!(
                 open.permits_bind(addr(refused)),
                 Err(GuardError::OpenOnNetwork(addr(refused))),
@@ -333,7 +349,13 @@ mod tests {
     fn any_configured_mechanism_permits_a_network_bind() {
         let everywhere = addr("0.0.0.0:9090");
         assert!(Guard::probes_only().permits_bind(everywhere).is_ok());
-        assert!(Guard::open().with_bearer(TOKEN).unwrap().permits_bind(everywhere).is_ok());
+        assert!(
+            Guard::open()
+                .with_bearer(TOKEN)
+                .unwrap()
+                .permits_bind(everywhere)
+                .is_ok()
+        );
         assert!(
             Guard::open()
                 .with_client_certificates()
@@ -345,9 +367,14 @@ mod tests {
 
     #[test]
     fn a_short_token_is_refused() {
-        assert_eq!(Guard::open().with_bearer("hunter2").unwrap_err(), GuardError::WeakToken(7));
         assert_eq!(
-            Guard::open().with_bearer(&format!("  {}\n", &TOKEN[..31])).unwrap_err(),
+            Guard::open().with_bearer("hunter2").unwrap_err(),
+            GuardError::WeakToken(7)
+        );
+        assert_eq!(
+            Guard::open()
+                .with_bearer(&format!("  {}\n", &TOKEN[..31]))
+                .unwrap_err(),
             GuardError::WeakToken(31),
             "whitespace does not count towards the length"
         );
@@ -375,22 +402,41 @@ mod tests {
         for probe in ["/healthz", "/readyz", "/readyz?verbose"] {
             assert_eq!(guard.judge(probe, None, false), Verdict::Allow, "{probe}");
         }
-        assert_eq!(Guard::probes_only().judge("/healthz", None, false), Verdict::Allow);
+        assert_eq!(
+            Guard::probes_only().judge("/healthz", None, false),
+            Verdict::Allow
+        );
     }
 
     #[test]
     fn probes_only_refuses_everything_else() {
         let guard = Guard::probes_only();
-        for path in ["/metrics", "/sessions", "/rooms", "/tracks", "/", "/healthz/../sessions"] {
-            assert_eq!(guard.judge(path, Some(&format!("Bearer {TOKEN}")), true), Verdict::Forbidden);
+        for path in [
+            "/metrics",
+            "/sessions",
+            "/rooms",
+            "/tracks",
+            "/",
+            "/healthz/../sessions",
+        ] {
+            assert_eq!(
+                guard.judge(path, Some(&format!("Bearer {TOKEN}")), true),
+                Verdict::Forbidden
+            );
         }
     }
 
     #[test]
     fn the_bearer_token_is_checked() {
         let guard = Guard::open().with_bearer(TOKEN).unwrap();
-        assert_eq!(guard.judge("/sessions", None, false), Verdict::Unauthenticated);
-        assert_eq!(guard.judge("/sessions", Some("Bearer wrong"), false), Verdict::Unauthenticated);
+        assert_eq!(
+            guard.judge("/sessions", None, false),
+            Verdict::Unauthenticated
+        );
+        assert_eq!(
+            guard.judge("/sessions", Some("Bearer wrong"), false),
+            Verdict::Unauthenticated
+        );
         assert_eq!(
             guard.judge("/sessions", Some(&format!("Bearer {TOKEN}x")), false),
             Verdict::Unauthenticated,
@@ -400,8 +446,14 @@ mod tests {
             guard.judge("/sessions", Some(&format!("Basic {TOKEN}")), false),
             Verdict::Unauthenticated
         );
-        assert_eq!(guard.judge("/sessions", Some(&format!("Bearer {TOKEN}")), false), Verdict::Allow);
-        assert_eq!(guard.judge("/metrics", Some(&format!("bearer  {TOKEN} ")), false), Verdict::Allow);
+        assert_eq!(
+            guard.judge("/sessions", Some(&format!("Bearer {TOKEN}")), false),
+            Verdict::Allow
+        );
+        assert_eq!(
+            guard.judge("/metrics", Some(&format!("bearer  {TOKEN} ")), false),
+            Verdict::Allow
+        );
     }
 
     #[test]
@@ -419,7 +471,10 @@ mod tests {
             .with_client_certificates()
             .unwrap();
         let header = format!("Bearer {TOKEN}");
-        assert_eq!(guard.judge("/rooms", Some(&header), false), Verdict::Forbidden);
+        assert_eq!(
+            guard.judge("/rooms", Some(&header), false),
+            Verdict::Forbidden
+        );
         assert_eq!(guard.judge("/rooms", None, true), Verdict::Unauthenticated);
         assert_eq!(guard.judge("/rooms", Some(&header), true), Verdict::Allow);
     }
