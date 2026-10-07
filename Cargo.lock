@@ -1061,6 +1061,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "moqom-direct-ffi"
+version = "0.0.0"
+dependencies = [
+ "aws-lc-rs",
+ "moqom-client",
+ "quinn",
+ "rustls",
+ "tokio",
+]
+
+[[package]]
 name = "moqom-loadgen"
 version = "0.0.0"
 dependencies = [

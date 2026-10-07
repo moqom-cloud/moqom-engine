@@ -1,0 +1,33 @@
+[package]
+name = "moqom-direct-ffi"
+description = "C ABI for the direct-path socket in moqom-client, for the Swift SDK"
+version = "0.0.0"
+# Apache-2.0 as moqom-client, since this ships as one library with it.
+license = "Apache-2.0"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+# `staticlib` is what an iOS target links, and what `build-apple.sh` assembles
+# into an xcframework. `cdylib` covers a desktop host. `rlib` keeps the crate
+# testable from cargo, which matters because the boundary is where the unsafe
+# lives and it needs tests of its own.
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+moqom-client = { path = "../moqom-client" }
+# Already what moqom-client is built on; named here for the handles' types and
+# for hashing the peer's certificate.
+aws-lc-rs = { workspace = true }
+quinn = { workspace = true }
+rustls = { workspace = true }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net", "sync", "time", "macros"] }
+
+[dev-dependencies]
+aws-lc-rs = { workspace = true }
+
+[lints]
+workspace = true

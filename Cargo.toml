@@ -4,6 +4,7 @@ members = [
     "moqom-proto",
     "moqom-rans",
     "moqom-rans-ffi",
+    "moqom-direct-ffi",
     "moqom-relay",
     "moqom-transport",
     "moqom-client",
