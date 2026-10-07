@@ -609,7 +609,9 @@ unsafe fn socket_config(config: *const MoqomDirectEndpointConfig) -> Result<Sock
         ));
     }
     let mut socket = SocketConfig::new(alpn.as_bytes());
-    socket.bind = SocketAddr::from((Ipv4Addr::UNSPECIFIED, config.port));
+    // Both families on one port where the platform allows it; see
+    // `SocketConfig::bind`.
+    socket.bind = SocketAddr::from((Ipv6Addr::UNSPECIFIED, config.port));
     socket.idle_timeout = duration(config.idle_timeout_ms, "idle_timeout_ms")?;
     socket.datagrams = config.datagrams != 0;
     if let Some(host) = unsafe { str_from(config.stun_host) }? {

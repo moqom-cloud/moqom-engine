@@ -19,6 +19,15 @@
 //! 3. The socket itself is handed to quinn, which from then on owns every
 //!    datagram that arrives on it.
 //!
+//! # Both address families, one port
+//!
+//! The default bind is `[::]` with `IPV6_V6ONLY` off: one dual-stack socket,
+//! so IPv4 and IPv6 share the port and everything above still holds for both.
+//! IPv4 peers are reached through their IPv4-mapped addresses, which quinn
+//! does on its own and the probes and STUN do here. Where the platform will not
+//! make a dual-stack socket, or has no IPv6 at all, the socket is IPv4 alone,
+//! which is what it always was.
+//!
 //! # Pinned, mutual TLS
 //!
 //! Each socket generates an ephemeral self-signed certificate. A peer learns
@@ -27,7 +36,7 @@
 //! nothing else is trusted, and no certificate authority is involved.
 
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -48,9 +57,10 @@ pub enum StunServer {
     Address(SocketAddr),
     /// A name, resolved through the system resolver when the socket is bound.
     ///
-    /// The first address of the socket's own family is used: an IPv4 socket
-    /// cannot send to an IPv6 server, and asking from a different socket would
-    /// learn a mapping nobody uses.
+    /// The first address of each family the socket can use is asked: a
+    /// dual-stack socket learns its public IPv4 and IPv6 addresses together,
+    /// and an IPv4 socket asks only the IPv4 one. Asking from a different
+    /// socket would learn a mapping nobody uses.
     Name {
         /// The host name, or an address literal.
         host: String,
@@ -60,27 +70,102 @@ pub enum StunServer {
 }
 
 impl StunServer {
-    /// The address to send to from a socket bound at `local`.
-    fn resolve(&self, local: SocketAddr) -> io::Result<SocketAddr> {
+    /// The addresses to ask from a socket of `stack`.
+    fn resolve(&self, stack: Stack) -> io::Result<Vec<SocketAddr>> {
         match self {
-            Self::Address(address) => Ok(*address),
-            Self::Name { host, port } => (host.as_str(), *port)
-                .to_socket_addrs()?
-                .find(|address| address.is_ipv4() == local.is_ipv4())
-                .ok_or_else(|| {
-                    io::Error::new(
+            Self::Address(address) => Ok(vec![*address]),
+            Self::Name { host, port } => {
+                let resolved: Vec<SocketAddr> = (host.as_str(), *port).to_socket_addrs()?.collect();
+                let servers = pick_servers(&resolved, stack);
+                if servers.is_empty() {
+                    return Err(io::Error::new(
                         io::ErrorKind::NotFound,
                         "the STUN server has no address of this socket's family",
-                    )
-                }),
+                    ));
+                }
+                Ok(servers)
+            }
         }
+    }
+}
+
+/// The first resolved address of each family `stack` reaches, IPv4 first.
+fn pick_servers(resolved: &[SocketAddr], stack: Stack) -> Vec<SocketAddr> {
+    let v4 = resolved
+        .iter()
+        .find(|address| address.ip().to_canonical().is_ipv4());
+    let v6 = resolved
+        .iter()
+        .find(|address| address.ip().to_canonical().is_ipv6());
+    [v4, v6]
+        .into_iter()
+        .flatten()
+        .filter(|address| stack.reaches(**address))
+        .copied()
+        .collect()
+}
+
+/// Which families a bound socket can send to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stack {
+    /// An IPv4 socket.
+    V4,
+    /// An IPv6 socket bound to one address, or with `IPV6_V6ONLY` on.
+    V6,
+    /// An IPv6 socket on every interface with `IPV6_V6ONLY` off.
+    Dual,
+}
+
+impl Stack {
+    fn reaches(self, target: SocketAddr) -> bool {
+        let v4 = target.ip().to_canonical().is_ipv4();
+        match self {
+            Self::V4 => v4,
+            Self::V6 => !v4,
+            Self::Dual => true,
+        }
+    }
+}
+
+/// Bind `address`, making an unspecified IPv6 one dual-stack.
+///
+/// A dual-stack socket that cannot be made -- no IPv6 in the kernel, or a
+/// platform that insists on `IPV6_V6ONLY` -- falls back to IPv4 on the same
+/// port, since an IPv6-only socket would quietly drop every IPv4 peer, which
+/// is most of them.
+fn bind_udp(address: SocketAddr) -> io::Result<(UdpSocket, Stack)> {
+    let SocketAddr::V6(v6) = address else {
+        return Ok((UdpSocket::bind(address)?, Stack::V4));
+    };
+    if !v6.ip().is_unspecified() {
+        return Ok((UdpSocket::bind(address)?, Stack::V6));
+    }
+    let dual = || -> io::Result<UdpSocket> {
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV6,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )?;
+        socket.set_only_v6(false)?;
+        socket.bind(&address.into())?;
+        Ok(socket.into())
+    };
+    match dual() {
+        Ok(socket) => Ok((socket, Stack::Dual)),
+        Err(_) => Ok((
+            UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, address.port())))?,
+            Stack::V4,
+        )),
     }
 }
 
 /// How to bind a [`DirectSocket`].
 #[derive(Debug, Clone)]
 pub struct SocketConfig {
-    /// Where to bind. The default is every IPv4 interface on an ephemeral port.
+    /// Where to bind. The default, `[::]` on an ephemeral port, is every
+    /// interface in both families on one dual-stack socket, or every IPv4
+    /// interface where that cannot be made. An IPv4 address binds IPv4 alone,
+    /// and a specific IPv6 one IPv6 alone.
     pub bind: SocketAddr,
     /// A STUN server to learn the public address from, if any.
     pub stun: Option<StunServer>,
@@ -105,7 +190,7 @@ impl SocketConfig {
     #[must_use]
     pub fn new(alpn: impl Into<Vec<u8>>) -> Self {
         Self {
-            bind: SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+            bind: SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
             stun: None,
             stun_timeout: Duration::from_secs(1),
             idle_timeout: Duration::from_secs(3),
@@ -128,7 +213,10 @@ pub struct DirectSocket {
     key: PrivateKeyDer<'static>,
     fingerprint: [u8; 32],
     host_candidates: Vec<SocketAddr>,
-    reflexive: Option<SocketAddr>,
+    /// IPv4 first, then IPv6, each present only if a server of that family
+    /// answered.
+    reflexive: Vec<SocketAddr>,
+    stack: Stack,
     alpn: Vec<u8>,
     datagrams: bool,
     transport: Arc<quinn::TransportConfig>,
@@ -161,21 +249,27 @@ impl DirectSocket {
             return Err(Error::Tls("an ALPN must be 1 to 255 bytes".to_owned()));
         }
 
-        let socket = UdpSocket::bind(config.bind)?;
-        let host_candidates = host_candidates(&socket)?;
-        let mut reflexive = None;
+        let (socket, stack) = bind_udp(config.bind)?;
+        let host_candidates = host_candidates(&socket, stack)?;
+        let mut reflexive = Vec::new();
         if let Some(stun) = config.stun {
             let probe = socket.try_clone()?;
-            let local = socket.local_addr()?;
             let patience = config.stun_timeout;
             // Blocking twice over: the resolver, and STUN's own timed reads.
             let answer = tokio::task::spawn_blocking(move || {
-                let server = stun.resolve(local)?;
-                super::stun::reflexive(&probe, server, patience)
+                let servers = stun.resolve(stack)?;
+                super::stun::reflexive_each(&probe, &servers, patience)
             })
             .await
             .map_err(|error| Error::Io(io::Error::other(error)))?;
-            reflexive = answer.ok();
+            if let Ok(answers) = answer {
+                for address in answers.into_iter().flatten() {
+                    if !reflexive.contains(&address) {
+                        reflexive.push(address);
+                    }
+                }
+                reflexive.sort_by_key(|address: &SocketAddr| address.is_ipv6());
+            }
         }
 
         let generated =
@@ -199,6 +293,7 @@ impl DirectSocket {
             fingerprint,
             host_candidates,
             reflexive,
+            stack,
             alpn: config.alpn,
             datagrams: config.datagrams,
             transport: transport(config.idle_timeout, config.datagrams),
@@ -234,10 +329,18 @@ impl DirectSocket {
     }
 
     /// The public address the STUN server reported, if one was asked and
-    /// answered.
+    /// answered: the IPv4 one when both families answered, since that is the
+    /// one behind a NAT.
     #[must_use]
     pub fn reflexive(&self) -> Option<SocketAddr> {
-        self.reflexive
+        self.reflexive.first().copied()
+    }
+
+    /// Every public address STUN reported, IPv4 first. A dual-stack socket
+    /// asked by name can have one of each.
+    #[must_use]
+    pub fn reflexive_addresses(&self) -> &[SocketAddr] {
+        &self.reflexive
     }
 
     /// Whether connections from this socket use datagrams; see
@@ -284,8 +387,9 @@ impl DirectSocket {
     /// handshake completes with the peer presenting the certificate `pin`
     /// names. The rest are dropped, which closes them.
     ///
-    /// A candidate quinn refuses to dial at all -- an IPv6 address from an
-    /// IPv4 socket -- is skipped rather than failing the others.
+    /// A candidate this socket cannot reach at all -- IPv6 from an IPv4
+    /// socket, IPv4 from one bound to a single IPv6 address -- is skipped
+    /// rather than failing the others, as is one quinn refuses.
     ///
     /// # Errors
     /// [`Error::Unreachable`] after `timeout`, [`Error::Handshake`] with the
@@ -310,9 +414,14 @@ impl DirectSocket {
         let mut attempts = tokio::task::JoinSet::new();
         let mut refused = None;
         for candidate in candidates {
+            let candidate = super::stun::canonical(*candidate);
+            if !self.stack.reaches(candidate) {
+                refused = Some(quinn::ConnectError::InvalidRemoteAddress(candidate));
+                continue;
+            }
             match self
                 .endpoint
-                .connect_with(client.clone(), *candidate, SERVER_NAME)
+                .connect_with(client.clone(), candidate, SERVER_NAME)
             {
                 Ok(connecting) => {
                     attempts.spawn(connecting);
@@ -420,33 +529,59 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
     out
 }
 
-/// This socket's own addresses, for a peer on the same network.
+/// This socket's own addresses, for a peer on the same network, IPv4 first.
 ///
-/// A socket bound to every interface reports `0.0.0.0`, which is no use to a
-/// peer, so the interface the default route leaves by is asked for instead: a
-/// UDP `connect` picks it without sending anything.
-fn host_candidates(socket: &UdpSocket) -> io::Result<Vec<SocketAddr>> {
+/// A socket bound to every interface reports `0.0.0.0` or `::`, which is no
+/// use to a peer, so the address the default route of each family leaves from
+/// is asked for instead: a UDP `connect` picks it without sending anything. A
+/// family with no default route contributes nothing, and an IPv6 link-local
+/// address is never offered, since it means nothing without the interface it
+/// belongs to.
+fn host_candidates(socket: &UdpSocket, stack: Stack) -> io::Result<Vec<SocketAddr>> {
     let bound = socket.local_addr()?;
     if !bound.ip().is_unspecified() {
-        return Ok(vec![bound]);
+        return Ok(vec![super::stun::canonical(bound)]);
     }
     let mut candidates = Vec::new();
-    let probe = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
-    // TEST-NET-1: never routed, so nothing is sent, but the kernel still picks
-    // the interface it would use for the internet.
-    if probe.connect((Ipv4Addr::new(192, 0, 2, 1), 9)).is_ok()
-        && let Ok(local) = probe.local_addr()
-        && !local.ip().is_unspecified()
-    {
-        candidates.push(SocketAddr::new(local.ip(), bound.port()));
+    if stack != Stack::V6 {
+        // TEST-NET-1: never routed, so nothing is sent, but the kernel still
+        // picks the interface it would use for the internet.
+        if let Some(ip) = route_source(
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+            SocketAddr::from((Ipv4Addr::new(192, 0, 2, 1), 9)),
+        ) {
+            candidates.push(SocketAddr::new(ip, bound.port()));
+        }
+    }
+    if stack != Stack::V4 {
+        // The IPv6 documentation prefix, for the same reason.
+        if let Some(IpAddr::V6(ip)) = route_source(
+            SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
+            SocketAddr::from((Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1), 9)),
+        ) && !ip.is_unicast_link_local()
+            && ip.to_ipv4_mapped().is_none()
+        {
+            candidates.push(SocketAddr::new(IpAddr::V6(ip), bound.port()));
+        }
     }
     if candidates.is_empty() {
-        candidates.push(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::LOCALHOST),
-            bound.port(),
-        ));
+        let loopback = if stack == Stack::V6 {
+            IpAddr::V6(Ipv6Addr::LOCALHOST)
+        } else {
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        };
+        candidates.push(SocketAddr::new(loopback, bound.port()));
     }
     Ok(candidates)
+}
+
+/// The local address the kernel would send to `target` from, if it has a
+/// route there at all.
+fn route_source(bind: SocketAddr, target: SocketAddr) -> Option<IpAddr> {
+    let probe = UdpSocket::bind(bind).ok()?;
+    probe.connect(target).ok()?;
+    let local = probe.local_addr().ok()?.ip();
+    (!local.is_unspecified() && !local.is_loopback()).then_some(local)
 }
 
 /// Trusts exactly the certificate whose SHA-256 is pinned, in either direction.
@@ -559,5 +694,51 @@ impl rustls::server::danger::ClientCertVerifier for Pinned {
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         Self::schemes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn address(text: &str) -> SocketAddr {
+        text.parse().expect("an address")
+    }
+
+    #[test]
+    fn each_stack_reaches_its_own_families() {
+        let v4 = address("192.0.2.1:9");
+        let mapped = address("[::ffff:192.0.2.1]:9");
+        let v6 = address("[2001:db8::1]:9");
+        assert!(Stack::V4.reaches(v4) && Stack::V4.reaches(mapped) && !Stack::V4.reaches(v6));
+        assert!(!Stack::V6.reaches(v4) && !Stack::V6.reaches(mapped) && Stack::V6.reaches(v6));
+        assert!(Stack::Dual.reaches(v4) && Stack::Dual.reaches(mapped) && Stack::Dual.reaches(v6));
+    }
+
+    #[test]
+    fn a_name_is_asked_once_per_family_the_socket_reaches() {
+        let resolved = [
+            address("[2001:db8::1]:3478"),
+            address("192.0.2.1:3478"),
+            address("[2001:db8::2]:3478"),
+            address("192.0.2.2:3478"),
+        ];
+        let v4 = address("192.0.2.1:3478");
+        let v6 = address("[2001:db8::1]:3478");
+        assert_eq!(pick_servers(&resolved, Stack::Dual), vec![v4, v6]);
+        assert_eq!(pick_servers(&resolved, Stack::V4), vec![v4]);
+        assert_eq!(pick_servers(&resolved, Stack::V6), vec![v6]);
+        assert!(pick_servers(&resolved[..1], Stack::V4).is_empty());
+    }
+
+    #[test]
+    fn the_default_bind_is_dual_stack_and_an_ipv4_bind_is_not() {
+        let (socket, stack) = bind_udp(SocketConfig::new(b"x".to_vec()).bind).expect("binds");
+        assert_eq!(stack, Stack::Dual);
+        assert!(socket.local_addr().expect("address").is_ipv6());
+        let (_, stack) = bind_udp(address("127.0.0.1:0")).expect("binds");
+        assert_eq!(stack, Stack::V4);
+        let (_, stack) = bind_udp(address("[::1]:0")).expect("binds");
+        assert_eq!(stack, Stack::V6);
     }
 }

@@ -144,11 +144,43 @@ pub fn reflexive(
     server: SocketAddr,
     patience: Duration,
 ) -> io::Result<SocketAddr> {
-    let mut transaction = [0u8; 12];
-    SystemRandom::new()
-        .fill(&mut transaction)
-        .map_err(|_| io::Error::other("the random source failed"))?;
-    let request = binding_request(transaction);
+    reflexive_each(socket, &[server], patience)?
+        .pop()
+        .flatten()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "the STUN server did not answer"))
+}
+
+/// Ask every one of `servers` at once for `socket`'s public address, and say
+/// what each reported, in the same order.
+///
+/// For a dual-stack socket, which has a public address in each family and
+/// learns each from a server of that family. Asking them together rather than
+/// in turn means a family with no route -- IPv6 on most cellular-to-IPv4
+/// paths -- costs nothing extra, and the answers are told apart by
+/// transaction rather than by arrival. An IPv4 server is reached from an IPv6
+/// socket through its IPv4-mapped address, and the addresses reported come
+/// back in their plain form.
+///
+/// # Errors
+/// The socket refusing a read, or the random source failing. A server that
+/// cannot be sent to or does not answer is `None`, not an error.
+pub fn reflexive_each(
+    socket: &UdpSocket,
+    servers: &[SocketAddr],
+    patience: Duration,
+) -> io::Result<Vec<Option<SocketAddr>>> {
+    let local = socket.local_addr()?;
+    let random = SystemRandom::new();
+    let mut asked = Vec::with_capacity(servers.len());
+    for server in servers {
+        let mut transaction = [0u8; 12];
+        random
+            .fill(&mut transaction)
+            .map_err(|_| io::Error::other("the random source failed"))?;
+        asked.push((destination(local, *server), transaction));
+    }
+    let mut answers: Vec<Option<SocketAddr>> = vec![None; servers.len()];
+    let mut unreachable = vec![false; servers.len()];
 
     let previous = socket.read_timeout()?;
     let attempt = (patience / 3).max(Duration::from_millis(10));
@@ -156,16 +188,37 @@ pub fn reflexive(
     let result = (|| {
         let mut buffer = [0u8; 576];
         for _ in 0..3 {
-            socket.send_to(&request, server)?;
+            for (i, (server, transaction)) in asked.iter().enumerate() {
+                if answers[i].is_none() && !unreachable[i] {
+                    // No route to this family is an answer of sorts: there
+                    // is nothing to learn from it, and retrying will not help.
+                    unreachable[i] = socket
+                        .send_to(&binding_request(*transaction), server)
+                        .is_err();
+                }
+            }
+            let waiting = |answers: &[Option<SocketAddr>]| {
+                answers
+                    .iter()
+                    .zip(&unreachable)
+                    .any(|(answer, unreachable)| answer.is_none() && !unreachable)
+            };
+            if !waiting(&answers) {
+                break;
+            }
             let deadline = std::time::Instant::now() + attempt;
-            while std::time::Instant::now() < deadline {
+            while waiting(&answers) && std::time::Instant::now() < deadline {
                 match socket.recv_from(&mut buffer) {
-                    Ok((n, from)) if from == server => {
-                        if let Some(address) = parse_binding_response(&buffer[..n], transaction) {
-                            return Ok(address);
+                    Ok((n, from)) => {
+                        for (i, (server, transaction)) in asked.iter().enumerate() {
+                            if canonical(from) == canonical(*server)
+                                && let Some(address) =
+                                    parse_binding_response(&buffer[..n], *transaction)
+                            {
+                                answers[i] = Some(canonical(address));
+                            }
                         }
                     }
-                    Ok(_) => {}
                     Err(error)
                         if matches!(
                             error.kind(),
@@ -174,17 +227,40 @@ pub fn reflexive(
                     {
                         break;
                     }
+                    // An ICMP error from an earlier send, reported on a later
+                    // read on some platforms. It names no server, so it ends
+                    // nothing but this read.
+                    Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {}
                     Err(error) => return Err(error),
                 }
             }
+            if !waiting(&answers) {
+                break;
+            }
         }
-        Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "the STUN server did not answer",
-        ))
+        Ok(())
     })();
     socket.set_read_timeout(previous)?;
-    result
+    result.map(|()| answers)
+}
+
+/// Where to send to reach `target` from a socket bound at `local`.
+///
+/// A dual-stack socket is an IPv6 socket, and reaches an IPv4 peer only
+/// through the peer's IPv4-mapped address; `send_to` with a plain IPv4 address
+/// fails on it. Anything else is sent to as given.
+pub(crate) fn destination(local: SocketAddr, target: SocketAddr) -> SocketAddr {
+    match (local, target) {
+        (SocketAddr::V6(_), SocketAddr::V4(v4)) => {
+            SocketAddr::new(IpAddr::V6(v4.ip().to_ipv6_mapped()), v4.port())
+        }
+        _ => target,
+    }
+}
+
+/// `address` with an IPv4-mapped IPv6 address written as the IPv4 it is.
+pub(crate) fn canonical(address: SocketAddr) -> SocketAddr {
+    SocketAddr::new(address.ip().to_canonical(), address.port())
 }
 
 #[cfg(test)]

@@ -26,6 +26,9 @@ web-transport-quinn = { workspace = true }
 webpki-roots = "0.26"
 # Direct paths: each endpoint presents an ephemeral certificate its peer pins.
 rcgen = { workspace = true }
+# Direct paths: turning `IPV6_V6ONLY` off before the bind, for one dual-stack socket. Already in
+# the tree beneath quinn-udp and moqom-transport.
+socket2 = { workspace = true }
 
 [dev-dependencies]
 moqom-relay = { path = "../moqom-relay" }

@@ -12,7 +12,7 @@
 #![allow(clippy::similar_names)]
 
 use std::ffi::{CStr, CString, c_char, c_void};
-use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Duration;
 
@@ -214,9 +214,28 @@ fn race(
     accept_pin: [u8; 32],
     timeout_ms: u32,
 ) -> (ConnectionEvent, ConnectionEvent) {
+    race_to(
+        loopback(acceptor),
+        dialler,
+        dial_pin,
+        acceptor,
+        accept_pin,
+        timeout_ms,
+    )
+}
+
+/// [`race`], dialling the acceptor at `target`.
+fn race_to(
+    target: MoqomDirectAddress,
+    dialler: *mut MoqomDirectEndpoint,
+    dial_pin: [u8; 32],
+    acceptor: *mut MoqomDirectEndpoint,
+    accept_pin: [u8; 32],
+    timeout_ms: u32,
+) -> (ConnectionEvent, ConnectionEvent) {
     let accepted = Waiter::<ConnectionEvent>::new();
     let dialled = Waiter::<ConnectionEvent>::new();
-    let target = [loopback(acceptor)];
+    let target = [target];
     unsafe {
         moqom_direct_endpoint_accept(
             acceptor,
@@ -1031,4 +1050,38 @@ fn probes_go_out_from_the_endpoint_port_until_stopped() {
         "a probe after punch_stop"
     );
     unsafe { moqom_direct_endpoint_free(endpoint) };
+}
+
+#[test]
+fn endpoints_connect_over_ipv6_on_the_port_they_report() {
+    // The bind is dual-stack, so the one port the header reports takes IPv6
+    // as well as IPv4, and an address of family 6 dials it.
+    let a = bind(&Config::plain());
+    let b = bind(&Config::plain());
+    let port = unsafe { moqom_direct_endpoint_port(b) };
+    let target = MoqomDirectAddress::from(SocketAddr::from((Ipv6Addr::LOCALHOST, port)));
+    assert_eq!(target.family, 6);
+
+    let ((dial, dialled, why), (accept, accepted, how)) =
+        race_to(target, a, fingerprint(b), b, fingerprint(a), 5_000);
+    assert_eq!(dial, STATUS_OK, "dial: {why}");
+    assert_eq!(accept, STATUS_OK, "accept: {how}");
+    unsafe {
+        let mut remote = MoqomDirectAddress::from(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)));
+        assert_eq!(
+            moqom_direct_connection_remote(dialled.0, &raw mut remote),
+            STATUS_OK
+        );
+        assert_eq!(remote, target);
+        assert_eq!(
+            moqom_direct_connection_remote(accepted.0, &raw mut remote),
+            STATUS_OK
+        );
+        assert_eq!(remote.family, 6);
+        assert_eq!(remote.port, moqom_direct_endpoint_port(a));
+        moqom_direct_connection_free(dialled.0);
+        moqom_direct_connection_free(accepted.0);
+        moqom_direct_endpoint_free(a);
+        moqom_direct_endpoint_free(b);
+    }
 }

@@ -27,7 +27,7 @@
 //! evidence that its own credentials passed. Neither side returns a session
 //! the other has refused.
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -56,7 +56,8 @@ pub struct DirectConfig {
     pub room: String,
     /// This participant, as `user/device`. Offers are addressed by it.
     pub me: String,
-    /// Where to bind. The default is every interface on an ephemeral port.
+    /// Where to bind. The default is every interface in both families on an
+    /// ephemeral port; see [`SocketConfig::bind`].
     pub bind: SocketAddr,
     /// A STUN server to learn the public address from, if any.
     ///
@@ -89,7 +90,7 @@ impl DirectConfig {
             tenant: tenant.into(),
             room: room.into(),
             me: me.into(),
-            bind: SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+            bind: SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
             stun: None,
             punching: true,
             punch_interval: Duration::from_millis(25),
@@ -147,10 +148,10 @@ impl DirectEndpoint {
         })
         .await?;
         let mut candidates = socket.host_candidates().to_vec();
-        if let Some(address) = socket.reflexive()
-            && !candidates.contains(&address)
-        {
-            candidates.push(address);
+        for address in socket.reflexive_addresses() {
+            if !candidates.contains(address) {
+                candidates.push(*address);
+            }
         }
         let identity = certificate_identity(socket.certificate().as_ref());
 

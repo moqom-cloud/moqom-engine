@@ -28,6 +28,13 @@ pub(crate) struct Puncher {
 
 impl Puncher {
     pub(crate) fn start(socket: UdpSocket, targets: Vec<SocketAddr>, interval: Duration) -> Self {
+        let targets: Vec<SocketAddr> = match socket.local_addr() {
+            Ok(local) => targets
+                .into_iter()
+                .map(|target| super::stun::destination(local, target))
+                .collect(),
+            Err(_) => targets,
+        };
         let (stop, stopped) = mpsc::channel::<()>();
         // A thread rather than a task, since the socket is a plain std one
         // shared with QUIC and registering a second handle to it with the
