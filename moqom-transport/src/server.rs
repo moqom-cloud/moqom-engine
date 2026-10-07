@@ -441,4 +441,24 @@ mod tests {
         let offered: Vec<&[u8]> = tls.alpn_protocols.iter().map(Vec::as_slice).collect();
         assert_eq!(offered, alpn::OFFERED);
     }
+
+    /// Every listener and client in the engine is built on this provider, so
+    /// this is the one place that has to hold for all of them to send the
+    /// hybrid share first. It fails if the workspace's `prefer-post-quantum`
+    /// feature on rustls is ever dropped.
+    #[test]
+    fn the_provider_listeners_are_built_on_prefers_the_hybrid() {
+        let provider = rustls::crypto::aws_lc_rs::default_provider();
+        let groups: Vec<rustls::NamedGroup> = provider
+            .kx_groups
+            .iter()
+            .map(|group| group.name())
+            .collect();
+        assert_eq!(
+            groups.first(),
+            Some(&rustls::NamedGroup::X25519MLKEM768),
+            "{groups:?}"
+        );
+        assert!(groups.contains(&rustls::NamedGroup::X25519), "{groups:?}");
+    }
 }

@@ -29,6 +29,10 @@ rcgen = { workspace = true }
 
 [dev-dependencies]
 moqom-relay = { path = "../moqom-relay" }
+# Adds the negotiated key exchange group to quinn's handshake data, which is how the post-quantum
+# tests read it. Unlike quinn's feature of the same name this one does not also switch on rustls's
+# post-quantum preference, so the tests see what the build itself chose.
+quinn-proto = { workspace = true, features = ["__rustls-post-quantum-test"] }
 rcgen = { workspace = true }
 rustls = { workspace = true }
 # Minting a token in the possession test, where the claim shape is what the Go

@@ -1050,6 +1050,7 @@ dependencies = [
  "moqom-relay",
  "moqom-transport",
  "quinn",
+ "quinn-proto",
  "rcgen",
  "rustls",
  "serde_json",

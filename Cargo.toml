@@ -42,7 +42,12 @@ quinn-proto = { version = "0.11", default-features = false }
 # a differentiated services codepoint on it, which quinn offers no way to do through `Endpoint`.
 socket2 = "0.6"
 web-transport-quinn = { version = "0.11", default-features = false, features = ["aws-lc-rs"] }
-rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
+# `prefer-post-quantum` puts X25519MLKEM768 first in aws-lc-rs's default key exchange groups, so
+# every configuration built from the default provider sends a hybrid key share first and still
+# offers X25519 alongside it for a classical peer. Feature unification makes this hold for every
+# crate in the build, tonic's gRPC link included, and `moqom-transport` has a test that fails if
+# it ever stops.
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std", "prefer-post-quantum"] }
 url = "2"
 tokio = { version = "1", default-features = false }
 tracing = "0.1"
