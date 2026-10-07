@@ -25,7 +25,7 @@ use crate::archive::{self, Archived, Header};
 use crate::catalog::Track;
 use crate::crc32c::Crc32c;
 use crate::fmp4::{Muxer, Output, Reorder};
-use crate::manifest::{Artifact, ArtifactKind, TrackEntry};
+use crate::manifest::{Artifact, ArtifactKind, Join, JoinFrom, TrackEntry};
 
 /// Groups remembered for recognising redelivery. A reconnect replays at most
 /// the group in flight, so a handful would do; this many covers a relay that
@@ -129,6 +129,7 @@ pub struct TrackWriter {
     dedupe: Dedupe,
     objects: u64,
     duplicates: u64,
+    joins: Vec<Join>,
 }
 
 impl TrackWriter {
@@ -170,6 +171,7 @@ impl TrackWriter {
             dedupe: Dedupe::default(),
             objects: 0,
             duplicates: 0,
+            joins: Vec::new(),
         }
     }
 
@@ -190,6 +192,21 @@ impl TrackWriter {
             open.writer.session(ordinal, at)?;
         }
         Ok(())
+    }
+
+    /// Say how this session's recording of the track began. See [`Join`].
+    pub fn joined(&mut self, from: JoinFrom, at: Option<(u64, u64)>, reason: Option<String>) {
+        let session = self.session.map_or(0, |(ordinal, _)| ordinal);
+        if let Some(reason) = &reason {
+            tracing::info!(track = %self.config.relative, session, ?from, %reason, "the group in flight was not caught up");
+        }
+        self.joins.push(Join {
+            session,
+            from,
+            group: at.map(|(group, _)| group),
+            object: at.map(|(_, object)| object),
+            reason,
+        });
     }
 
     /// The catalog restated this track, possibly differently.
@@ -289,6 +306,7 @@ impl TrackWriter {
             objects: self.objects,
             duplicates: self.duplicates,
             cmaf_skipped: self.cmaf_skipped.clone(),
+            joins: self.joins.clone(),
         }
     }
 

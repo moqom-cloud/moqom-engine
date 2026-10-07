@@ -17,9 +17,28 @@
 //! publisher's catalog last said -- lives outside the session. When the
 //! connection drops the recorder reconnects with the current credential,
 //! resubscribes to everything it knew about, and writes on into the same
-//! files. The relay restarts each subscription at the group in flight, so the
-//! cost of a reconnect is the media that went by during the gap, marked in the
-//! archive, and nothing written twice.
+//! files. The cost of a reconnect is the media that went by during the gap,
+//! marked in the archive, and nothing written twice.
+//!
+//! # Catching up
+//!
+//! A subscription starts at the next group, so a recorder joining a room in
+//! progress -- or coming back after a reconnect -- would begin every track
+//! part-way into the media and lose the group in flight. It fetches that group
+//! from the relay's cache instead:
+//!
+//! - **Media.** When a track's first live object arrives at group `H`, the
+//!   group in flight was `H - 1`, now finished, and it is fetched whole. The
+//!   recording then begins at the first object of `H - 1` and runs on
+//!   contiguously. Fetching then rather than at once is what makes the group
+//!   whole: a fetch made at subscription time ends at the live edge, and the
+//!   rest of that group would be neither fetched nor subscribed.
+//! - **The catalog.** Fetched at once, since a catalog that does not change is
+//!   never sent again, and nothing can be subscribed until it is known.
+//!
+//! Where the relay no longer holds the group (it keeps a few seconds), the
+//! track starts at the next group. Either way the manifest says so per track
+//! and per session, in `joins`.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -29,14 +48,15 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use moqom_client::{
-    Credentials, DeviceKey, Error, FullTrackName, NamespaceEvent, Session, Subscription,
-    TrackNamespace,
+    Credentials, DeviceKey, Error, FetchEnd, FetchRange, Fetched, FullTrackName, GroupId, Location,
+    NamespaceEvent, Object, ObjectId, Session, Subscription, TrackNamespace,
 };
+use moqom_proto::varint::VarInt;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::catalog::{self, Follower, Track};
-use crate::manifest::{Artifact, ArtifactKind, Manifest, TrackEntry};
+use crate::manifest::{Artifact, ArtifactKind, JoinFrom, Manifest, TrackEntry};
 use crate::store::Store;
 use crate::track::{Finished, TrackConfig, TrackWriter, component, now_micros};
 
@@ -123,6 +143,14 @@ enum Event {
     },
     Ended {
         relative: String,
+    },
+    /// A media track's first live object on this session, which is where
+    /// catching up has to reach.
+    Live {
+        namespace: TrackNamespace,
+        name: String,
+        relative: String,
+        at: (u64, u64),
     },
     Failed(String),
 }
@@ -390,6 +418,7 @@ impl Recorder {
         };
         let (events_tx, mut events) = mpsc::channel(256);
         let mut readers: HashMap<String, Reader> = HashMap::new();
+        let mut catching_up: Vec<Reader> = Vec::new();
 
         let known: Vec<TrackNamespace> = state.participants.keys().cloned().collect();
         for namespace in known {
@@ -436,6 +465,12 @@ impl Recorder {
                     }
                     Event::Ended { relative } => {
                         readers.remove(&relative);
+                    }
+                    Event::Live { namespace, name, relative, at } => {
+                        catching_up.retain(|reader| !reader.task.is_finished());
+                        if let Some(reader) = self.catch_up(&mut session, state, &namespace, &name, &relative, at, &events_tx).await {
+                            catching_up.push(reader);
+                        }
                     }
                     Event::Failed(reason) => return Ended::Failed(reason),
                 },
@@ -649,14 +684,23 @@ impl Recorder {
         };
 
         let catalog = (name == catalog::TRACK_NAME).then(|| namespace.clone());
-        let task = tokio::spawn(read(
-            subscription,
+        let prelude = if catalog.is_some() {
+            self.fetch_catalog(session, &subscription, &writer, &relative)
+                .await
+        } else {
+            None
+        };
+        let live = catalog
+            .is_none()
+            .then(|| (namespace.clone(), name.to_owned()));
+        let feed = Feed {
             writer,
             catalog,
-            Arc::clone(&self.progress),
-            events.clone(),
-            relative.clone(),
-        ));
+            progress: Arc::clone(&self.progress),
+            events: events.clone(),
+            relative: relative.clone(),
+        };
+        let task = tokio::spawn(read(subscription, prelude, feed, live));
         readers.insert(
             relative,
             Reader {
@@ -666,6 +710,218 @@ impl Recorder {
         );
         Ok(())
     }
+}
+
+impl Recorder {
+    /// The catalog as it stands, which a catalog that never changes would
+    /// otherwise never send.
+    async fn fetch_catalog(
+        &self,
+        session: &mut Session,
+        subscription: &Subscription,
+        writer: &Arc<Mutex<TrackWriter>>,
+        relative: &str,
+    ) -> Option<Fetched> {
+        let fetched = tokio::time::timeout(
+            SUBSCRIBE_TIMEOUT,
+            session.fetch(FetchRange::InFlight(subscription)),
+        )
+        .await;
+        let reason = match fetched {
+            Ok(Ok(fetched)) => return Some(fetched),
+            Ok(Err(failure)) => format!(
+                "the relay holds no catalog ({failure}); the publisher's next catalog starts this track"
+            ),
+            Err(_) => "the relay did not answer the catalog fetch".to_owned(),
+        };
+        tracing::debug!(recording = %self.config.recording, %relative, %reason, "no catalog to catch up on");
+        lock(writer).joined(JoinFrom::NextGroup, None, Some(reason));
+        None
+    }
+
+    /// Fetch what a media track's subscription began too late for, given
+    /// where its first live object was.
+    #[allow(clippy::too_many_arguments)]
+    async fn catch_up(
+        &self,
+        session: &mut Session,
+        state: &State,
+        namespace: &TrackNamespace,
+        name: &str,
+        relative: &str,
+        at: (u64, u64),
+        events: &mpsc::Sender<Event>,
+    ) -> Option<Reader> {
+        let writer = Arc::clone(state.writers.get(relative)?);
+        let Some((start, end)) = catch_up_range(at) else {
+            lock(&writer).joined(JoinFrom::TrackStart, Some(at), None);
+            return None;
+        };
+        let missed = if at.1 == 0 {
+            JoinFrom::NextGroup
+        } else {
+            JoinFrom::MidGroup
+        };
+        let fetched =
+            match FullTrackName::new(namespace.clone(), Bytes::copy_from_slice(name.as_bytes())) {
+                Ok(track) => {
+                    tokio::time::timeout(
+                        SUBSCRIBE_TIMEOUT,
+                        session.fetch(FetchRange::Range { track, start, end }),
+                    )
+                    .await
+                }
+                Err(failure) => Ok(Err(Error::Setup(failure.to_string()))),
+            };
+        let fetched = match fetched {
+            Ok(Ok(fetched)) => fetched,
+            Ok(Err(failure)) => {
+                lock(&writer).joined(
+                    missed,
+                    Some(at),
+                    Some(format!(
+                        "the group in flight could not be fetched: {failure}"
+                    )),
+                );
+                return None;
+            }
+            Err(_) => {
+                lock(&writer).joined(
+                    missed,
+                    Some(at),
+                    Some("the relay did not answer the catch-up fetch".to_owned()),
+                );
+                return None;
+            }
+        };
+        let feed = Feed {
+            writer,
+            catalog: None,
+            progress: Arc::clone(&self.progress),
+            events: events.clone(),
+            relative: relative.to_owned(),
+        };
+        let task = tokio::spawn(async move {
+            drain(fetched, &feed, Some(start.group.get()), (missed, Some(at))).await;
+        });
+        Some(Reader {
+            namespace: namespace.clone(),
+            task,
+        })
+    }
+}
+
+/// What to fetch for a subscription whose first live object was at `at`, or
+/// `None` when nothing came before it.
+///
+/// A first object opening a group means the group before it was the one in
+/// flight, and it is wanted whole. A first object part-way into a group means
+/// the subscription started inside it, and only its start is wanted.
+fn catch_up_range((group, object): (u64, u64)) -> Option<(Location, FetchEnd)> {
+    let location = |group: u64, object: u64| {
+        Some(Location::new(
+            GroupId::new(VarInt::new(group).ok()?),
+            ObjectId::new(VarInt::new(object).ok()?),
+        ))
+    };
+    match (group, object) {
+        (0, 0) => None,
+        (group, 0) => Some((
+            location(group - 1, 0)?,
+            FetchEnd::EndOfGroup(location(group - 1, 0)?.group),
+        )),
+        (group, object) => Some((
+            location(group, 0)?,
+            FetchEnd::Through(location(group, object - 1)?),
+        )),
+    }
+}
+
+/// Where a track's objects go, and who hears about them.
+struct Feed {
+    writer: Arc<Mutex<TrackWriter>>,
+    catalog: Option<TrackNamespace>,
+    progress: Arc<Progress>,
+    events: mpsc::Sender<Event>,
+    relative: String,
+}
+
+impl Feed {
+    /// Archive one object. False once there is no point going on.
+    async fn object(&self, object: &Object) -> bool {
+        self.progress
+            .bytes_received
+            .fetch_add(object.payload.len() as u64, Ordering::Relaxed);
+        let written = lock(&self.writer).object(object);
+        match written {
+            Ok(true) => {
+                self.progress.objects.fetch_add(1, Ordering::Relaxed);
+                if let Some(namespace) = &self.catalog {
+                    let event = Event::Catalog {
+                        namespace: namespace.clone(),
+                        payload: object.payload.clone(),
+                    };
+                    if self.events.send(event).await.is_err() {
+                        return false;
+                    }
+                }
+                true
+            }
+            Ok(false) => true,
+            Err(failure) => {
+                let _ = self
+                    .events
+                    .send(Event::Failed(format!("writing the spool: {failure}")))
+                    .await;
+                false
+            }
+        }
+    }
+}
+
+/// Archive a catch-up fetch, then say how the track's recording began.
+///
+/// `want` is the group the fetch was for, if it named one; `missed` is what
+/// to say if it brings nothing.
+async fn drain(
+    mut fetched: Fetched,
+    feed: &Feed,
+    want: Option<u64>,
+    missed: (JoinFrom, Option<(u64, u64)>),
+) -> bool {
+    let mut first = None;
+    loop {
+        match fetched.next_object().await {
+            Ok(Some(object)) => {
+                first.get_or_insert((object.group.get(), object.object));
+                if !feed.object(&object).await {
+                    return false;
+                }
+            }
+            Ok(None) => break,
+            Err(failure) => {
+                tracing::debug!(relative = %feed.relative, %failure, "catch-up fetch ended");
+                break;
+            }
+        }
+    }
+    let (from, at, reason) = match first {
+        Some((group, 0)) if want.is_none_or(|want| want == group) => {
+            (JoinFrom::CaughtUp, Some((group, 0)), None)
+        }
+        Some(at) => (
+            JoinFrom::MidGroup,
+            Some(at),
+            Some("the relay held only part of the group in flight".to_owned()),
+        ),
+        None => (
+            missed.0,
+            missed.1,
+            Some("the relay's answer to the catch-up fetch was empty".to_owned()),
+        ),
+    };
+    lock(&feed.writer).joined(from, at, reason);
+    true
 }
 
 /// A publisher's namespace is the room's plus a user and a device; anything
@@ -684,48 +940,45 @@ fn participant(namespace: &TrackNamespace) -> Option<Participant> {
 
 async fn read(
     mut subscription: Subscription,
-    writer: Arc<Mutex<TrackWriter>>,
-    catalog: Option<TrackNamespace>,
-    progress: Arc<Progress>,
-    events: mpsc::Sender<Event>,
-    relative: String,
+    prelude: Option<Fetched>,
+    feed: Feed,
+    mut live: Option<(TrackNamespace, String)>,
 ) {
+    if let Some(prelude) = prelude
+        && !drain(prelude, &feed, None, (JoinFrom::NextGroup, None)).await
+    {
+        return;
+    }
     loop {
         let object = match subscription.next_object().await {
             Ok(Some(object)) => object,
             Ok(None) => break,
             Err(failure) => {
-                tracing::debug!(%relative, %failure, "subscription ended");
+                tracing::debug!(relative = %feed.relative, %failure, "subscription ended");
                 break;
             }
         };
-        progress
-            .bytes_received
-            .fetch_add(object.payload.len() as u64, Ordering::Relaxed);
-        let written = lock(&writer).object(&object);
-        match written {
-            Ok(true) => {
-                progress.objects.fetch_add(1, Ordering::Relaxed);
-                if let Some(namespace) = &catalog {
-                    let event = Event::Catalog {
-                        namespace: namespace.clone(),
-                        payload: object.payload.clone(),
-                    };
-                    if events.send(event).await.is_err() {
-                        return;
-                    }
-                }
-            }
-            Ok(false) => {}
-            Err(failure) => {
-                let _ = events
-                    .send(Event::Failed(format!("writing the spool: {failure}")))
-                    .await;
+        if let Some((namespace, name)) = live.take() {
+            let event = Event::Live {
+                namespace,
+                name,
+                relative: feed.relative.clone(),
+                at: (object.group.get(), object.object),
+            };
+            if feed.events.send(event).await.is_err() {
                 return;
             }
         }
+        if !feed.object(&object).await {
+            return;
+        }
     }
-    let _ = events.send(Event::Ended { relative }).await;
+    let _ = feed
+        .events
+        .send(Event::Ended {
+            relative: feed.relative.clone(),
+        })
+        .await;
 }
 
 async fn upload(

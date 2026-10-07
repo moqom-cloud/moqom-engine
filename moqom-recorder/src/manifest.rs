@@ -76,6 +76,46 @@ pub struct TrackEntry {
     pub duplicates: u64,
     /// Why no CMAF was written for this track, if none was.
     pub cmaf_skipped: Option<String>,
+    /// Where each session's recording of this track began. Absent from
+    /// manifests written before recorders caught up on joining.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub joins: Vec<Join>,
+}
+
+/// How a recording of one track began, in one session.
+///
+/// A subscription starts at the next group, so a recorder that joins while a
+/// group is in flight fetches that group from the relay to begin at its first
+/// object. This says whether it did.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Join {
+    /// The session, as numbered by the archive's `session` records.
+    pub session: u32,
+    /// How it began.
+    pub from: JoinFrom,
+    /// The first group recorded contiguously from here, when known.
+    pub group: Option<u64>,
+    /// And the first object in it: zero is a clean group boundary.
+    pub object: Option<u64>,
+    /// Why it did not catch up, when it did not.
+    pub reason: Option<String>,
+}
+
+/// See [`Join`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JoinFrom {
+    /// The track began after the recorder subscribed: nothing was missed.
+    TrackStart,
+    /// The group in flight was fetched from its first object.
+    CaughtUp,
+    /// The group in flight could not be fetched, so recording begins at the
+    /// start of the next one and the rest of the group in flight is not in it.
+    NextGroup,
+    /// Recording begins part-way through a group: the relay held only part of
+    /// it, or the subscription itself started mid-group and the start could
+    /// not be fetched.
+    MidGroup,
 }
 
 /// The manifest.

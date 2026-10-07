@@ -28,11 +28,13 @@ use moqom_proto::data::{
 use moqom_proto::error::DecodeError;
 use moqom_proto::model::{GroupId, TrackAlias, TrackNamespace};
 use moqom_recorder::archive::{Reader, Record};
-use moqom_recorder::manifest::{ArtifactKind, Manifest};
+use moqom_recorder::manifest::{ArtifactKind, Join, JoinFrom, Manifest};
 use moqom_recorder::store::{LocalDir, Store};
 use moqom_recorder::{Recorder, RecorderConfig};
 use moqom_relay::possession::{Enforcement, Possession};
-use moqom_relay::{Authenticator, Cache, Fabric, Limits, Session as RelaySession, VerificationKey};
+use moqom_relay::{
+    Authenticator, Cache, Fabric, Limits, Rules, Session as RelaySession, VerificationKey,
+};
 use moqom_transport::{Server, alpn, server::with_moqt_alpn};
 use tokio::sync::{mpsc, watch};
 use web_transport_quinn::{RecvStream, SendStream};
@@ -44,6 +46,8 @@ const ROOM: &str = "standup";
 /// The device field is the first sixteen characters of the token's thumbprint.
 const PUBLISHER_JKT: &str = "phonephonephone1-and-the-rest";
 const DEVICE: &str = "phonephonephone1";
+/// The subject the control plane mints every recorder token with.
+const RECORDER: &str = "moqom-recorder";
 
 async fn within<F: Future>(what: &str, future: F) -> F::Output {
     tokio::time::timeout(PATIENCE, future)
@@ -92,6 +96,12 @@ impl Drop for Relay {
 }
 
 fn relay() -> Relay {
+    relay_with(Limits::default(), 0)
+}
+
+/// A relay retaining what `limits` allow, holding the room to `ceiling`
+/// sessions (zero for none).
+fn relay_with(limits: Limits, ceiling: u32) -> Relay {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let generated =
         rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("a certificate");
@@ -111,7 +121,7 @@ fn relay() -> Relay {
     let identity = URL_SAFE_NO_PAD.encode(
         aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, certificate.as_ref()).as_ref(),
     );
-    let fabric = Fabric::with_cache(Cache::new(Limits::default()))
+    let fabric = Fabric::with_cache(Cache::new(limits))
         .authenticated(Authenticator::new(
             "",
             vec![VerificationKey {
@@ -120,6 +130,15 @@ fn relay() -> Relay {
             }],
         ))
         .proving(Possession::new(Enforcement::Observed, Some(identity)));
+    if ceiling > 0 {
+        fabric.policy().describe(
+            (TENANT.into(), ROOM.into()),
+            Rules {
+                ceiling,
+                ..Rules::default()
+            },
+        );
+    }
     let accept = tokio::spawn(async move {
         while let Some(incoming) = server.accept().await {
             let fabric = fabric.clone();
@@ -169,6 +188,38 @@ async fn write<M: MessageBody>(stream: &mut SendStream, message: &M) {
     let mut buf = BytesMut::new();
     write_message(&mut buf, message).expect("a message that fits");
     stream.write_all(&buf).await.expect("writing a message");
+}
+
+/// A subgroup still being written, for a group in flight.
+struct OpenGroup {
+    stream: SendStream,
+    writer: SubgroupWriter,
+    next: u32,
+}
+
+impl OpenGroup {
+    async fn write(&mut self, payload: &[u8], properties: ObjectProperties) {
+        let mut buf = BytesMut::new();
+        let object = SubgroupObject {
+            object: self.next.into(),
+            content: SubgroupContent::Normal {
+                payload: Bytes::copy_from_slice(payload),
+                properties: properties.to_wire(),
+            },
+        };
+        self.next += 1;
+        self.writer
+            .write(&mut buf, &object)
+            .expect("an encodable object");
+        self.stream
+            .write_all(&buf)
+            .await
+            .expect("writing an object");
+    }
+
+    fn finish(mut self) {
+        self.stream.finish().expect("finishing a subgroup");
+    }
 }
 
 /// A bare MOQT publisher: one namespace, an alias per track.
@@ -311,6 +362,25 @@ impl Publisher {
         stream.finish().expect("finishing a subgroup");
     }
 
+    /// Open a group and leave it open, as a camera does mid-GOP.
+    async fn open(&self, alias: u32, group: u32) -> OpenGroup {
+        let mut stream = self.session.open_uni().await.expect("a data stream");
+        let mut header = SubgroupHeader::new(
+            TrackAlias::from(alias),
+            GroupId::from(group),
+            SubgroupSource::Zero,
+        );
+        header.properties_present = true;
+        let mut buf = BytesMut::new();
+        header.encode(&mut buf);
+        stream.write_all(&buf).await.expect("writing a header");
+        OpenGroup {
+            stream,
+            writer: SubgroupWriter::new(&header),
+            next: 0,
+        }
+    }
+
     /// Watch the room, as every participant does, and list who is in it.
     async fn roster(&mut self) -> Vec<TrackNamespace> {
         let prefix = TrackNamespace::from_parts([TENANT, "r", ROOM]).expect("a prefix");
@@ -427,7 +497,7 @@ struct Running {
 
 fn start(relay: &Relay, out: &Path, e2ee_required: bool) -> Running {
     let (key, _) = DeviceKey::generate().expect("a recorder key");
-    let token = token("recorder", &key.thumbprint(), 0);
+    let token = token(RECORDER, &key.thumbprint(), 0);
     let recorder = Recorder::new(RecorderConfig {
         recording: "rec_1".into(),
         tenant: TENANT.into(),
@@ -699,5 +769,315 @@ async fn a_publisher_leaving_finishes_its_files() {
         .await
         .expect("no panic");
     assert_eq!(summary.error, None);
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+/// Somebody already in the room, watching ada, which is what makes the relay
+/// pull and cache her tracks before the recorder arrives.
+struct Viewer {
+    session: moqom_client::Session,
+    subscriptions: Vec<moqom_client::Subscription>,
+}
+
+impl Viewer {
+    async fn connect(relay: &Relay) -> Self {
+        let token = token("bea", "viewerviewerview-and-the-rest", 0);
+        let credentials = moqom_client::Credentials::bearer(token.as_bytes());
+        let session = moqom_client::Session::connect(
+            relay.addr,
+            "localhost",
+            moqom_client::tls::pinned(relay.certificate.clone()),
+            Some(&credentials),
+        )
+        .await
+        .expect("the viewer is admitted");
+        Self {
+            session,
+            subscriptions: Vec::new(),
+        }
+    }
+
+    async fn watch(&mut self, namespace: &TrackNamespace, track: &str) {
+        let full = moqom_client::FullTrackName::new(
+            namespace.clone(),
+            Bytes::copy_from_slice(track.as_bytes()),
+        )
+        .expect("a track name");
+        let subscription = within("the viewer's subscription", self.session.subscribe(full))
+            .await
+            .expect("subscribed");
+        self.subscriptions.push(subscription);
+    }
+
+    /// Read `count` objects off the latest subscription.
+    async fn received(&mut self, count: usize) {
+        let subscription = self.subscriptions.last_mut().expect("a subscription");
+        for _ in 0..count {
+            within("the viewer to receive", subscription.next_object())
+                .await
+                .expect("readable")
+                .expect("an object");
+        }
+    }
+}
+
+async fn until_tracks(progress: &moqom_recorder::recorder::Progress, tracks: u64) {
+    within("the recorder to subscribe", async {
+        while progress.tracks.load(Ordering::Relaxed) < tracks {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    // SUBSCRIBE_OK is sent once the relay has the subscriber; this only lets
+    // the recorder's task get to its read.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+}
+
+fn manifest_track<'a>(
+    manifest: &'a Manifest,
+    track: &str,
+) -> &'a moqom_recorder::manifest::TrackEntry {
+    manifest
+        .tracks
+        .iter()
+        .find(|entry| entry.track.ends_with(track))
+        .expect("the track is in the manifest")
+}
+
+/// A recorder joining while a group is in flight records that group from its
+/// first object, by fetching it from the relay once the subscription has
+/// shown where the live edge is -- and the catalog, which nobody republishes,
+/// from the relay's cache at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recorder_joining_mid_group_catches_up_on_the_group_in_flight() {
+    let relay = relay();
+    let out = scratch("catch-up");
+    let namespace =
+        TrackNamespace::from_parts([TENANT, "r", ROOM, "ada", DEVICE]).expect("a namespace");
+
+    let mut publisher = Publisher::connect(&relay, &token("ada", PUBLISHER_JKT, 3)).await;
+    let mut asked = publisher.answer(&[(".catalog", 1), ("video", 2)]);
+    publisher.announce(&namespace).await;
+
+    let mut viewer = Viewer::connect(&relay).await;
+    viewer.watch(&namespace, ".catalog").await;
+    until_asked(&mut asked, ".catalog").await;
+    publisher
+        .publish(1, 0, &[(&catalog(false), ObjectProperties::default())])
+        .await;
+    viewer.received(1).await;
+    viewer.watch(&namespace, "video").await;
+    until_asked(&mut asked, "video").await;
+
+    let base = 1_700_000_000_000_000u64;
+    let key = frame(0x65, 400);
+    let delta = frame(0x41, 120);
+    let mut in_flight = publisher.open(2, 5).await;
+    in_flight.write(&key, properties(base, true)).await;
+    in_flight
+        .write(&delta, properties(base + 33_333, false))
+        .await;
+    viewer.received(2).await;
+
+    let running = start(&relay, &out, false);
+    until_tracks(&running.progress, 2).await;
+    in_flight
+        .write(&delta, properties(base + 66_666, false))
+        .await;
+    in_flight.finish();
+    publisher
+        .publish(
+            2,
+            6,
+            &[
+                (&key, properties(base + 100_000, true)),
+                (&delta, properties(base + 133_333, false)),
+                (&delta, properties(base + 166_666, false)),
+            ],
+        )
+        .await;
+    until_archived(&running.progress, 7).await;
+
+    running.stop.send(true).expect("the recorder is running");
+    let summary = within("the recorder to finish", running.task)
+        .await
+        .expect("no panic");
+    assert_eq!(summary.error, None);
+
+    let root = out.join("acme/rec_1/ada").join(DEVICE);
+    let (_, objects) = objects_in(&root.join("video/a1-s00000.mqa"));
+    let mut ids: Vec<(u64, u64)> = objects.iter().map(|seen| (seen.0, seen.1)).collect();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        [(5, 0), (5, 1), (5, 2), (6, 0), (6, 1), (6, 2)],
+        "the group in flight is whole, and nothing is archived twice"
+    );
+
+    let video = manifest_track(&summary.manifest, "/video");
+    assert_eq!(
+        video.joins,
+        [Join {
+            session: 1,
+            from: JoinFrom::CaughtUp,
+            group: Some(5),
+            object: Some(0),
+            reason: None,
+        }]
+    );
+    let catalog = manifest_track(&summary.manifest, "/.catalog");
+    assert_eq!(catalog.joins.len(), 1);
+    assert_eq!(catalog.joins[0].from, JoinFrom::CaughtUp);
+    assert_eq!(catalog.joins[0].object, Some(0));
+
+    // The group-5 CMAF fragment is there too: the fetched group arrived
+    // while the live one was still held for reordering.
+    let cmaf = std::fs::read(root.join("video/a1-r1-p00000.mp4")).expect("a CMAF file");
+    assert_eq!(
+        cmaf.windows(4).filter(|window| window == b"moof").count(),
+        2,
+        "one fragment per group, the caught-up one included"
+    );
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+/// A relay that keeps nothing cannot answer the catch-up, and the recorder
+/// says so rather than pretending the track began where it did.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn without_the_group_in_flight_the_recording_starts_at_the_next_and_says_so() {
+    let relay = relay_with(Limits::none(), 0);
+    let out = scratch("no-catch-up");
+    let namespace =
+        TrackNamespace::from_parts([TENANT, "r", ROOM, "ada", DEVICE]).expect("a namespace");
+
+    let mut publisher = Publisher::connect(&relay, &token("ada", PUBLISHER_JKT, 3)).await;
+    let mut asked = publisher.answer(&[(".catalog", 1), ("video", 2)]);
+    publisher.announce(&namespace).await;
+
+    let mut viewer = Viewer::connect(&relay).await;
+    viewer.watch(&namespace, ".catalog").await;
+    until_asked(&mut asked, ".catalog").await;
+    publisher
+        .publish(1, 0, &[(&catalog(false), ObjectProperties::default())])
+        .await;
+    viewer.received(1).await;
+    viewer.watch(&namespace, "video").await;
+    until_asked(&mut asked, "video").await;
+
+    let base = 1_700_000_000_000_000u64;
+    let key = frame(0x65, 400);
+    let delta = frame(0x41, 120);
+    let mut in_flight = publisher.open(2, 5).await;
+    in_flight.write(&key, properties(base, true)).await;
+    viewer.received(1).await;
+
+    let running = start(&relay, &out, false);
+    until_tracks(&running.progress, 1).await;
+    // Nothing retained the catalog, so the recorder learns of video only when
+    // it is restated.
+    publisher
+        .publish(1, 1, &[(&catalog(false), ObjectProperties::default())])
+        .await;
+    until_tracks(&running.progress, 2).await;
+    in_flight
+        .write(&delta, properties(base + 33_333, false))
+        .await;
+    in_flight.finish();
+    publisher
+        .publish(
+            2,
+            6,
+            &[
+                (&key, properties(base + 100_000, true)),
+                (&delta, properties(base + 133_333, false)),
+            ],
+        )
+        .await;
+    until_archived(&running.progress, 3).await;
+    // Long enough for the refused catch-up to be written down.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    running.stop.send(true).expect("the recorder is running");
+    let summary = within("the recorder to finish", running.task)
+        .await
+        .expect("no panic");
+    assert_eq!(summary.error, None);
+
+    let root = out.join("acme/rec_1/ada").join(DEVICE);
+    let (_, objects) = objects_in(&root.join("video/a1-s00000.mqa"));
+    let ids: Vec<(u64, u64)> = objects.iter().map(|seen| (seen.0, seen.1)).collect();
+    assert_eq!(ids, [(6, 0), (6, 1)]);
+
+    let video = manifest_track(&summary.manifest, "/video");
+    assert_eq!(video.joins.len(), 1);
+    assert_eq!(video.joins[0].from, JoinFrom::NextGroup);
+    assert_eq!(
+        (video.joins[0].group, video.joins[0].object),
+        (Some(6), Some(0))
+    );
+    assert!(video.joins[0].reason.is_some());
+    let catalog = manifest_track(&summary.manifest, "/.catalog");
+    assert_eq!(catalog.joins[0].from, JoinFrom::NextGroup);
+    assert!(catalog.joins[0].reason.is_some());
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+/// A room at its ceiling still admits its recorder, and the recorder does not
+/// take anybody's place: the next person is refused for the people in the
+/// room, not for the recorder.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_full_room_admits_its_recorder_and_the_recorder_takes_no_seat() {
+    let relay = relay_with(Limits::default(), 1);
+    let out = scratch("full");
+    let namespace =
+        TrackNamespace::from_parts([TENANT, "r", ROOM, "ada", DEVICE]).expect("a namespace");
+
+    let mut publisher = Publisher::connect(&relay, &token("ada", PUBLISHER_JKT, 3)).await;
+    let mut asked = publisher.answer(&[(".catalog", 1), ("video", 2)]);
+    publisher.announce(&namespace).await;
+
+    let refused = |relay: &Relay| {
+        let token = token("bea", "viewerviewerview-and-the-rest", 0);
+        let addr = relay.addr;
+        let tls = moqom_client::tls::pinned(relay.certificate.clone());
+        async move {
+            let credentials = moqom_client::Credentials::bearer(token.as_bytes());
+            match moqom_client::Session::connect(addr, "localhost", tls, Some(&credentials)).await {
+                Ok(session) => {
+                    // Refusal can arrive as the connection closing just after
+                    // SETUP rather than in place of it.
+                    let reason = within("a refusal", session.closed()).await;
+                    reason.to_string()
+                }
+                Err(failure) => failure.to_string(),
+            }
+        }
+    };
+    assert!(
+        refused(&relay).await.contains("full"),
+        "the room is full before the recorder arrives"
+    );
+
+    let running = start(&relay, &out, false);
+    until_asked(&mut asked, ".catalog").await;
+    publisher
+        .publish(1, 0, &[(&catalog(false), ObjectProperties::default())])
+        .await;
+    until_asked(&mut asked, "video").await;
+    publish_two_groups(&publisher).await;
+    until_archived(&running.progress, 7).await;
+
+    assert!(
+        refused(&relay).await.contains("full"),
+        "still full, and for the same one person"
+    );
+
+    running.stop.send(true).expect("the recorder is running");
+    let summary = within("the recorder to finish", running.task)
+        .await
+        .expect("no panic");
+    assert_eq!(summary.error, None);
+    let video = manifest_track(&summary.manifest, "/video");
+    assert_eq!(video.objects, 6);
     let _ = std::fs::remove_dir_all(&out);
 }
