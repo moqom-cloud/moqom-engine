@@ -31,7 +31,8 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use bytes::Bytes;
-use moqom_proto::control::{MessageType, Role, Setup};
+use moqom_proto::control::{ControlFrame, MessageType, Role, Setup};
+use web_transport_quinn::SendStream;
 
 use super::socket::{DirectSocket, SocketConfig, StunServer};
 use super::verify::admissible;
@@ -305,9 +306,7 @@ impl DirectEndpoint {
         let peer_identity = relay_identity(&connection).ok_or(Error::NoRelayIdentity)?;
         let quic = connection.clone();
         let transport = raw(connection);
-        let (mut send, recv) = transport.accept_bi().await?;
-        let mut frames = Frames::new(recv);
-        let frame = frames.next().await?.ok_or(Error::Closed)?;
+        let (mut send, frames, frame) = first_speaking_bi(&transport).await?;
         if frame.message_type != MessageType::Setup {
             return Err(Error::Unexpected {
                 found: frame.message_type,
@@ -363,6 +362,40 @@ impl DirectEndpoint {
             Error::PeerUnverified(reason)
         })
     }
+}
+
+/// The first inbound bidirectional stream that carries a control frame.
+///
+/// Network.framework opens a bidirectional stream of its own that it never
+/// writes to, and quinn can hand that one out before the peer's SETUP stream,
+/// so every inbound stream is read at once and the first to speak wins.
+async fn first_speaking_bi(
+    transport: &moqom_transport::Session,
+) -> Result<(SendStream, Frames, ControlFrame), Error> {
+    let (found, mut first) = tokio::sync::mpsc::channel(1);
+    let accepter = {
+        let transport = transport.clone();
+        tokio::spawn(async move {
+            while let Ok((send, recv)) = transport.accept_bi().await {
+                let found = found.clone();
+                tokio::spawn(async move {
+                    let mut frames = Frames::new(recv);
+                    let result = match frames.next().await {
+                        Ok(Some(frame)) => Ok((send, frames, frame)),
+                        Ok(None) => return,
+                        Err(error) => Err(error),
+                    };
+                    let _ = found.send(result).await;
+                });
+            }
+        })
+    };
+    let result = first.recv().await.unwrap_or(Err(Error::Closed));
+    // Stopped before SETUP is answered, so no later stream the session needs
+    // can be taken by this loop.
+    accepter.abort();
+    let _ = accepter.await;
+    result
 }
 
 fn raw(connection: quinn::Connection) -> moqom_transport::Session {
