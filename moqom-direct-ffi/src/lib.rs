@@ -60,6 +60,13 @@
 //! for the same reason as `moqom-rans-ffi`: terminating someone's app is the
 //! worst available outcome. That needs a build with `panic = "unwind"`, which
 //! `build-apple.sh` sets.
+//!
+//! # Linking
+//!
+//! `build-apple.sh` produces `target/MoqomDirectFFI.xcframework` with iOS
+//! device, iOS simulator and macOS slices, module `MoqomDirectFFI`. A target
+//! linking it also needs `Security.framework` and `CoreFoundation.framework`.
+//! visionOS and tvOS have no slice: their Rust targets are tier 3.
 
 // The entire purpose of this crate: borrowing the caller's pointers and handing
 // out raw handles. Each dereference is next to the null check that guards it.

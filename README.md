@@ -18,6 +18,7 @@ end-to-end encryption our decisions instead of someone else's.
 | `moqom-proto` | Apache-2.0 | The object model, control messages, and data plane, per draft (`Draft::{D16, D19, D22}`) |
 | `moqom-transport` | Apache-2.0 | QUIC and WebTransport sessions on one UDP port |
 | `moqom-client` | Apache-2.0 | A MOQT subscriber and publisher for recorders, classifiers, and the CLI; direct (peer-to-peer) sessions in `direct` |
+| `moqom-direct-ffi` | Apache-2.0 | C ABI for the direct path's socket (STUN, NAT probes, pinned QUIC on one port), built into `MoqomDirectFFI.xcframework` for the Swift SDK |
 | `moqom-cli` | Apache-2.0 | The `moqom` binary: `subscribe`, `publish` and `cloudflare sub`, using only `moqom-client` |
 | `moqom-media` | Apache-2.0 | Framing coded video into MOQOM objects, shared by the CLI and the load generator |
 | `moqom-loadgen` | Apache-2.0 | Load generation and relay measurement |
@@ -245,6 +246,11 @@ go test ./internal/token/`.
 and its interop tests run against a relay built from this repository. A change
 to the wire format here that is not mirrored there will fail over there, not
 here.
+
+**The direct-path ABI.** `moqom-direct-ffi/include/moqom_direct.h` is written by
+hand and is what the Swift SDK's `MoqomDirectRust` codes against. Change it
+together with that SDK, and bump `MOQOM_DIRECT_ABI_VERSION` on any incompatible
+change.
 
 ## Design notes
 
