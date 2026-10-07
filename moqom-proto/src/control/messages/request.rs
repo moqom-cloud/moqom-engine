@@ -148,8 +148,10 @@ impl std::fmt::Display for RequestErrorCode {
 pub struct Redirect {
     /// Session URI to connect to. Empty means stay on the current session.
     connect_uri: Bytes,
-    /// Replacement track name. An empty namespace *and* empty name together
-    /// mean the original request's values are reused.
+    /// The Redirect target. In draft-19 an empty namespace *and* empty name
+    /// together mean the original request's values are reused; from draft-22
+    /// (moq-wg #1824) the target is always literal. See
+    /// [`Self::replaces_track_in`].
     pub track: FullTrackName,
 }
 
@@ -163,7 +165,9 @@ impl Redirect {
         }
     }
 
-    /// Redirect to another endpoint, keeping the original track.
+    /// Redirect to another endpoint with an empty target: in draft-19, the
+    /// original track; in draft-22, literally the empty Full Track Name, which
+    /// is what a namespace-scoped request's redirect carries.
     ///
     /// # Errors
     /// [`DecodeError::Invalid`] if the URI exceeds [`MAX_CONNECT_URI_LEN`].
@@ -184,13 +188,25 @@ impl Redirect {
         &self.connect_uri
     }
 
-    /// Whether the track should be replaced, as opposed to reused.
+    /// Whether the track should be replaced, as opposed to reused, under
+    /// draft-19's rule.
     ///
     /// Both parts must be empty to mean "reuse", so a namespace-only redirect
-    /// still counts as a replacement.
+    /// still counts as a replacement. Use [`Self::replaces_track_in`] where
+    /// the session's draft is known.
     #[must_use]
     pub fn replaces_track(&self) -> bool {
         !(self.track.namespace().is_empty() && self.track.name().is_empty())
+    }
+
+    /// Whether the track should be replaced in `draft`: always from draft-22,
+    /// which removed the reuse rule (moq-wg #1824).
+    #[must_use]
+    pub fn replaces_track_in(&self, draft: crate::Draft) -> bool {
+        match draft {
+            crate::Draft::D22 => true,
+            crate::Draft::D16 | crate::Draft::D19 => self.replaces_track(),
+        }
     }
 
     /// Encoded size.
@@ -574,11 +590,15 @@ mod tests {
         }
     }
 
-    /// "Both zero length" means reuse the original track, so an empty
-    /// namespace and empty name is a meaningful encoding rather than an error.
+    /// An empty namespace and empty name is a meaningful encoding rather than
+    /// an error: "reuse the original track" in draft-19, the literal empty
+    /// target in draft-22.
     #[test]
-    fn an_empty_redirect_track_means_reuse() {
-        let reuse = Redirect::to_uri(&b"moqt://x/"[..]).unwrap();
+    fn an_empty_redirect_track_means_reuse_only_before_draft_22() {
+        let empty = Redirect::to_uri(&b"moqt://x/"[..]).unwrap();
+        assert!(!empty.replaces_track_in(crate::Draft::D19));
+        assert!(empty.replaces_track_in(crate::Draft::D22));
+        let reuse = empty;
         assert!(!reuse.replaces_track());
 
         assert!(Redirect::to_track(track()).replaces_track());
