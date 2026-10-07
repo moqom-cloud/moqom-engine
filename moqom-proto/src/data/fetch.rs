@@ -29,6 +29,7 @@ use bytes::{Buf, BufMut, Bytes};
 
 use crate::control::properties::Properties;
 use crate::control::request_id::RequestId;
+use crate::draft::Draft;
 use crate::error::DecodeError;
 use crate::model::{GroupId, Location, ObjectId, SubgroupId};
 use crate::varint::VarInt;
@@ -169,6 +170,16 @@ pub enum FetchRecord {
     /// unknown status. What a relay serving a partial cache says about the part
     /// it does not hold.
     EndOfUnknownRange(Location),
+
+    /// Everything from after the previous record through this location was
+    /// abandoned because the Fill Timeout ran out before an upstream fetch
+    /// produced it (draft-22 §3.2.3). Unlike an unknown range this says the
+    /// relay tried; asking again with a longer timeout may succeed.
+    ///
+    /// Draft-22 only. Under draft-19 it is written as
+    /// [`Self::EndOfUnknownRange`], which is what it means to a reader that
+    /// cannot tell the two apart.
+    EndOfTimedOutRange(Location),
 }
 
 impl FetchRecord {
@@ -177,7 +188,9 @@ impl FetchRecord {
     pub const fn location(&self) -> Location {
         match self {
             Self::Object(object) => object.location,
-            Self::EndOfNonExistentRange(location) | Self::EndOfUnknownRange(location) => *location,
+            Self::EndOfNonExistentRange(location)
+            | Self::EndOfUnknownRange(location)
+            | Self::EndOfTimedOutRange(location) => *location,
         }
     }
 }
@@ -229,6 +242,8 @@ impl FetchFlags {
 
     const END_OF_NON_EXISTENT: u64 = 0x8C;
     const END_OF_UNKNOWN: u64 = 0x10C;
+    /// Draft-22 only.
+    const END_OF_TIMED_OUT: u64 = 0x20C;
 
     /// Flags describing which of a record's optional fields are present.
     ///
@@ -259,7 +274,11 @@ impl FetchFlags {
     }
 
     fn from_code(code: u64) -> Result<Self, DecodeError> {
-        if code < 128 || code == Self::END_OF_NON_EXISTENT || code == Self::END_OF_UNKNOWN {
+        if code < 128
+            || code == Self::END_OF_NON_EXISTENT
+            || code == Self::END_OF_UNKNOWN
+            || (code == Self::END_OF_TIMED_OUT && Draft::current() == Draft::D22)
+        {
             Ok(Self(code))
         } else {
             Err(DecodeError::Invalid(
@@ -269,7 +288,9 @@ impl FetchFlags {
     }
 
     const fn is_end_of_range(self) -> bool {
-        self.0 == Self::END_OF_NON_EXISTENT || self.0 == Self::END_OF_UNKNOWN
+        self.0 == Self::END_OF_NON_EXISTENT
+            || self.0 == Self::END_OF_UNKNOWN
+            || self.0 == Self::END_OF_TIMED_OUT
     }
 
     const fn has_object_delta(self) -> bool {
@@ -376,16 +397,27 @@ struct Plan {
 pub struct FetchWriter {
     order: GroupOrder,
     state: FetchState,
+    draft: Draft,
 }
 
 impl FetchWriter {
-    /// Start writing a stream in `order`.
+    /// Start writing a stream in `order`, in the ambient draft.
     #[must_use]
     pub fn new(order: GroupOrder) -> Self {
         Self {
             order,
             state: FetchState::default(),
+            draft: Draft::current(),
         }
+    }
+
+    /// Write every record in `draft`, whatever the ambient draft is when
+    /// [`Self::write`] is called. A writer lives across awaits; see
+    /// [`crate::draft`].
+    #[must_use]
+    pub const fn in_draft(mut self, draft: Draft) -> Self {
+        self.draft = draft;
+        self
     }
 
     /// Whether nothing has been written yet.
@@ -399,7 +431,7 @@ impl FetchWriter {
     /// # Errors
     /// [`FetchError`] if the record cannot follow what has already been written.
     pub fn encoded_len(&self, record: &FetchRecord) -> Result<usize, FetchError> {
-        Ok(Self::length(&self.plan(record)?))
+        self.draft.scope(|| Ok(Self::length(&self.plan(record)?)))
     }
 
     /// Append a record to the stream.
@@ -414,6 +446,14 @@ impl FetchWriter {
     /// [`Location`] and [`SubgroupId`], which are varints already, and the
     /// deltas between them are checked before anything is written.
     pub fn write<B: BufMut>(
+        &mut self,
+        buf: &mut B,
+        record: &FetchRecord,
+    ) -> Result<(), FetchError> {
+        self.draft.scope(|| self.write_scoped(buf, record))
+    }
+
+    fn write_scoped<B: BufMut>(
         &mut self,
         buf: &mut B,
         record: &FetchRecord,
@@ -481,6 +521,14 @@ impl FetchWriter {
             }
             FetchRecord::EndOfUnknownRange(location) => {
                 self.plan_marker(FetchFlags(FetchFlags::END_OF_UNKNOWN), *location)
+            }
+            FetchRecord::EndOfTimedOutRange(location) => {
+                let code = if self.draft == Draft::D22 {
+                    FetchFlags::END_OF_TIMED_OUT
+                } else {
+                    FetchFlags::END_OF_UNKNOWN
+                };
+                self.plan_marker(FetchFlags(code), *location)
             }
         }
     }
@@ -636,16 +684,25 @@ impl FetchWriter {
 pub struct FetchReader {
     order: GroupOrder,
     state: FetchState,
+    draft: Draft,
 }
 
 impl FetchReader {
-    /// Start reading a stream in `order`.
+    /// Start reading a stream in `order`, in the ambient draft.
     #[must_use]
     pub fn new(order: GroupOrder) -> Self {
         Self {
             order,
             state: FetchState::default(),
+            draft: Draft::current(),
         }
+    }
+
+    /// Read every record in `draft`; see [`FetchWriter::in_draft`].
+    #[must_use]
+    pub const fn in_draft(mut self, draft: Draft) -> Self {
+        self.draft = draft;
+        self
     }
 
     /// Read the next record.
@@ -660,7 +717,7 @@ impl FetchReader {
     /// location can name, or a marker carrying a payload.
     pub fn read(&mut self, buf: &mut &[u8]) -> Result<FetchRecord, DecodeError> {
         let mut cursor = *buf;
-        let (record, next) = self.read_from(&mut cursor)?;
+        let (record, next) = self.draft.scope(|| self.read_from(&mut cursor))?;
         *buf = cursor;
         self.state = next;
         Ok(record)
@@ -699,10 +756,10 @@ impl FetchReader {
             }
             let mut state = self.state;
             state.advance_to_marker(location);
-            let record = if flags.0 == FetchFlags::END_OF_NON_EXISTENT {
-                FetchRecord::EndOfNonExistentRange(location)
-            } else {
-                FetchRecord::EndOfUnknownRange(location)
+            let record = match flags.0 {
+                FetchFlags::END_OF_NON_EXISTENT => FetchRecord::EndOfNonExistentRange(location),
+                FetchFlags::END_OF_TIMED_OUT => FetchRecord::EndOfTimedOutRange(location),
+                _ => FetchRecord::EndOfUnknownRange(location),
             };
             return Ok((record, state));
         }

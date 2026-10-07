@@ -2848,6 +2848,9 @@ impl Session {
                 let start = Location::new(GroupId::new(*start_group), ObjectId::ZERO);
                 Some((track, start, FetchEnd::Through(live)))
             }
+
+            // Only a draft-22 decoder produces this, and no session speaks it yet.
+            FetchKind::Filtered { .. } => None,
         }
     }
 

@@ -13,6 +13,7 @@
 use bytes::{Buf, BufMut, Bytes};
 
 use crate::coding::{decode_bytes, encode_bytes, encoded_bytes_len};
+use crate::draft::Draft;
 use crate::error::DecodeError;
 use crate::varint::VarInt;
 
@@ -77,6 +78,47 @@ pub mod param_type {
     /// track stops paying for the relay's copy and keeps the subscription to
     /// fall back on. Omitted there means unchanged.
     pub const FORWARD: u64 = 0x10;
+
+    /// Milliseconds to keep trying to deliver an object, from its last
+    /// header byte (draft-22 §5.2). Draft-19 called it `DELIVERY_TIMEOUT`.
+    pub const OBJECT_DELIVERY_TIMEOUT: u64 = 0x02;
+    /// Milliseconds a subscriber will wait for a publisher to appear.
+    pub const RENDEZVOUS_TIMEOUT: u64 = 0x04;
+    /// Milliseconds to keep a subgroup stream open.
+    pub const SUBGROUP_DELIVERY_TIMEOUT: u64 = 0x06;
+    /// Milliseconds until the sender ends the subscription.
+    pub const EXPIRES: u64 = 0x08;
+    /// The largest Location the sender has seen on the track.
+    pub const LARGEST_OBJECT: u64 = 0x09;
+    /// Milliseconds a relay may spend fetching upstream for a fetch or a
+    /// fill before reporting the rest as timed out. Draft-22.
+    pub const FILL_TIMEOUT: u64 = 0x0A;
+    /// Priority of this request against the session's others; lower first.
+    pub const SUBSCRIBER_PRIORITY: u64 = 0x20;
+    /// Which Locations pass. Draft-22's structure; draft-19 numbered a
+    /// differently shaped `SUBSCRIPTION_FILTER` here.
+    pub const LOCATION_FILTER: u64 = 0x21;
+    /// Ascending (1) or descending (2) group order.
+    pub const GROUP_ORDER: u64 = 0x22;
+    /// Requests a fill fetch stream and carries its parameters. Draft-22.
+    pub const FILL_PARAMETERS: u64 = 0x23;
+    /// Range filter on Subgroup ID.
+    pub const SUBGROUP_FILTER: u64 = 0x25;
+    /// Range filter on Object ID.
+    pub const OBJECTID_FILTER: u64 = 0x26;
+    /// Range filter on publisher priority.
+    pub const PRIORITY_FILTER: u64 = 0x27;
+    /// Range filter on an object property's value.
+    pub const OBJECT_PROPERTY_FILTER: u64 = 0x28;
+    /// Range filter on a track property's value.
+    pub const TRACK_PROPERTY_FILTER: u64 = 0x29;
+    /// Asks the original publisher to start a new group.
+    pub const NEW_GROUP_REQUEST: u64 = 0x32;
+    /// Replaces the namespace prefix of a namespace or tracks request.
+    pub const TRACK_NAMESPACE_PREFIX: u64 = 0x34;
+    /// Whether objects are sent with their properties: 0 or 1, default 1.
+    /// Draft-22.
+    pub const INCLUDE_PROPERTIES: u64 = 0x35;
 }
 
 /// A parameter could not be constructed.
@@ -111,15 +153,36 @@ pub enum ParamError {
         /// The offending type.
         type_value: u64,
     },
+    /// A draft-22 parameter was given a value its registry entry does not
+    /// take, or its type is not in the registry.
+    #[error("type {type_value} does not take this value in draft-22")]
+    Shape {
+        /// The offending type.
+        type_value: u64,
+    },
 }
 
-/// A parameter value. Which variant is legal is fixed by the type's parity.
+/// A parameter value.
+///
+/// Under parity typing, which is every draft-19 parameter and every SETUP
+/// option, only the first two occur and parity decides which. The rest are
+/// draft-22 Message Parameter shapes ([`typed`](crate::control::typed)); if
+/// one is ever written under parity typing it goes out as the byte string of
+/// its own encoding, so encoding stays infallible.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParamValue {
-    /// A varint, carried by even-numbered types.
+    /// A varint, carried by even-numbered types; also a draft-22 `uint8`.
     VarInt(VarInt),
     /// A length-prefixed byte string, carried by odd-numbered types.
     Bytes(Bytes),
+    /// A Location: `LARGEST_OBJECT`.
+    Location(crate::model::Location),
+    /// A Track Namespace: `TRACK_NAMESPACE_PREFIX`.
+    Namespace(crate::model::TrackNamespace),
+    /// `LOCATION_FILTER`.
+    LocationFilter(crate::control::typed::LocationFilter),
+    /// A parameter block in its own scope: `FILL_PARAMETERS`.
+    Nested(Parameters),
 }
 
 /// A single key-value parameter.
@@ -180,6 +243,12 @@ impl Parameter {
         Ok(())
     }
 
+    /// For constructors that have already checked `type_value` is within
+    /// [`crate::varint::MAX`] — the registry's types all are.
+    pub(crate) const fn from_parts(type_value: u64, value: ParamValue) -> Self {
+        Self { type_value, value }
+    }
+
     /// The parameter type.
     #[must_use]
     pub const fn type_value(&self) -> u64 {
@@ -197,7 +266,7 @@ impl Parameter {
     pub const fn as_varint(&self) -> Option<VarInt> {
         match self.value {
             ParamValue::VarInt(v) => Some(v),
-            ParamValue::Bytes(_) => None,
+            _ => None,
         }
     }
 
@@ -206,8 +275,48 @@ impl Parameter {
     pub const fn as_bytes(&self) -> Option<&Bytes> {
         match &self.value {
             ParamValue::Bytes(b) => Some(b),
-            ParamValue::VarInt(_) => None,
+            _ => None,
         }
+    }
+
+    /// The value as a Location, if it is one.
+    #[must_use]
+    pub const fn as_location(&self) -> Option<crate::model::Location> {
+        match self.value {
+            ParamValue::Location(l) => Some(l),
+            _ => None,
+        }
+    }
+
+    /// The value as a Location Filter, if it is one.
+    #[must_use]
+    pub const fn as_location_filter(&self) -> Option<crate::control::typed::LocationFilter> {
+        match self.value {
+            ParamValue::LocationFilter(f) => Some(f),
+            _ => None,
+        }
+    }
+
+    /// The nested block, if this is `FILL_PARAMETERS`.
+    #[must_use]
+    pub const fn as_nested(&self) -> Option<&Parameters> {
+        match &self.value {
+            ParamValue::Nested(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    /// The bytes a non-parity value is carried as under parity typing.
+    fn parity_fallback(&self) -> Option<Vec<u8>> {
+        let mut out = Vec::new();
+        match &self.value {
+            ParamValue::VarInt(_) | ParamValue::Bytes(_) => return None,
+            ParamValue::Location(l) => l.encode(&mut out),
+            ParamValue::Namespace(ns) => ns.encode(&mut out),
+            ParamValue::LocationFilter(f) => f.encode(&mut out),
+            ParamValue::Nested(p) => p.encode_counted(&mut out),
+        }
+        Some(out)
     }
 
     /// The delta this parameter encodes as, given its predecessor's type.
@@ -234,6 +343,7 @@ impl Parameter {
             + match &self.value {
                 ParamValue::VarInt(v) => v.size(),
                 ParamValue::Bytes(b) => encoded_bytes_len(b.as_ref()),
+                _ => encoded_bytes_len(&self.parity_fallback().unwrap_or_default()),
             }
     }
 
@@ -242,7 +352,27 @@ impl Parameter {
         match &self.value {
             ParamValue::VarInt(v) => v.encode(buf),
             ParamValue::Bytes(b) => encode_bytes(buf, b.as_ref()),
+            _ => encode_bytes(buf, &self.parity_fallback().unwrap_or_default()),
         }
+    }
+
+    fn typed_len_after(&self, previous_type: u64) -> usize {
+        self.delta_from(previous_type).size() + self.typed_value_len()
+    }
+
+    fn typed_encode_after<B: BufMut>(&self, buf: &mut B, previous_type: u64) {
+        self.delta_from(previous_type).encode(buf);
+        self.encode_typed_value(buf);
+    }
+
+    fn typed_decode_after<B: Buf>(buf: &mut B, previous_type: u64) -> Result<Self, DecodeError> {
+        let delta = crate::varint::decode_u64(buf)?;
+        let type_value = previous_type
+            .checked_add(delta)
+            .filter(|t| *t <= crate::varint::MAX)
+            .ok_or(DecodeError::Invalid("unknown message parameter"))?;
+        let value = Self::decode_typed_value(type_value, buf)?;
+        Ok(Self { type_value, value })
     }
 
     fn decode_after<B: Buf>(buf: &mut B, previous_type: u64) -> Result<Self, DecodeError> {
@@ -413,7 +543,17 @@ impl Parameters {
     /// Total encoded size including the leading count.
     #[must_use]
     pub fn encoded_len_counted(&self) -> usize {
-        VarInt::new(self.0.len() as u64).map_or(8, VarInt::size) + self.encoded_len()
+        let count = VarInt::new(self.0.len() as u64).map_or(9, VarInt::size);
+        if !Draft::current().typed_parameters() {
+            return count + self.encoded_len();
+        }
+        let mut previous = 0u64;
+        let mut total = count;
+        for param in &self.0 {
+            total += param.typed_len_after(previous);
+            previous = param.type_value;
+        }
+        total
     }
 
     /// Append the sequence prefixed by a parameter count.
@@ -424,13 +564,25 @@ impl Parameters {
     /// begins. SETUP uses [`Self::encode`] instead, since its options run to the
     /// end of the message.
     ///
+    /// Under a draft with typed parameters each value is written in its
+    /// registry shape ([`typed`](crate::control::typed)); the count and the
+    /// delta-encoded types are the same either way.
+    ///
     /// # Panics
     /// Cannot panic: a parameter count is bounded by the 64 KiB message limit.
     pub fn encode_counted<B: BufMut>(&self, buf: &mut B) {
         VarInt::new(self.0.len() as u64)
             .expect("parameter count within varint range")
             .encode(buf);
-        self.encode(buf);
+        if !Draft::current().typed_parameters() {
+            self.encode(buf);
+            return;
+        }
+        let mut previous = 0u64;
+        for param in &self.0 {
+            param.typed_encode_after(buf, previous);
+            previous = param.type_value;
+        }
     }
 
     /// Decode a count-prefixed sequence.
@@ -461,10 +613,25 @@ impl Parameters {
         let count =
             usize::try_from(count).map_err(|_| DecodeError::Invalid("count exceeds usize"))?;
 
-        let mut params = Vec::with_capacity(count);
+        let typed = Draft::current().typed_parameters();
+        let mut params: Vec<Parameter> = Vec::with_capacity(count);
         let mut previous = 0u64;
         for _ in 0..count {
-            let param = Parameter::decode_after(buf, previous)?;
+            let param = if typed {
+                let param = Parameter::typed_decode_after(buf, previous)?;
+                // §9.20: a repeat the definition does not allow is a
+                // PROTOCOL_VIOLATION. Types ascend, so a repeat is adjacent.
+                if params
+                    .last()
+                    .is_some_and(|p| p.type_value == param.type_value)
+                    && !crate::control::typed::repeatable(param.type_value)
+                {
+                    return Err(DecodeError::Invalid("message parameter repeated"));
+                }
+                param
+            } else {
+                Parameter::decode_after(buf, previous)?
+            };
             previous = param.type_value;
             params.push(param);
         }

@@ -83,6 +83,9 @@ impl RequestErrorCode {
     pub const NAMESPACE_TOO_LARGE: Self = Self(VarInt::from_u32(0x31));
     /// A joining FETCH referenced a request that is not an established
     /// subscription.
+    ///
+    /// Draft-19 only: draft-22 has no joining FETCH and §12.3 drops the
+    /// code. See [`Self::defined_in`].
     pub const INVALID_JOINING_REQUEST_ID: Self = Self(VarInt::from_u32(0x32));
     /// A mandatory track property was not understood.
     pub const UNSUPPORTED_EXTENSION: Self = Self(VarInt::from_u32(0x33));
@@ -92,6 +95,16 @@ impl RequestErrorCode {
     pub const CONFLICTING_FILTERS: Self = Self(VarInt::from_u32(0x35));
     /// A filter parameter is invalid.
     pub const INVALID_FILTER: Self = Self(VarInt::from_u32(0x36));
+
+    /// Whether `draft`'s registry has this code. A code it does not is still
+    /// carried, but MOQOM never sends one.
+    #[must_use]
+    pub fn defined_in(self, draft: crate::Draft) -> bool {
+        match draft {
+            crate::Draft::D22 => self != Self::INVALID_JOINING_REQUEST_ID && self.name().is_some(),
+            _ => self.name().is_some(),
+        }
+    }
 
     /// The registered name, if this build knows the code.
     #[must_use]
@@ -264,8 +277,10 @@ impl RequestOk {
     /// [`DecodeError::Short`] if incomplete; [`DecodeError::Invalid`] if
     /// malformed.
     pub fn decode<B: Buf>(buf: &mut B) -> Result<Self, DecodeError> {
+        let parameters = Parameters::decode_counted(buf)?;
+        crate::control::typed::check_typed(crate::control::typed::Context::RequestOk, &parameters)?;
         Ok(Self {
-            parameters: Parameters::decode_counted(buf)?,
+            parameters,
             properties: Properties::decode_to_end(buf)?,
         })
     }
