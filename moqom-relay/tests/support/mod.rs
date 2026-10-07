@@ -1619,7 +1619,7 @@ fn fresh_proof_id() -> String {
 }
 
 pub mod tokens {
-    use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair};
+    use aws_lc_rs::signature::{KeyPair, ML_DSA_65_SIGNING, PqdsaKeyPair};
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use moqom_relay::{Authenticator, VerificationKey};
@@ -1639,8 +1639,8 @@ pub mod tokens {
     }
 
     /// A deterministic key, so a failing test fails the same way twice.
-    fn signer() -> Ed25519KeyPair {
-        Ed25519KeyPair::from_seed_unchecked(&[7u8; 32]).expect("a valid Ed25519 seed")
+    fn signer() -> PqdsaKeyPair {
+        PqdsaKeyPair::from_seed(&ML_DSA_65_SIGNING, &[7u8; 32]).expect("a valid ML-DSA-65 seed")
     }
 
     /// The direct-ticket keys a ticketing relay here signs with.
@@ -1652,10 +1652,10 @@ pub mod tokens {
     pub fn authenticator() -> Authenticator {
         Authenticator::new(
             ISSUER,
-            vec![VerificationKey {
-                id: KID.to_owned(),
-                bytes: signer().public_key().as_ref().to_vec(),
-            }],
+            vec![VerificationKey::ml_dsa_65(
+                KID,
+                signer().public_key().as_ref().to_vec(),
+            )],
         )
     }
 
@@ -1714,8 +1714,8 @@ pub mod tokens {
         /// identifier of one it does: what somebody without the control plane's
         /// key can make.
         pub fn token_forged(&self) -> String {
-            let stranger =
-                Ed25519KeyPair::from_seed_unchecked(&[9u8; 32]).expect("a valid Ed25519 seed");
+            let stranger = PqdsaKeyPair::from_seed(&ML_DSA_65_SIGNING, &[9u8; 32])
+                .expect("a valid ML-DSA-65 seed");
             let claims = self.claims(THUMBPRINT, 0, 600);
             sign(&stranger, &header(), &claims)
         }
@@ -1824,7 +1824,7 @@ pub mod tokens {
     }
 
     fn header() -> serde_json::Value {
-        serde_json::json!({ "alg": "EdDSA", "typ": "MOQT", "kid": KID })
+        serde_json::json!({ "alg": "ML-DSA-65", "typ": "MOQT", "kid": KID })
     }
 
     /// The client's half of proof of possession: a device key, and proofs made
@@ -1920,16 +1920,16 @@ pub mod tokens {
         sign(&signer(), header, claims)
     }
 
-    fn sign(
-        key: &Ed25519KeyPair,
-        header: &serde_json::Value,
-        claims: &serde_json::Value,
-    ) -> String {
+    fn sign(key: &PqdsaKeyPair, header: &serde_json::Value, claims: &serde_json::Value) -> String {
         let segment = |value: &serde_json::Value| {
             URL_SAFE_NO_PAD.encode(serde_json::to_vec(value).expect("serialisable"))
         };
         let signing = format!("{}.{}", segment(header), segment(claims));
-        let signature = key.sign(signing.as_bytes());
-        format!("{signing}.{}", URL_SAFE_NO_PAD.encode(signature.as_ref()))
+        let mut signature = vec![0u8; ML_DSA_65_SIGNING.signature_len()];
+        let written = key
+            .sign(signing.as_bytes(), &mut signature)
+            .expect("ML-DSA-65 signs");
+        signature.truncate(written);
+        format!("{signing}.{}", URL_SAFE_NO_PAD.encode(&signature))
     }
 }

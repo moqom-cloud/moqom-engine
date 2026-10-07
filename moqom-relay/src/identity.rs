@@ -28,24 +28,21 @@
 //!
 //! # The format
 //!
-//! Ed25519 over JSON claims in the compact JWS serialisation, minted by the Go
-//! control plane's `token` package. The full design target is CAT/CWT with COSE;
-//! this is the subset that exists on both sides today.
+//! ML-DSA-65 (FIPS 204) over JSON claims in the compact JWS serialisation,
+//! minted by the Go control plane's `token` package. Ed25519 keys are still read,
+//! so tokens signed before the move to ML-DSA verify until they expire. The full
+//! design target is CAT/CWT with COSE; this is the subset that exists on both
+//! sides today.
 //!
-//! What the `cnf.jkt` thumbprint means depends on the relay's configuration, and
-//! this module is where that is decided. It names the device the token was issued
-//! to, and [`crate::possession`] is what turns naming into proving — a session
-//! that must show a signature from that device is holding a credential nobody can
-//! steal by copying, and one that need not is holding a bearer token whose short
-//! life is the only thing limiting a copy. Both are reachable; see
-//! [`Enforcement`](crate::possession::Enforcement) for why the weaker one still
-//! exists.
+//! The `cnf.jkt` thumbprint names the device the token was issued to, and
+//! [`crate::possession`] turns naming into proving: every session shows a
+//! signature from that device, so a copied token is worth nothing.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use aws_lc_rs::signature::{ED25519, UnparsedPublicKey};
+use aws_lc_rs::signature::{ED25519, ML_DSA_65, UnparsedPublicKey};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::Deserialize;
@@ -53,15 +50,6 @@ use serde::Deserialize;
 use crate::possession::Possession;
 use crate::quota::Principal;
 use crate::scope::{self, Permission, Publish, capability};
-
-/// The one algorithm accepted.
-///
-/// Pinned rather than read from the token, which is the whole defence against
-/// algorithm confusion: a verifier that dispatches on the token's own `alg` can
-/// be told to use `none`, or to verify an HMAC using the public key as the
-/// shared secret. Both produce forgeries that validate. The Go minter pins the
-/// same string for the same reason.
-const ALGORITHM: &str = "EdDSA";
 
 /// The token type, so a JWS minted for something else cannot be replayed here.
 const TOKEN_TYPE: &str = "MOQT";
@@ -85,8 +73,9 @@ const DEVICE_ID_LENGTH: usize = 16;
 /// Checked before anything is decoded, because the work below is proportional
 /// to the input and a peer that can hand us a megabyte of base64 to parse per
 /// connection attempt has found a cheaper attack than the one the rate limiter
-/// is watching for. Real tokens are around four hundred bytes.
-const MAX_TOKEN_BYTES: usize = 4096;
+/// is watching for. Real tokens are about five kilobytes, nearly all of it the
+/// 3,309-byte ML-DSA-65 signature in base64.
+const MAX_TOKEN_BYTES: usize = 8192;
 
 /// Why a token was not accepted.
 ///
@@ -98,7 +87,7 @@ pub enum AuthError {
     /// Not a well-formed token.
     #[error("token is malformed: {0}")]
     Malformed(&'static str),
-    /// Signed with something other than Ed25519, or not a MOQT token.
+    /// Not a MOQT token, or naming an algorithm other than its key's.
     #[error("token algorithm or type is not supported")]
     Unsupported,
     /// Signed by a key this relay does not have.
@@ -286,16 +275,98 @@ struct Scope {
     rly: bool,
 }
 
+/// What a [`VerificationKey`] verifies with.
+///
+/// A property of the key rather than of the token, which is the whole defence
+/// against algorithm confusion: a verifier that dispatches on the token's own
+/// `alg` can be told to use `none`, or to verify an HMAC using the public key
+/// as the shared secret. A token here must name its key's algorithm, and is
+/// verified with that algorithm and no other. The Go minter does the same.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyAlgorithm {
+    /// ML-DSA-65, which every token and ticket is signed with.
+    MlDsa65,
+    /// Ed25519, read only to verify what was signed before ML-DSA.
+    Ed25519,
+}
+
+impl KeyAlgorithm {
+    /// The JOSE `alg` a token signed with this key carries.
+    #[must_use]
+    pub const fn jose(self) -> &'static str {
+        match self {
+            Self::MlDsa65 => "ML-DSA-65",
+            Self::Ed25519 => "EdDSA",
+        }
+    }
+
+    const fn public_key_bytes(self) -> usize {
+        match self {
+            Self::MlDsa65 => 1952,
+            Self::Ed25519 => 32,
+        }
+    }
+}
+
 /// A public key this relay will accept tokens from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerificationKey {
     /// The `kid` naming it.
     pub id: String,
-    /// Raw Ed25519 public key bytes.
+    /// What it verifies with.
+    pub algorithm: KeyAlgorithm,
+    /// The raw public key.
     pub bytes: Vec<u8>,
 }
 
 impl VerificationKey {
+    /// An ML-DSA-65 key from its 1,952-byte encoding.
+    #[must_use]
+    pub fn ml_dsa_65(id: impl Into<String>, bytes: Vec<u8>) -> Self {
+        Self {
+            id: id.into(),
+            algorithm: KeyAlgorithm::MlDsa65,
+            bytes,
+        }
+    }
+
+    /// A legacy Ed25519 key from its 32 bytes.
+    #[must_use]
+    pub fn ed25519(id: impl Into<String>, bytes: Vec<u8>) -> Self {
+        Self {
+            id: id.into(),
+            algorithm: KeyAlgorithm::Ed25519,
+            bytes,
+        }
+    }
+
+    /// Whether `signature` is this key's over `message`, by this key's own
+    /// algorithm.
+    #[must_use]
+    pub fn verifies(&self, message: &[u8], signature: &[u8]) -> bool {
+        let algorithm: &dyn aws_lc_rs::signature::VerificationAlgorithm = match self.algorithm {
+            KeyAlgorithm::MlDsa65 => &ML_DSA_65,
+            KeyAlgorithm::Ed25519 => &ED25519,
+        };
+        UnparsedPublicKey::new(algorithm, self.bytes.as_slice())
+            .verify(message, signature)
+            .is_ok()
+    }
+
+    /// The key as a JWK, in the shape [`Self::parse_set`] reads.
+    #[must_use]
+    pub fn jwk(&self) -> serde_json::Value {
+        let encoded = URL_SAFE_NO_PAD.encode(&self.bytes);
+        match self.algorithm {
+            KeyAlgorithm::MlDsa65 => serde_json::json!({
+                "kty": "AKP", "alg": "ML-DSA-65", "kid": self.id, "pub": encoded,
+            }),
+            KeyAlgorithm::Ed25519 => serde_json::json!({
+                "kty": "OKP", "crv": "Ed25519", "kid": self.id, "x": encoded,
+            }),
+        }
+    }
+
     /// Read keys from the JWK set the control plane serves.
     ///
     /// Accepts either a bare array of JWKs or the `{"keys": [...]}` wrapper, so
@@ -308,9 +379,15 @@ impl VerificationKey {
         #[derive(Deserialize)]
         struct Jwk {
             kty: String,
+            #[serde(default)]
             crv: String,
+            #[serde(default)]
+            alg: String,
             kid: String,
+            #[serde(default)]
             x: String,
+            #[serde(default, rename = "pub")]
+            public: String,
         }
         #[derive(Deserialize)]
         #[serde(untagged)]
@@ -327,23 +404,35 @@ impl VerificationKey {
 
         jwks.into_iter()
             .map(|jwk| {
-                if jwk.kty != "OKP" || jwk.crv != "Ed25519" {
-                    return Err(format!(
-                        "key {}: only OKP/Ed25519 is supported, got {}/{}",
-                        jwk.kid, jwk.kty, jwk.crv
-                    ));
-                }
+                let (algorithm, field, name) = match (jwk.kty.as_str(), jwk.crv.as_str()) {
+                    ("AKP", _) if jwk.alg == "ML-DSA-65" => {
+                        (KeyAlgorithm::MlDsa65, &jwk.public, "pub")
+                    }
+                    ("OKP", "Ed25519") => (KeyAlgorithm::Ed25519, &jwk.x, "x"),
+                    _ => {
+                        return Err(format!(
+                            "key {}: only AKP/ML-DSA-65 and OKP/Ed25519 are supported, got {}/{}{}",
+                            jwk.kid, jwk.kty, jwk.alg, jwk.crv
+                        ));
+                    }
+                };
                 let bytes = URL_SAFE_NO_PAD
-                    .decode(jwk.x.as_bytes())
-                    .map_err(|e| format!("key {}: x is not base64url: {e}", jwk.kid))?;
-                if bytes.len() != 32 {
+                    .decode(field.as_bytes())
+                    .map_err(|e| format!("key {}: {name} is not base64url: {e}", jwk.kid))?;
+                if bytes.len() != algorithm.public_key_bytes() {
                     return Err(format!(
-                        "key {}: an Ed25519 public key is 32 bytes, got {}",
+                        "key {}: an {} public key is {} bytes, got {}",
                         jwk.kid,
+                        algorithm.jose(),
+                        algorithm.public_key_bytes(),
                         bytes.len()
                     ));
                 }
-                Ok(Self { id: jwk.kid, bytes })
+                Ok(Self {
+                    id: jwk.kid,
+                    algorithm,
+                    bytes,
+                })
             })
             .collect()
     }
@@ -384,7 +473,7 @@ pub struct Authenticator {
 
 struct Shared {
     /// What the operator configured, kept apart so that a push cannot drop it.
-    configured: HashMap<String, Vec<u8>>,
+    configured: HashMap<String, VerificationKey>,
     /// The union of the above and the most recent push, which is what verifies.
     effective: RwLock<Arc<Keys>>,
 }
@@ -393,7 +482,7 @@ struct Keys {
     issuer: String,
     /// The one tenant this relay serves, or empty for any.
     tenant: String,
-    by_id: HashMap<String, Vec<u8>>,
+    by_id: HashMap<String, VerificationKey>,
 }
 
 impl std::fmt::Debug for Authenticator {
@@ -421,7 +510,7 @@ impl Authenticator {
     /// from the control plane are checked against the right one.
     #[must_use]
     pub fn new(issuer: impl Into<String>, keys: Vec<VerificationKey>) -> Self {
-        let configured: HashMap<_, _> = keys.into_iter().map(|key| (key.id, key.bytes)).collect();
+        let configured: HashMap<_, _> = keys.into_iter().map(|key| (key.id.clone(), key)).collect();
         Self {
             inner: Arc::new(Shared {
                 effective: RwLock::new(Arc::new(Keys {
@@ -487,7 +576,7 @@ impl Authenticator {
     #[must_use]
     pub fn accept(&self, pushed: Vec<VerificationKey>) -> usize {
         let mut by_id = self.inner.configured.clone();
-        by_id.extend(pushed.into_iter().map(|key| (key.id, key.bytes)));
+        by_id.extend(pushed.into_iter().map(|key| (key.id.clone(), key)));
         let count = by_id.len();
 
         let mut effective = self
@@ -814,12 +903,15 @@ impl Keys {
         }
 
         let header: Header = decode_segment(header_segment, "header")?;
-        if header.alg != ALGORITHM || header.typ != TOKEN_TYPE {
+        if header.typ != TOKEN_TYPE {
             return Err(AuthError::Unsupported);
         }
-        let Some(public) = self.by_id.get(&header.kid) else {
+        let Some(key) = self.by_id.get(&header.kid) else {
             return Err(AuthError::UnknownKey);
         };
+        if header.alg != key.algorithm.jose() {
+            return Err(AuthError::Unsupported);
+        }
 
         let signature = URL_SAFE_NO_PAD
             .decode(signature_segment)
@@ -828,9 +920,9 @@ impl Keys {
         // The signed message is `header.claims`, which is everything before the
         // final separator.
         let signed = &token[..header_segment.len() + 1 + claims_segment.len()];
-        UnparsedPublicKey::new(&ED25519, public.as_slice())
-            .verify(signed, &signature)
-            .map_err(|_| AuthError::BadSignature)?;
+        if !key.verifies(signed, &signature) {
+            return Err(AuthError::BadSignature);
+        }
 
         // Only now are the claims worth reading. Parsing them earlier and
         // acting on the result — even to produce a better error message — is
@@ -984,10 +1076,10 @@ mod tests {
     fn authenticator() -> Authenticator {
         Authenticator::new(
             "https://api.moqom.cloud",
-            vec![VerificationKey {
-                id: KID.to_owned(),
-                bytes: signer().public_key().as_ref().to_vec(),
-            }],
+            vec![VerificationKey::ed25519(
+                KID.to_owned(),
+                signer().public_key().as_ref().to_vec(),
+            )],
         )
     }
 
@@ -1278,10 +1370,10 @@ mod tests {
         Authenticator::for_tenant(
             "https://api.moqom.cloud",
             tenant,
-            vec![VerificationKey {
-                id: KID.to_owned(),
-                bytes: signer().public_key().as_ref().to_vec(),
-            }],
+            vec![VerificationKey::ed25519(
+                KID.to_owned(),
+                signer().public_key().as_ref().to_vec(),
+            )],
         )
     }
 
@@ -1315,10 +1407,10 @@ mod tests {
         // the operator's and must not go with them.
         let now = at(0);
         let authenticator = pinned("acme");
-        let count = authenticator.accept(vec![VerificationKey {
-            id: KID.to_owned(),
-            bytes: signer().public_key().as_ref().to_vec(),
-        }]);
+        let count = authenticator.accept(vec![VerificationKey::ed25519(
+            KID.to_owned(),
+            signer().public_key().as_ref().to_vec(),
+        )]);
         assert_eq!(count, 1);
         let mut theirs = claims(now);
         theirs["aud"] = serde_json::json!("globex");
@@ -1488,10 +1580,10 @@ mod tests {
             "before any key arrives the token is not read, only ignored"
         );
 
-        let pushed = authenticator.accept(vec![VerificationKey {
-            id: KID.to_owned(),
-            bytes: signer().public_key().as_ref().to_vec(),
-        }]);
+        let pushed = authenticator.accept(vec![VerificationKey::ed25519(
+            KID.to_owned(),
+            signer().public_key().as_ref().to_vec(),
+        )]);
 
         assert_eq!(pushed, 1);
         assert!(authenticator.is_verifying());
@@ -1512,10 +1604,10 @@ mod tests {
         let token = mint(&header(), &claims(now));
         let authenticator = authenticator();
 
-        let _ = authenticator.accept(vec![VerificationKey {
-            id: "some-other-key".to_owned(),
-            bytes: vec![7u8; 32],
-        }]);
+        let _ = authenticator.accept(vec![VerificationKey::ed25519(
+            "some-other-key".to_owned(),
+            vec![7u8; 32],
+        )]);
 
         assert_eq!(
             authenticator.identify([token.as_bytes()], peer(), now),
@@ -1530,10 +1622,8 @@ mod tests {
         // is the one guarantee a retirement is supposed to make.
         let now = at(0);
         let token = mint(&header(), &claims(now));
-        let real = VerificationKey {
-            id: KID.to_owned(),
-            bytes: signer().public_key().as_ref().to_vec(),
-        };
+        let real =
+            VerificationKey::ed25519(KID.to_owned(), signer().public_key().as_ref().to_vec());
 
         let authenticator = Authenticator::new("https://api.moqom.cloud", Vec::new());
         let _ = authenticator.accept(vec![real]);
@@ -1543,10 +1633,10 @@ mod tests {
                 .is_ok()
         );
 
-        let _ = authenticator.accept(vec![VerificationKey {
-            id: "the-only-key-now".to_owned(),
-            bytes: vec![9u8; 32],
-        }]);
+        let _ = authenticator.accept(vec![VerificationKey::ed25519(
+            "the-only-key-now".to_owned(),
+            vec![9u8; 32],
+        )]);
 
         assert!(
             authenticator
@@ -1599,5 +1689,89 @@ mod tests {
         assert_eq!(AuthError::Expired.code(), Code::EXPIRED_AUTH_TOKEN);
         assert_eq!(AuthError::Unsupported.code(), Code::MALFORMED_AUTH_TOKEN);
         assert_eq!(AuthError::BadSignature.code(), Code::UNAUTHORIZED);
+    }
+
+    fn ml_dsa_signer() -> aws_lc_rs::signature::PqdsaKeyPair {
+        aws_lc_rs::signature::PqdsaKeyPair::from_seed(
+            &aws_lc_rs::signature::ML_DSA_65_SIGNING,
+            &[8u8; 32],
+        )
+        .expect("a valid ML-DSA-65 seed")
+    }
+
+    fn ml_dsa_mint(alg: &str, kid: &str, claims: &serde_json::Value) -> String {
+        let header = serde_json::json!({ "alg": alg, "typ": "MOQT", "kid": kid });
+        let signing = format!("{}.{}", segment(&header), segment(claims));
+        let mut signature = vec![0u8; aws_lc_rs::signature::ML_DSA_65_SIGNING.signature_len()];
+        let written = ml_dsa_signer()
+            .sign(signing.as_bytes(), &mut signature)
+            .expect("signs");
+        signature.truncate(written);
+        format!("{signing}.{}", URL_SAFE_NO_PAD.encode(&signature))
+    }
+
+    /// Both kinds of key at once, as during the move from Ed25519.
+    fn rollover() -> Authenticator {
+        Authenticator::new(
+            "https://api.moqom.cloud",
+            vec![
+                VerificationKey::ml_dsa_65("pq", ml_dsa_signer().public_key().as_ref().to_vec()),
+                VerificationKey::ed25519(KID, signer().public_key().as_ref().to_vec()),
+            ],
+        )
+    }
+
+    #[test]
+    fn an_ml_dsa_token_verifies_beside_a_legacy_ed25519_one() {
+        let now = SystemTime::now();
+        let authenticator = rollover();
+        let pq = ml_dsa_mint("ML-DSA-65", "pq", &claims(now));
+        assert!(pq.len() > 4096 && pq.len() < MAX_TOKEN_BYTES);
+        assert!(authenticator.identify([pq.as_bytes()], peer(), now).is_ok());
+        let legacy = mint(&header(), &claims(now));
+        assert!(
+            authenticator
+                .identify([legacy.as_bytes()], peer(), now)
+                .is_ok()
+        );
+    }
+
+    /// The algorithm belongs to the key, so neither kind of key can be made
+    /// to verify with the other's algorithm by what a token's header says.
+    #[test]
+    fn a_token_naming_another_algorithm_than_its_keys_is_refused() {
+        let now = SystemTime::now();
+        let authenticator = rollover();
+        let claims = claims(now);
+
+        let pq_as_eddsa = ml_dsa_mint("EdDSA", "pq", &claims);
+        assert_eq!(
+            authenticator
+                .identify([pq_as_eddsa.as_bytes()], peer(), now)
+                .err(),
+            Some(AuthError::Unsupported)
+        );
+        let legacy_as_pq = mint(
+            &serde_json::json!({ "alg": "ML-DSA-65", "typ": "MOQT", "kid": KID }),
+            &claims,
+        );
+        assert_eq!(
+            authenticator
+                .identify([legacy_as_pq.as_bytes()], peer(), now)
+                .err(),
+            Some(AuthError::Unsupported)
+        );
+    }
+
+    #[test]
+    fn an_akp_key_is_read_from_a_set() {
+        let key = VerificationKey::ml_dsa_65("pq", ml_dsa_signer().public_key().as_ref().to_vec());
+        let document = serde_json::json!({ "keys": [key.jwk()] }).to_string();
+        assert_eq!(VerificationKey::parse_set(&document), Ok(vec![key]));
+
+        let short = r#"[{"kty":"AKP","alg":"ML-DSA-65","kid":"k","pub":"AAAA"}]"#;
+        assert!(VerificationKey::parse_set(short).is_err());
+        let other = r#"[{"kty":"AKP","alg":"ML-DSA-44","kid":"k","pub":"AAAA"}]"#;
+        assert!(VerificationKey::parse_set(other).is_err());
     }
 }

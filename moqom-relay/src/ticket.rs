@@ -11,7 +11,7 @@
 //! # Not a token
 //!
 //! A ticket is a compact JWS like a MOQOM token and is verified the same way,
-//! against an Ed25519 JWK by `kid`, but nothing about it can be mistaken for
+//! against an ML-DSA-65 JWK by `kid`, but nothing about it can be mistaken for
 //! one. Its `typ` is [`TICKET_TYPE`], which a token verifier refuses, and it is
 //! signed by a key in a separate set: a relay holds the private half of a
 //! ticket key, and a relay holding a key that verified tokens could mint them.
@@ -26,12 +26,12 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use aws_lc_rs::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
+use aws_lc_rs::signature::{KeyPair, ML_DSA_65_SIGNING, PqdsaKeyPair};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 
-use crate::identity::VerificationKey;
+use crate::identity::{KeyAlgorithm, VerificationKey};
 
 /// The JWS `typ` every ticket carries and a token never does.
 pub const TICKET_TYPE: &str = "moqom-direct-ticket";
@@ -48,12 +48,13 @@ pub const LIFETIME: Duration = Duration::from_secs(90);
 /// checking it. The same allowance a token gets.
 pub const CLOCK_SKEW: Duration = Duration::from_secs(30);
 
-/// Longest ticket a peer reads. A real one is a few hundred bytes.
-const LONGEST: usize = 2048;
+/// Longest ticket a peer reads. A real one is about 4.7 kilobytes, nearly all of
+/// it the 3,309-byte ML-DSA-65 signature in base64.
+const LONGEST: usize = 8192;
 
 /// The ticket keys a relay signs with and publishes.
 pub struct TicketKeys {
-    signer: Ed25519KeyPair,
+    signer: PqdsaKeyPair,
     kid: String,
     published: Vec<VerificationKey>,
 }
@@ -68,8 +69,9 @@ impl std::fmt::Debug for TicketKeys {
 }
 
 impl TicketKeys {
-    /// Read a JWK set of Ed25519 keys. The first key with a private half (`d`)
-    /// signs; every key's public half is published.
+    /// Read a JWK set. The first ML-DSA-65 key (`AKP`) with a private seed
+    /// (`priv`) signs; every key's public half is published, including Ed25519
+    /// (`OKP`) keys, which only verify tickets issued before the move.
     ///
     /// # Errors
     /// What is wrong with the document, for the operator who wrote it.
@@ -77,11 +79,17 @@ impl TicketKeys {
         #[derive(Deserialize)]
         struct Jwk {
             kty: String,
-            crv: String,
-            kid: String,
-            x: String,
             #[serde(default)]
-            d: Option<String>,
+            crv: String,
+            #[serde(default)]
+            alg: String,
+            kid: String,
+            #[serde(default)]
+            x: String,
+            #[serde(default, rename = "pub")]
+            public: String,
+            #[serde(default, rename = "priv")]
+            private: Option<String>,
         }
         #[derive(Deserialize)]
         #[serde(untagged)]
@@ -97,26 +105,41 @@ impl TicketKeys {
         let mut signer = None;
         let mut published = Vec::with_capacity(keys.len());
         for jwk in keys {
-            if jwk.kty != "OKP" || jwk.crv != "Ed25519" {
-                return Err(format!(
-                    "ticket key {}: only OKP/Ed25519 is supported",
-                    jwk.kid
-                ));
+            match (jwk.kty.as_str(), jwk.crv.as_str()) {
+                ("AKP", _) if jwk.alg == "ML-DSA-65" => {
+                    let public = URL_SAFE_NO_PAD
+                        .decode(&jwk.public)
+                        .map_err(|_| format!("ticket key {}: bad pub", jwk.kid))?;
+                    if let (Some(private), None) = (&jwk.private, &signer) {
+                        let seed = decode_32(private)
+                            .ok_or_else(|| format!("ticket key {}: bad priv", jwk.kid))?;
+                        let pair = PqdsaKeyPair::from_seed(&ML_DSA_65_SIGNING, &seed)
+                            .map_err(|_| format!("ticket key {}: bad priv", jwk.kid))?;
+                        if pair.public_key().as_ref() != public.as_slice() {
+                            return Err(format!(
+                                "ticket key {}: priv and pub are not one key",
+                                jwk.kid
+                            ));
+                        }
+                        signer = Some((pair, jwk.kid.clone()));
+                    }
+                    published.push(VerificationKey::ml_dsa_65(jwk.kid, public));
+                }
+                ("OKP", "Ed25519") => {
+                    let public = decode_32(&jwk.x)
+                        .ok_or_else(|| format!("ticket key {}: bad x", jwk.kid))?;
+                    published.push(VerificationKey::ed25519(jwk.kid, public.to_vec()));
+                }
+                _ => {
+                    return Err(format!(
+                        "ticket key {}: only AKP/ML-DSA-65 and OKP/Ed25519 are supported",
+                        jwk.kid
+                    ));
+                }
             }
-            let public =
-                decode_32(&jwk.x).ok_or_else(|| format!("ticket key {}: bad x", jwk.kid))?;
-            if let (Some(d), None) = (&jwk.d, &signer) {
-                let seed = decode_32(d).ok_or_else(|| format!("ticket key {}: bad d", jwk.kid))?;
-                let pair = Ed25519KeyPair::from_seed_and_public_key(&seed, &public)
-                    .map_err(|_| format!("ticket key {}: d and x are not one key", jwk.kid))?;
-                signer = Some((pair, jwk.kid.clone()));
-            }
-            published.push(VerificationKey {
-                id: jwk.kid,
-                bytes: public.to_vec(),
-            });
         }
-        let (signer, kid) = signer.ok_or("no ticket key has a private half (d) to sign with")?;
+        let (signer, kid) =
+            signer.ok_or("no ML-DSA-65 ticket key has a private seed (priv) to sign with")?;
         Ok(Self {
             signer,
             kid,
@@ -124,18 +147,20 @@ impl TicketKeys {
         })
     }
 
-    /// One key, from a seed. For tests and for embedders that hold their own.
+    /// One ML-DSA-65 key, from its FIPS 204 seed. For tests and for embedders
+    /// that hold their own.
     ///
     /// # Panics
     /// Never for a 32-byte seed.
     #[must_use]
     pub fn from_seed(kid: impl Into<String>, seed: &[u8; 32]) -> Self {
-        let signer = Ed25519KeyPair::from_seed_unchecked(seed).expect("any 32 bytes are a seed");
+        let signer =
+            PqdsaKeyPair::from_seed(&ML_DSA_65_SIGNING, seed).expect("any 32 bytes are a seed");
         let kid = kid.into();
-        let published = vec![VerificationKey {
-            id: kid.clone(),
-            bytes: signer.public_key().as_ref().to_vec(),
-        }];
+        let published = vec![VerificationKey::ml_dsa_65(
+            kid.clone(),
+            signer.public_key().as_ref().to_vec(),
+        )];
         Self {
             signer,
             kid,
@@ -146,17 +171,7 @@ impl TicketKeys {
     /// Every public key, as JWKs, for the ticket objects.
     #[must_use]
     pub fn public_jwks(&self) -> Vec<serde_json::Value> {
-        self.published
-            .iter()
-            .map(|key| {
-                serde_json::json!({
-                    "kty": "OKP",
-                    "crv": "Ed25519",
-                    "kid": key.id,
-                    "x": URL_SAFE_NO_PAD.encode(&key.bytes),
-                })
-            })
-            .collect()
+        self.published.iter().map(VerificationKey::jwk).collect()
     }
 
     /// Every public key, for verifying.
@@ -171,12 +186,19 @@ impl TicketKeys {
     /// Never: the claims are plain strings and integers.
     #[must_use]
     pub fn issue(&self, claims: &Claims) -> String {
-        let header = serde_json::json!({ "alg": "EdDSA", "typ": TICKET_TYPE, "kid": self.kid });
+        let header = serde_json::json!({
+            "alg": KeyAlgorithm::MlDsa65.jose(), "typ": TICKET_TYPE, "kid": self.kid,
+        });
         let header = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).expect("a JSON object"));
         let body = URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims).expect("a JSON object"));
         let signed = format!("{header}.{body}");
-        let signature = self.signer.sign(signed.as_bytes());
-        format!("{signed}.{}", URL_SAFE_NO_PAD.encode(signature.as_ref()))
+        let mut signature = vec![0u8; ML_DSA_65_SIGNING.signature_len()];
+        let written = self
+            .signer
+            .sign(signed.as_bytes(), &mut signature)
+            .expect("ML-DSA-65 signs any message");
+        signature.truncate(written);
+        format!("{signed}.{}", URL_SAFE_NO_PAD.encode(&signature))
     }
 }
 
@@ -322,19 +344,22 @@ pub fn verify(
     };
     let parsed: Header =
         serde_json::from_slice(&decode(header)?).map_err(|_| TicketError::Malformed)?;
-    if parsed.alg != "EdDSA" || parsed.typ != TICKET_TYPE {
+    if parsed.typ != TICKET_TYPE {
         return Err(TicketError::Unsupported);
     }
     let key = keys
         .iter()
         .find(|key| key.id == parsed.kid)
         .ok_or(TicketError::UnknownKey)?;
-    UnparsedPublicKey::new(&ED25519, &key.bytes)
-        .verify(
-            &ticket[..header.len() + 1 + body.len()],
-            &decode(signature)?,
-        )
-        .map_err(|_| TicketError::BadSignature)?;
+    if parsed.alg != key.algorithm.jose() {
+        return Err(TicketError::Unsupported);
+    }
+    if !key.verifies(
+        &ticket[..header.len() + 1 + body.len()],
+        &decode(signature)?,
+    ) {
+        return Err(TicketError::BadSignature);
+    }
 
     let claims: Claims =
         serde_json::from_slice(&decode(body)?).map_err(|_| TicketError::Malformed)?;
@@ -476,14 +501,18 @@ mod tests {
     #[test]
     fn a_token_shaped_jws_is_not_a_ticket() {
         let keys = keys();
-        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"EdDSA","typ":"MOQT","kid":"ticket-1"}"#);
+        let header =
+            URL_SAFE_NO_PAD.encode(br#"{"alg":"ML-DSA-65","typ":"MOQT","kid":"ticket-1"}"#);
         let body =
             URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims(SystemTime::now())).expect("claims"));
         let signed = format!("{header}.{body}");
-        let jws = format!(
-            "{signed}.{}",
-            URL_SAFE_NO_PAD.encode(keys.signer.sign(signed.as_bytes()).as_ref())
-        );
+        let mut signature = vec![0u8; ML_DSA_65_SIGNING.signature_len()];
+        let written = keys
+            .signer
+            .sign(signed.as_bytes(), &mut signature)
+            .expect("signs");
+        signature.truncate(written);
+        let jws = format!("{signed}.{}", URL_SAFE_NO_PAD.encode(&signature));
         assert_eq!(
             verify(
                 keys.verification_keys(),
@@ -498,21 +527,43 @@ mod tests {
     #[test]
     fn a_key_set_signs_with_its_first_private_key_and_publishes_all() {
         let seed = [5u8; 32];
-        let pair = Ed25519KeyPair::from_seed_unchecked(&seed).expect("seed");
-        let x = URL_SAFE_NO_PAD.encode(pair.public_key().as_ref());
-        let d = URL_SAFE_NO_PAD.encode(seed);
+        let pair = PqdsaKeyPair::from_seed(&ML_DSA_65_SIGNING, &seed).expect("seed");
+        let public = URL_SAFE_NO_PAD.encode(pair.public_key().as_ref());
+        let private = URL_SAFE_NO_PAD.encode(seed);
+        let other = PqdsaKeyPair::from_seed(&ML_DSA_65_SIGNING, &[6u8; 32]).expect("seed");
+        let other = URL_SAFE_NO_PAD.encode(other.public_key().as_ref());
         let old = URL_SAFE_NO_PAD.encode([9u8; 32]);
         let document = format!(
             r#"{{"keys":[{{"kty":"OKP","crv":"Ed25519","kid":"old","x":"{old}"}},
-                {{"kty":"OKP","crv":"Ed25519","kid":"new","x":"{x}","d":"{d}"}}]}}"#
+                {{"kty":"AKP","alg":"ML-DSA-65","kid":"new","pub":"{public}","priv":"{private}"}}]}}"#
         );
         let keys = TicketKeys::parse(&document).expect("a set");
         assert_eq!(keys.kid, "new");
         assert_eq!(keys.public_jwks().len(), 2);
-        assert!(keys.public_jwks().iter().all(|jwk| jwk.get("d").is_none()));
+        assert!(
+            keys.public_jwks()
+                .iter()
+                .all(|jwk| jwk.get("priv").is_none())
+        );
 
-        let mismatched = document.replace(&x, &old);
+        let mismatched = document.replace(&public, &other);
         assert!(TicketKeys::parse(&mismatched).is_err());
-        assert!(TicketKeys::parse(&document.replace(r#","d":""#, r#","e":""#)).is_err());
+        assert!(TicketKeys::parse(&document.replace(r#","priv":""#, r#","e":""#)).is_err());
+    }
+
+    /// An Ed25519 ticket key only verifies: a set with no ML-DSA-65 key to
+    /// sign with is refused.
+    #[test]
+    fn an_ed25519_ticket_key_never_signs() {
+        let seed = URL_SAFE_NO_PAD.encode([5u8; 32]);
+        let x = URL_SAFE_NO_PAD.encode(
+            aws_lc_rs::signature::Ed25519KeyPair::from_seed_unchecked(&[5u8; 32])
+                .expect("seed")
+                .public_key()
+                .as_ref(),
+        );
+        let document =
+            format!(r#"[{{"kty":"OKP","crv":"Ed25519","kid":"old","x":"{x}","d":"{seed}"}}]"#);
+        assert!(TicketKeys::parse(&document).is_err());
     }
 }

@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair};
+use aws_lc_rs::signature::{KeyPair, ML_DSA_65_SIGNING, PqdsaKeyPair};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bytes::{Buf, Bytes, BytesMut};
@@ -63,8 +63,8 @@ async fn within<F: Future>(what: &str, future: F) -> F::Output {
         .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
 }
 
-fn signer() -> Ed25519KeyPair {
-    Ed25519KeyPair::from_seed_unchecked(&[9u8; 32]).expect("a valid seed")
+fn signer() -> PqdsaKeyPair {
+    PqdsaKeyPair::from_seed(&ML_DSA_65_SIGNING, &[9u8; 32]).expect("a valid ML-DSA-65 seed")
 }
 
 fn token(subject: &str, thumbprint: &str, publish: u32) -> String {
@@ -72,7 +72,7 @@ fn token(subject: &str, thumbprint: &str, publish: u32) -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .expect("after the epoch")
         .as_secs();
-    let header = serde_json::json!({ "alg": "EdDSA", "typ": "MOQT", "kid": KEY_ID });
+    let header = serde_json::json!({ "alg": "ML-DSA-65", "typ": "MOQT", "kid": KEY_ID });
     let claims = serde_json::json!({
         "iss": "https://api.moqom.cloud",
         "sub": subject,
@@ -87,8 +87,12 @@ fn token(subject: &str, thumbprint: &str, publish: u32) -> String {
         URL_SAFE_NO_PAD.encode(header.to_string()),
         URL_SAFE_NO_PAD.encode(claims.to_string())
     );
-    let signature = signer().sign(input.as_bytes());
-    format!("{input}.{}", URL_SAFE_NO_PAD.encode(signature.as_ref()))
+    let mut signature = vec![0u8; ML_DSA_65_SIGNING.signature_len()];
+    let written = signer()
+        .sign(input.as_bytes(), &mut signature)
+        .expect("ML-DSA-65 signs");
+    signature.truncate(written);
+    format!("{input}.{}", URL_SAFE_NO_PAD.encode(&signature))
 }
 
 struct Relay {
@@ -132,10 +136,10 @@ fn relay_with(limits: Limits, ceiling: u32) -> Relay {
     let fabric = Fabric::with_cache(Cache::new(limits))
         .authenticated(Authenticator::new(
             "",
-            vec![VerificationKey {
-                id: KEY_ID.to_owned(),
-                bytes: signer().public_key().as_ref().to_vec(),
-            }],
+            vec![VerificationKey::ml_dsa_65(
+                KEY_ID.to_owned(),
+                signer().public_key().as_ref().to_vec(),
+            )],
         ))
         .proving(Possession::new(Enforcement::Required, Some(identity)));
     if ceiling > 0 {

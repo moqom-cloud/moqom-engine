@@ -26,7 +26,7 @@ web-transport-quinn = { workspace = true }
 url = { workspace = true }
 webpki-roots = "0.26"
 
-# Verifying the credential a session presents. aws-lc-rs supplies Ed25519 and is
+# Verifying the credential a session presents. aws-lc-rs supplies ML-DSA-65 and is
 # already here as the rustls provider, so the signature check costs no new
 # cryptography; serde reads the claims, which are JSON precisely so that the
 # media-path binary does not have to carry a CBOR/COSE stack.

@@ -140,7 +140,7 @@ and stops admitting new sessions when that account says it is not admitting.
 
 Direct calls are metered by ticket (`src/ticket.rs`), because their media never
 reaches a relay. A participant on a direct path subscribes to its own
-`.direct/{peerUser}/{peerDevice}` track; the relay answers with an Ed25519-signed
+`.direct/{peerUser}/{peerDevice}` track; the relay answers with an ML-DSA-65-signed
 ticket about once a minute and counts those seconds as `direct_seconds`. Each
 peer holds the other to its tickets (`moqom-client`'s `direct` module, and the
 Swift SDK), so an app that drops the relay session loses the direct path. Keys

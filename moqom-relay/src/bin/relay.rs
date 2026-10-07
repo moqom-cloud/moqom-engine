@@ -123,8 +123,9 @@
 //!   Usage records carry `MOQOM_RELAY_ID` in their ids, so two relays reporting
 //!   to one account must not share one.
 //! - `MOQOM_RELAY_TICKET_KEYS` — a file holding the fleet's direct-ticket keys,
-//!   a JWK set of Ed25519 keys where the first with a private half (`d`)
-//!   signs and every public half is published to participants. Unset issues no
+//!   a JWK set where the first ML-DSA-65 key (`AKP`) with a private seed
+//!   (`priv`) signs and every public half is published to participants,
+//!   including Ed25519 (`OKP`) keys, which only verify older tickets. Unset issues no
 //!   tickets, which keeps every participant on this relay off direct paths.
 //!   Not the token keys: see `moqom_relay::ticket`.
 //!

@@ -16,7 +16,7 @@
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
-use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair};
+use aws_lc_rs::signature::{KeyPair, ML_DSA_65_SIGNING, PqdsaKeyPair};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use moqom_client::{Credentials, DeviceKey, Session};
@@ -65,10 +65,10 @@ impl Relay {
         // An empty issuer accepts any, which is what the relay's own harness does.
         let authenticator = Authenticator::new(
             "",
-            vec![VerificationKey {
-                id: KEY_ID.to_owned(),
-                bytes: signer().public_key().as_ref().to_vec(),
-            }],
+            vec![VerificationKey::ml_dsa_65(
+                KEY_ID.to_owned(),
+                signer().public_key().as_ref().to_vec(),
+            )],
         );
         let fabric = Fabric::with_cache(Cache::new(Limits::default()))
             .authenticated(authenticator)
@@ -105,8 +105,8 @@ impl Drop for Relay {
 
 /// The issuing key. A fixed seed, because what varies between these tests is the
 /// device key and not the issuer.
-fn signer() -> Ed25519KeyPair {
-    Ed25519KeyPair::from_seed_unchecked(&[7u8; 32]).expect("a valid Ed25519 seed")
+fn signer() -> PqdsaKeyPair {
+    PqdsaKeyPair::from_seed(&ML_DSA_65_SIGNING, &[7u8; 32]).expect("a valid ML-DSA-65 seed")
 }
 
 /// A token committed to `thumbprint`, shaped the way the control plane mints one.
@@ -115,7 +115,7 @@ fn token_bound_to(thumbprint: &str) -> Vec<u8> {
         .duration_since(std::time::UNIX_EPOCH)
         .expect("after the epoch")
         .as_secs();
-    let header = serde_json::json!({ "alg": "EdDSA", "typ": "MOQT", "kid": KEY_ID });
+    let header = serde_json::json!({ "alg": "ML-DSA-65", "typ": "MOQT", "kid": KEY_ID });
     let claims = serde_json::json!({
         "iss": "https://api.moqom.cloud",
         "sub": "ada",
@@ -131,12 +131,12 @@ fn token_bound_to(thumbprint: &str) -> Vec<u8> {
         URL_SAFE_NO_PAD.encode(header.to_string()),
         URL_SAFE_NO_PAD.encode(claims.to_string())
     );
-    let signature = signer().sign(signing_input.as_bytes());
-    format!(
-        "{signing_input}.{}",
-        URL_SAFE_NO_PAD.encode(signature.as_ref())
-    )
-    .into_bytes()
+    let mut signature = vec![0u8; ML_DSA_65_SIGNING.signature_len()];
+    let written = signer()
+        .sign(signing_input.as_bytes(), &mut signature)
+        .expect("ML-DSA-65 signs");
+    signature.truncate(written);
+    format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(&signature)).into_bytes()
 }
 
 async fn within<F: Future>(what: &str, future: F) -> F::Output {

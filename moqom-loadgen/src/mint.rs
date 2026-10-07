@@ -34,7 +34,7 @@
 
 use std::sync::Arc;
 
-use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair};
+use aws_lc_rs::signature::{KeyPair, ML_DSA_65_SIGNING, PqdsaKeyPair};
 use aws_lc_rs::{digest, error};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -55,7 +55,7 @@ const DEVICE_ID_LENGTH: usize = 16;
 
 /// The signing half of a run's identities.
 pub struct Mint {
-    pair: Ed25519KeyPair,
+    pair: PqdsaKeyPair,
 }
 
 impl Mint {
@@ -65,7 +65,7 @@ impl Mint {
     /// A seed the curve will not accept.
     pub fn from_seed(seed: &[u8; 32]) -> Result<Self, error::KeyRejected> {
         Ok(Self {
-            pair: Ed25519KeyPair::from_seed_unchecked(seed)?,
+            pair: PqdsaKeyPair::from_seed(&ML_DSA_65_SIGNING, seed)?,
         })
     }
 
@@ -73,8 +73,10 @@ impl Mint {
     /// document `MOQOM_RELAY_JWKS` reads.
     #[must_use]
     pub fn jwks(&self) -> String {
-        let x = URL_SAFE_NO_PAD.encode(self.pair.public_key().as_ref());
-        format!(r#"{{"keys":[{{"kty":"OKP","crv":"Ed25519","kid":"{KEY_ID}","x":"{x}"}}]}}"#)
+        let public = URL_SAFE_NO_PAD.encode(self.pair.public_key().as_ref());
+        format!(
+            r#"{{"keys":[{{"kty":"AKP","alg":"ML-DSA-65","kid":"{KEY_ID}","pub":"{public}"}}]}}"#
+        )
     }
 
     /// A token for one identity, valid for `seconds`.
@@ -103,7 +105,7 @@ impl Mint {
                 "bs": false,
             },
         });
-        let header = serde_json::json!({ "alg": "EdDSA", "typ": "MOQT", "kid": KEY_ID });
+        let header = serde_json::json!({ "alg": "ML-DSA-65", "typ": "MOQT", "kid": KEY_ID });
         self.sign(&header, &claims)
     }
 
@@ -112,8 +114,13 @@ impl Mint {
         let header = URL_SAFE_NO_PAD.encode(header.to_string());
         let claims = URL_SAFE_NO_PAD.encode(claims.to_string());
         let signing = format!("{header}.{claims}");
-        let signature = URL_SAFE_NO_PAD.encode(self.pair.sign(signing.as_bytes()).as_ref());
-        format!("{signing}.{signature}")
+        let mut signature = vec![0u8; ML_DSA_65_SIGNING.signature_len()];
+        let written = self
+            .pair
+            .sign(signing.as_bytes(), &mut signature)
+            .expect("ML-DSA-65 signs any message");
+        signature.truncate(written);
+        format!("{signing}.{}", URL_SAFE_NO_PAD.encode(&signature))
     }
 }
 
@@ -287,7 +294,8 @@ mod tests {
     #[test]
     fn the_key_set_names_the_algorithm_the_relay_expects() {
         let jwks: serde_json::Value = serde_json::from_str(&mint().jwks()).expect("valid JSON");
-        assert_eq!(jwks["keys"][0]["crv"], "Ed25519");
+        assert_eq!(jwks["keys"][0]["kty"], "AKP");
+        assert_eq!(jwks["keys"][0]["alg"], "ML-DSA-65");
         assert_eq!(jwks["keys"][0]["kid"], KEY_ID);
     }
 }
