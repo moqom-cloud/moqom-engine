@@ -4,17 +4,21 @@ The media path of the **Media Over QUIC Orchestration Mesh**: the protocol
 codec, the transport, and the relay. Pure Rust, and everything here sits between
 a publisher and a subscriber.
 
-Targets [`draft-ietf-moq-transport-19`](https://datatracker.ietf.org/doc/draft-ietf-moq-transport/).
+Targets [`draft-ietf-moq-transport`](https://datatracker.ietf.org/doc/draft-ietf-moq-transport/)
+drafts 22 and 19, chosen per session by ALPN. The relay accepts `moqt-22` and
+`moqt-19` and prefers 22. The client offers both, and also speaks a draft-16
+subset (`moqom_client::cloudflare`, `moqom cloudflare sub`) for subscribing
+through Cloudflare's relay. Direct links and WebTransport sessions are draft-19.
 The implementation is our own rather than a fork, because owning the wire format
 is what makes the congestion controller, the object-to-transport mapping, and
 end-to-end encryption our decisions instead of someone else's.
 
 | Crate | License | What |
 | --- | --- | --- |
-| `moqom-proto` | Apache-2.0 | The draft-19 object model, all eighteen control messages, and the data plane |
+| `moqom-proto` | Apache-2.0 | The object model, control messages, and data plane, per draft (`Draft::{D16, D19, D22}`) |
 | `moqom-transport` | Apache-2.0 | QUIC and WebTransport sessions on one UDP port |
 | `moqom-client` | Apache-2.0 | A MOQT subscriber and publisher for recorders, classifiers, and the CLI; direct (peer-to-peer) sessions in `direct` |
-| `moqom-cli` | Apache-2.0 | The `moqom` binary: `subscribe` and `publish`, using only `moqom-client` |
+| `moqom-cli` | Apache-2.0 | The `moqom` binary: `subscribe`, `publish` and `cloudflare sub`, using only `moqom-client` |
 | `moqom-media` | Apache-2.0 | Framing coded video into MOQOM objects, shared by the CLI and the load generator |
 | `moqom-loadgen` | Apache-2.0 | Load generation and relay measurement |
 | `moqom-relay` | BUSL-1.1 | The relay: announcement, subscription, fan-out, retention, authorisation, usage metering, direct tickets |
