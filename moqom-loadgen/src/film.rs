@@ -150,9 +150,9 @@ mod tests {
         ));
         let mut file = std::fs::File::create(&path).expect("a temporary file");
         file.write_all(stream).expect("writing the stream");
-        let film = Film::load(&path, Codec::H264);
+        let loaded = Film::load(&path, Codec::H264);
         let _ = std::fs::remove_file(&path);
-        film
+        loaded
     }
 
     #[test]

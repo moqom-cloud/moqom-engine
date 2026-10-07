@@ -59,6 +59,7 @@ mod mint;
 mod scrape;
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -1120,7 +1121,7 @@ fn spawn_live(
             }
             let mut line = format!("live         t+{}s", began.elapsed().as_secs());
             if let Some(progress) = &progress {
-                line.push_str(&format!("  objects={}", progress.load(Ordering::Relaxed)));
+                let _ = write!(line, "  objects={}", progress.load(Ordering::Relaxed));
             }
             if let Some(addr) = &metrics {
                 match Reading::take(addr).await {
@@ -1136,13 +1137,13 @@ fn spawn_live(
                                 / dt
                                 / 1_000_000_000.0
                         });
-                        line.push_str(&format!(
-                            "  sess={sess:.0}  shed={shed:.0}  {gbit:.2} Gbit/s"
-                        ));
+                        let _ = write!(line, "  sess={sess:.0}  shed={shed:.0}  {gbit:.2} Gbit/s");
                         previous = Some(reading);
                         previous_at = Instant::now();
                     }
-                    Err(error) => line.push_str(&format!("  relay=({error})")),
+                    Err(error) => {
+                        let _ = write!(line, "  relay=({error})");
+                    }
                 }
             }
             eprintln!("{line}");

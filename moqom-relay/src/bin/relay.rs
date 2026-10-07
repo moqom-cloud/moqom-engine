@@ -169,6 +169,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     runtime.block_on(run())
 }
 
+#[allow(clippy::too_many_lines)] // the startup sequence, read top to bottom
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Installed once, before any TLS configuration is built. `rustls` will
     // otherwise refuse to pick a provider when more than one is compiled in.
@@ -810,12 +811,15 @@ fn env_path(key: &str) -> Option<PathBuf> {
     env(key).map(PathBuf::from)
 }
 
+/// The admin port's TLS, when it has any.
+type AdminTls = Arc<rustls::ServerConfig>;
+
 /// Who may read the admin port, from the environment.
 ///
 /// Files rather than values for every secret, as with the rest of the relay's
 /// credentials: a process's environment is readable by more things than its
 /// files are.
-fn admin_guard() -> Result<(Guard, Option<Arc<rustls::ServerConfig>>), Box<dyn std::error::Error>> {
+fn admin_guard() -> Result<(Guard, Option<AdminTls>), Box<dyn std::error::Error>> {
     let probes_only = match env("MOQOM_RELAY_ADMIN_AUTH").as_deref() {
         None => false,
         Some("probes-only") => true,
