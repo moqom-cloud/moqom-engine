@@ -92,9 +92,9 @@ pub struct SocketConfig {
     /// Keep-alives go out at a third of it, which also keeps both NAT mappings
     /// open.
     pub idle_timeout: Duration,
-    /// Whether to accept QUIC datagrams. Off means the transport parameter is
-    /// not sent, so the peer cannot send any; sending to a peer that offers
-    /// them works either way.
+    /// Whether to use QUIC datagrams. Off means the transport parameter is
+    /// not sent, so the peer cannot send any, and quinn refuses to send them
+    /// too: off is off in both directions.
     pub datagrams: bool,
     /// The one ALPN offered when dialling and accepted when accepting.
     pub alpn: Vec<u8>,
@@ -130,6 +130,7 @@ pub struct DirectSocket {
     host_candidates: Vec<SocketAddr>,
     reflexive: Option<SocketAddr>,
     alpn: Vec<u8>,
+    datagrams: bool,
     transport: Arc<quinn::TransportConfig>,
     punching: Mutex<Option<Puncher>>,
 }
@@ -199,6 +200,7 @@ impl DirectSocket {
             host_candidates,
             reflexive,
             alpn: config.alpn,
+            datagrams: config.datagrams,
             transport: transport(config.idle_timeout, config.datagrams),
             punching: Mutex::new(None),
         })
@@ -236,6 +238,13 @@ impl DirectSocket {
     #[must_use]
     pub fn reflexive(&self) -> Option<SocketAddr> {
         self.reflexive
+    }
+
+    /// Whether connections from this socket use datagrams; see
+    /// [`SocketConfig::datagrams`].
+    #[must_use]
+    pub fn datagrams(&self) -> bool {
+        self.datagrams
     }
 
     /// The QUIC endpoint on the socket.
