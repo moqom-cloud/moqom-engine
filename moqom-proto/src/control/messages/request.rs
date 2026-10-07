@@ -95,6 +95,9 @@ impl RequestErrorCode {
     pub const CONFLICTING_FILTERS: Self = Self(VarInt::from_u32(0x35));
     /// A filter parameter is invalid.
     pub const INVALID_FILTER: Self = Self(VarInt::from_u32(0x36));
+    /// A relay would have forwarded the request and its hop limit was spent,
+    /// from draft-elliottwave-moq-hop-limit. Provisional; draft-22 only.
+    pub const HOP_LIMIT_EXCEEDED: Self = Self(VarInt::from_u32(0x37));
 
     /// Whether `draft`'s registry has this code. A code it does not is still
     /// carried, but MOQOM never sends one.
@@ -102,7 +105,7 @@ impl RequestErrorCode {
     pub fn defined_in(self, draft: crate::Draft) -> bool {
         match draft {
             crate::Draft::D22 => self != Self::INVALID_JOINING_REQUEST_ID && self.name().is_some(),
-            _ => self.name().is_some(),
+            _ => self != Self::HOP_LIMIT_EXCEEDED && self.name().is_some(),
         }
     }
 
@@ -129,6 +132,7 @@ impl RequestErrorCode {
             Self::REDIRECT => "REDIRECT",
             Self::CONFLICTING_FILTERS => "CONFLICTING_FILTERS",
             Self::INVALID_FILTER => "INVALID_FILTER",
+            Self::HOP_LIMIT_EXCEEDED => "HOP_LIMIT_EXCEEDED",
             _ => return None,
         })
     }

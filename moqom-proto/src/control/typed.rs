@@ -8,7 +8,9 @@
 //! skipped, and why the block is bounded by a count instead of a length.
 //!
 //! The registry here is the whole of draft-22's, plus the two parameters of
-//! MOQOM's own ([`param_type::AUTHORIZATION_PROOF`], [`param_type::RELAY_HOPS`]).
+//! MOQOM's own ([`param_type::AUTHORIZATION_PROOF`], [`param_type::RELAY_HOPS`])
+//! and [`param_type::HOP_LIMIT`] from draft-elliottwave-moq-hop-limit, which is
+//! negotiated by its own Setup Option rather than by `MOQOM_PARAMETERS`.
 //! The decoder accepts those so that one parse serves every peer; a session
 //! that has not seen [`MOQOM_PARAMETERS`](crate::control::setup::option_type::MOQOM_PARAMETERS)
 //! in the peer's SETUP must neither send them nor accept them, because a
@@ -67,7 +69,8 @@ pub const fn encoding(type_value: u64) -> Option<Encoding> {
         | p::EXPIRES
         | p::FILL_TIMEOUT
         | p::NEW_GROUP_REQUEST
-        | p::RELAY_HOPS => Encoding::VarInt,
+        | p::RELAY_HOPS
+        | p::HOP_LIMIT => Encoding::VarInt,
         p::FORWARD | p::SUBSCRIBER_PRIORITY | p::GROUP_ORDER | p::INCLUDE_PROPERTIES => {
             Encoding::Uint8
         }
@@ -117,6 +120,7 @@ mod allow {
         p::INCLUDE_PROPERTIES,
         p::RELAY_HOPS,
         p::AUTHORIZATION_PROOF,
+        p::HOP_LIMIT,
     ];
     pub(super) const SUBSCRIBE_OK: &[u64] = &[p::EXPIRES, p::LARGEST_OBJECT];
     pub(super) const FETCH: &[u64] = &[
@@ -132,6 +136,7 @@ mod allow {
         p::INCLUDE_PROPERTIES,
         p::RELAY_HOPS,
         p::AUTHORIZATION_PROOF,
+        p::HOP_LIMIT,
     ];
     pub(super) const FETCH_OK: &[u64] = &[];
     pub(super) const PUBLISH: &[u64] = &[
@@ -204,8 +209,11 @@ mod allow {
         p::INCLUDE_PROPERTIES,
         p::RELAY_HOPS,
         p::AUTHORIZATION_PROOF,
+        p::HOP_LIMIT,
     ];
     pub(super) const PUBLISH_NAMESPACE: &[u64] = &[p::AUTHORIZATION_TOKEN, p::AUTHORIZATION_PROOF];
+    pub(super) const SUBSCRIBE_NAMESPACE: &[u64] =
+        &[p::AUTHORIZATION_TOKEN, p::AUTHORIZATION_PROOF, p::HOP_LIMIT];
     pub(super) const SUBSCRIBE_TRACKS: &[u64] = &[
         p::AUTHORIZATION_TOKEN,
         p::FORWARD,
@@ -217,6 +225,7 @@ mod allow {
         p::TRACK_PROPERTY_FILTER,
         p::INCLUDE_PROPERTIES,
         p::AUTHORIZATION_PROOF,
+        p::HOP_LIMIT,
     ];
     pub(super) const FILL: &[u64] = &[
         p::FILL_TIMEOUT,
@@ -290,7 +299,8 @@ impl Context {
             Self::UpdatePublishNamespace => allow::UPDATE_PUBLISH_NAMESPACE,
             Self::RequestUpdate => allow::REQUEST_UPDATE,
             Self::TrackStatus => allow::TRACK_STATUS,
-            Self::PublishNamespace | Self::SubscribeNamespace => allow::PUBLISH_NAMESPACE,
+            Self::PublishNamespace => allow::PUBLISH_NAMESPACE,
+            Self::SubscribeNamespace => allow::SUBSCRIBE_NAMESPACE,
             Self::SubscribeTracks => allow::SUBSCRIBE_TRACKS,
             Self::Fill => allow::FILL,
         }
@@ -839,4 +849,45 @@ pub(crate) fn check_typed(context: Context, params: &Parameters) -> Result<(), D
 /// authorization token is defined as repeatable.
 pub(crate) const fn repeatable(type_value: u64) -> bool {
     type_value == param_type::AUTHORIZATION_TOKEN
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// draft-elliottwave-moq-hop-limit: a varint, on the five covered requests
+    /// and nowhere else, at most once, and not one of MOQOM's private
+    /// parameters, since its own Setup Option negotiates it.
+    #[test]
+    fn hop_limit_is_a_varint_on_covered_requests_only() {
+        assert_eq!(encoding(param_type::HOP_LIMIT), Some(Encoding::VarInt));
+        assert!(!is_private(param_type::HOP_LIMIT));
+        assert!(!repeatable(param_type::HOP_LIMIT));
+        for covered in [
+            Context::Subscribe,
+            Context::Fetch,
+            Context::TrackStatus,
+            Context::SubscribeNamespace,
+            Context::SubscribeTracks,
+        ] {
+            assert!(
+                covered.allowed().contains(&param_type::HOP_LIMIT),
+                "{covered:?}"
+            );
+        }
+        for other in [
+            Context::RequestUpdate,
+            Context::UpdateSubscription,
+            Context::UpdateFetch,
+            Context::Fill,
+            Context::PublishNamespace,
+            Context::Publish,
+            Context::SubscribeOk,
+        ] {
+            assert!(
+                !other.allowed().contains(&param_type::HOP_LIMIT),
+                "{other:?}"
+            );
+        }
+    }
 }

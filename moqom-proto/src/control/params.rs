@@ -70,6 +70,15 @@ pub mod param_type {
     /// [`setup::PRIVATE_USE_VARINT`](crate::control::setup::PRIVATE_USE_VARINT).
     pub const RELAY_HOPS: u64 = crate::control::setup::PRIVATE_USE_VARINT;
 
+    /// How many further relays a request may be forwarded to, from
+    /// draft-elliottwave-moq-hop-limit.
+    ///
+    /// The standards-track form of [`RELAY_HOPS`]: the same budget, carried on
+    /// draft-22 sessions where both ends sent
+    /// [`HOP_LIMIT_SUPPORTED`](crate::control::setup::option_type::HOP_LIMIT_SUPPORTED).
+    /// Provisional until IANA assigns one; even, so it carries a varint.
+    pub const HOP_LIMIT: u64 = 0x40C52;
+
     /// Whether objects are sent on a subscription at all: 0 or 1, anything
     /// else a protocol violation (draft-19 §10.2.17).
     ///

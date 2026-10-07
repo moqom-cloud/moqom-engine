@@ -82,6 +82,15 @@ pub mod option_type {
     /// draft, so offering this costs nothing with a peer that does not know it.
     /// Even, so it carries a varint: [`super::PRIVATE_USE_VARINT`].
     pub const MOQOM_PARAMETERS: u64 = super::PRIVATE_USE_VARINT;
+
+    /// The sender reads and honours the
+    /// [`HOP_LIMIT`](crate::control::params::param_type::HOP_LIMIT) Message
+    /// Parameter, from draft-elliottwave-moq-hop-limit.
+    ///
+    /// Odd, with an empty value: presence alone declares support, and a
+    /// non-empty value or a second copy is a `PROTOCOL_VIOLATION`.
+    /// Provisional until IANA assigns one.
+    pub const HOP_LIMIT_SUPPORTED: u64 = 0x40C51;
 }
 
 /// Where this implementation numbers an extension of its own.
