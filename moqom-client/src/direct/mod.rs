@@ -29,11 +29,20 @@
 //! is what makes falling back gapless, and it is also why a direct path does not
 //! yet save relay egress: pausing the relay copy needs the relay to honour a
 //! paused subscription, which it does not do yet.
+//!
+//! # Only the socket
+//!
+//! [`socket::DirectSocket`] is the layer beneath [`DirectEndpoint`]: binding,
+//! STUN, probing, and pinned mutual-TLS QUIC, with no MOQT and no admission.
+//! It is public for SDKs that do those steps themselves and need only the
+//! part that has to share one UDP port, which is what `moqom-direct-ffi`
+//! exports to Swift.
 
 mod link;
 mod offer;
 mod path;
 mod punch;
+pub mod socket;
 pub mod stun;
 mod verify;
 

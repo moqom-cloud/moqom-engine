@@ -27,25 +27,21 @@
 //! evidence that its own credentials passed. Neither side returns a session
 //! the other has refused.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
-use std::sync::Arc;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use bytes::Bytes;
 use moqom_proto::control::{MessageType, Role, Setup};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 
-use super::punch::Puncher;
+use super::socket::{DirectSocket, SocketConfig, StunServer};
 use super::verify::admissible;
 use super::{CandidateOffer, Eligibility, IpExposure, PeerCredentials, PeerVerifier, VerifiedPeer};
 use crate::Error;
 use crate::device::{Credentials, certificate_identity};
 use crate::session::{Frames, IMPLEMENTATION, Session, placeholder_url, relay_identity, write};
-use crate::tls::install_crypto_provider;
 
-/// The name in each endpoint's certificate. Nothing checks it -- both sides pin
-/// the certificate itself -- but TLS needs a server name to send.
-const SERVER_NAME: &str = "moqom-direct";
+/// How long the STUN server has to answer while binding.
+const STUN_PATIENCE: Duration = Duration::from_secs(1);
 
 /// The MOQT session close code for refused credentials, as the relay uses it.
 const UNAUTHORIZED: u32 = 0x03;
@@ -105,12 +101,7 @@ impl DirectConfig {
 /// A socket ready to reach one peer directly.
 pub struct DirectEndpoint {
     config: DirectConfig,
-    /// A second handle on the socket QUIC owns, for the probes.
-    socket: UdpSocket,
-    endpoint: quinn::Endpoint,
-    certificate: CertificateDer<'static>,
-    key: PrivateKeyDer<'static>,
-    fingerprint: [u8; 32],
+    socket: DirectSocket,
     identity: String,
     candidates: Vec<SocketAddr>,
 }
@@ -142,47 +133,29 @@ impl DirectEndpoint {
     ) -> Result<Self, Error> {
         let _ = exposure;
         eligibility.check()?;
-        install_crypto_provider();
 
-        let socket = UdpSocket::bind(config.bind)?;
-        let mut candidates = host_candidates(&socket)?;
-        if let Some(stun) = config.stun {
-            let probe = socket.try_clone()?;
-            let reflexive = tokio::task::spawn_blocking(move || {
-                super::stun::reflexive(&probe, stun, Duration::from_secs(1))
-            })
-            .await
-            .map_err(|error| Error::Io(std::io::Error::other(error)))?;
-            if let Ok(address) = reflexive
-                && !candidates.contains(&address)
-            {
-                candidates.push(address);
-            }
+        let socket = DirectSocket::bind(SocketConfig {
+            bind: config.bind,
+            stun: config.stun.map(StunServer::Address),
+            stun_timeout: STUN_PATIENCE,
+            idle_timeout: config.idle_timeout,
+            datagrams: true,
+            // Direct links are MOQOM's draft-19 at both ends, whatever a relay
+            // would negotiate.
+            alpn: moqom_transport::alpn::MOQT_DRAFT_19.to_vec(),
+        })
+        .await?;
+        let mut candidates = socket.host_candidates().to_vec();
+        if let Some(address) = socket.reflexive()
+            && !candidates.contains(&address)
+        {
+            candidates.push(address);
         }
-
-        let generated =
-            rcgen::generate_simple_self_signed(vec![SERVER_NAME.to_owned()]).map_err(Error::tls)?;
-        let certificate = generated.cert.der().clone();
-        let key =
-            PrivateKeyDer::try_from(generated.signing_key.serialize_der()).map_err(Error::tls)?;
-        let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, certificate.as_ref());
-        let mut fingerprint = [0u8; 32];
-        fingerprint.copy_from_slice(digest.as_ref());
-        let identity = certificate_identity(certificate.as_ref());
-
-        let probes = socket.try_clone()?;
-        let runtime = quinn::default_runtime()
-            .ok_or_else(|| Error::Io(std::io::Error::other("no async runtime")))?;
-        let endpoint =
-            quinn::Endpoint::new(quinn::EndpointConfig::default(), None, socket, runtime)?;
+        let identity = certificate_identity(socket.certificate().as_ref());
 
         Ok(Self {
             config,
-            socket: probes,
-            endpoint,
-            certificate,
-            key,
-            fingerprint,
+            socket,
             identity,
             candidates,
         })
@@ -208,7 +181,7 @@ impl DirectEndpoint {
     /// # Errors
     /// The socket refusing to say.
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
-        self.endpoint.local_addr()
+        self.socket.local_addr()
     }
 
     /// An offer telling `peer` how to reach this endpoint.
@@ -217,7 +190,7 @@ impl DirectEndpoint {
         CandidateOffer {
             from: self.config.me.clone(),
             to: peer.to_owned(),
-            certificate: self.fingerprint,
+            certificate: self.socket.fingerprint(),
             candidates: self.candidates.clone(),
         }
     }
@@ -242,17 +215,15 @@ impl DirectEndpoint {
         if offer.to != self.config.me {
             return Err(Error::Offer("addressed to another participant"));
         }
-        if offer.certificate == self.fingerprint {
+        let fingerprint = self.socket.fingerprint();
+        if offer.certificate == fingerprint {
             return Err(Error::Offer("this is our own offer"));
         }
-        let dialling = self.fingerprint < offer.certificate;
+        let dialling = fingerprint < offer.certificate;
 
         let _puncher = self.config.punching.then(|| {
             self.socket
-                .try_clone()
-                .map(|socket| {
-                    Puncher::start(socket, offer.candidates.clone(), self.config.punch_interval)
-                })
+                .puncher(offer.candidates.clone(), self.config.punch_interval)
                 .ok()
         });
 
@@ -269,62 +240,18 @@ impl DirectEndpoint {
             .map_err(|_| Error::Unreachable(patience))?
     }
 
-    fn transport(&self) -> Arc<quinn::TransportConfig> {
-        let mut transport = quinn::TransportConfig::default();
-        if let Ok(idle) = quinn::IdleTimeout::try_from(self.config.idle_timeout) {
-            transport.max_idle_timeout(Some(idle));
-        }
-        transport.keep_alive_interval(Some(self.config.idle_timeout / 3));
-        // A hole-punched path is usually short, and the default initial RTT of
-        // a third of a second would make the first retransmission -- the one
-        // that crosses once the far NAT has opened -- wait far longer than the
-        // path needs.
-        transport.initial_rtt(Duration::from_millis(50));
-        Arc::new(transport)
-    }
-
     async fn dial(
         &self,
         offer: &CandidateOffer,
         credentials: &Credentials<'_>,
         verifier: &dyn PeerVerifier,
     ) -> Result<(Session, VerifiedPeer), Error> {
-        let mut tls = rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(Pinned(offer.certificate)))
-            .with_client_auth_cert(vec![self.certificate.clone()], self.key.clone_key())
-            .map_err(Error::tls)?;
-        // Direct links are MOQOM's draft-19 at both ends, whatever a relay
-        // would negotiate.
-        tls.alpn_protocols = vec![moqom_transport::alpn::MOQT_DRAFT_19.to_vec()];
-        let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls).map_err(Error::tls)?;
-        let mut client = quinn::ClientConfig::new(Arc::new(crypto));
-        client.transport_config(self.transport());
-
         // Every candidate at once. Whichever completes first is the path; the
         // rest are dropped, which closes them.
-        let mut attempts = tokio::task::JoinSet::new();
-        for candidate in &offer.candidates {
-            let connecting = self
-                .endpoint
-                .connect_with(client.clone(), *candidate, SERVER_NAME)?;
-            attempts.spawn(connecting);
-        }
-        let mut last = None;
-        let connection = loop {
-            match attempts.join_next().await {
-                Some(Ok(Ok(connection))) => break connection,
-                Some(Ok(Err(error))) => last = Some(error),
-                Some(Err(_)) => {}
-                None => {
-                    return Err(match last {
-                        Some(error) => Error::Handshake(error),
-                        None => Error::Unreachable(self.config.patience),
-                    });
-                }
-            }
-        };
-        drop(attempts);
+        let connection = self
+            .socket
+            .dial(&offer.candidates, offer.certificate, self.config.patience)
+            .await?;
 
         let peer_identity = relay_identity(&connection).ok_or(Error::NoRelayIdentity)?;
         let quic = connection.clone();
@@ -356,7 +283,7 @@ impl DirectEndpoint {
             moqom_proto::Draft::D19,
             transport,
             (send, frames.into_inner()),
-            self.endpoint.clone(),
+            self.socket.endpoint().clone(),
             Role::Client,
         );
         Ok((session, peer))
@@ -368,25 +295,12 @@ impl DirectEndpoint {
         credentials: &Credentials<'_>,
         verifier: &dyn PeerVerifier,
     ) -> Result<(Session, VerifiedPeer), Error> {
-        let mut tls = rustls::ServerConfig::builder()
-            .with_client_cert_verifier(Arc::new(Pinned(offer.certificate)))
-            .with_single_cert(vec![self.certificate.clone()], self.key.clone_key())
-            .map_err(Error::tls)?;
-        tls.alpn_protocols = vec![moqom_transport::alpn::MOQT_DRAFT_19.to_vec()];
-        let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls).map_err(Error::tls)?;
-        let mut server = quinn::ServerConfig::with_crypto(Arc::new(crypto));
-        server.transport_config(self.transport());
-        self.endpoint.set_server_config(Some(server));
-
         // Anything that is not the pinned peer fails the handshake and is
         // ignored; the wait continues for the one that matters.
-        let connection = loop {
-            let incoming = self.endpoint.accept().await.ok_or(Error::Closed)?;
-            if let Ok(connection) = incoming.await {
-                break connection;
-            }
-        };
-        self.endpoint.set_server_config(None);
+        let connection = self
+            .socket
+            .accept(offer.certificate, self.config.patience)
+            .await?;
 
         let peer_identity = relay_identity(&connection).ok_or(Error::NoRelayIdentity)?;
         let quic = connection.clone();
@@ -414,7 +328,7 @@ impl DirectEndpoint {
             moqom_proto::Draft::D19,
             transport,
             (send, frames.into_inner()),
-            self.endpoint.clone(),
+            self.socket.endpoint().clone(),
             Role::Server,
         );
         Ok((session, peer))
@@ -492,148 +406,5 @@ async fn peer_rejection(connection: &quinn::Connection) -> Error {
     match crate::session::rejection(connection).await {
         Error::Rejected { code, reason } => Error::PeerRejected { code, reason },
         other => other,
-    }
-}
-
-/// This socket's own addresses, for a peer on the same network.
-///
-/// A socket bound to every interface reports `0.0.0.0`, which is no use to a
-/// peer, so the interface the default route leaves by is asked for instead: a
-/// UDP `connect` picks it without sending anything.
-fn host_candidates(socket: &UdpSocket) -> std::io::Result<Vec<SocketAddr>> {
-    let bound = socket.local_addr()?;
-    if !bound.ip().is_unspecified() {
-        return Ok(vec![bound]);
-    }
-    let mut candidates = Vec::new();
-    let probe = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
-    // TEST-NET-1: never routed, so nothing is sent, but the kernel still picks
-    // the interface it would use for the internet.
-    if probe.connect((Ipv4Addr::new(192, 0, 2, 1), 9)).is_ok()
-        && let Ok(local) = probe.local_addr()
-        && !local.ip().is_unspecified()
-    {
-        candidates.push(SocketAddr::new(local.ip(), bound.port()));
-    }
-    if candidates.is_empty() {
-        candidates.push(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::LOCALHOST),
-            bound.port(),
-        ));
-    }
-    Ok(candidates)
-}
-
-/// Trusts exactly the certificate whose SHA-256 is pinned, in either direction.
-#[derive(Debug)]
-struct Pinned([u8; 32]);
-
-impl Pinned {
-    fn matches(&self, end_entity: &CertificateDer<'_>) -> Result<(), rustls::Error> {
-        let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, end_entity.as_ref());
-        if digest.as_ref() == self.0 {
-            Ok(())
-        } else {
-            Err(rustls::Error::General(
-                "certificate is not the one the peer's offer named".into(),
-            ))
-        }
-    }
-
-    fn verify_signature(
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms,
-        )
-    }
-
-    fn schemes() -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::aws_lc_rs::default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
-    }
-}
-
-impl rustls::client::danger::ServerCertVerifier for Pinned {
-    fn verify_server_cert(
-        &self,
-        end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp: &[u8],
-        _now: UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        self.matches(end_entity)?;
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Err(rustls::Error::General(
-            "TLS 1.2 is not used over QUIC".into(),
-        ))
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Self::verify_signature(message, cert, dss)
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        Self::schemes()
-    }
-}
-
-impl rustls::server::danger::ClientCertVerifier for Pinned {
-    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
-        &[]
-    }
-
-    fn verify_client_cert(
-        &self,
-        end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _now: UnixTime,
-    ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
-        self.matches(end_entity)?;
-        Ok(rustls::server::danger::ClientCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Err(rustls::Error::General(
-            "TLS 1.2 is not used over QUIC".into(),
-        ))
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Self::verify_signature(message, cert, dss)
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        Self::schemes()
     }
 }
