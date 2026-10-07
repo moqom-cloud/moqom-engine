@@ -270,7 +270,10 @@ async fn a_renewed_credential_extends_the_session() {
     // On the namespace watch, which is the stream a real client is likeliest to
     // have: it is how anybody learns who else is in the room.
     let mut watch = ada.watch(&namespace(&["acme", "r", "room-42"])).await;
-    watch.renew(&grant.token()).await;
+    let fresh = grant.token();
+    let proof =
+        support::tokens::device::prove(&fresh, &relay.certificate_identity(), "ada-renewed");
+    watch.renew_proving(&fresh, &proof).await;
 
     // Long enough that the original deadline is well past. Asserting the session
     // is *still* here is the only way to check this: a renewal is answered with

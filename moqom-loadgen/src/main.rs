@@ -69,8 +69,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
 use moqom_client::{
-    Bytes, Credentials, FullTrackName, Metadata, Object, ObjectProperties, OutgoingObject, Session,
-    TrackNamespace,
+    Bytes, Credentials, DeviceKey, FullTrackName, Metadata, Object, ObjectProperties,
+    OutgoingObject, Session, TrackNamespace,
 };
 use moqom_media::annexb::{AccessUnit, Codec};
 use tokio::sync::{mpsc, watch};
@@ -161,11 +161,12 @@ enum Command {
     Watch(Box<WatchArgs>),
     /// Print the key set a relay must trust to admit this harness's tokens.
     Jwks,
-    /// Print one token, for a relay that needs a credential of its own.
+    /// Print one token, for a relay that needs a credential of its own, and write
+    /// the device key it is bound to.
     ///
     /// An edge relay authenticates to its parent like anything else, so a tier whose
     /// parent verifies credentials needs one of these in
-    /// `MOQOM_RELAY_UPSTREAM_TOKEN`. It is minted as a viewer in the room, which is
+    /// `MOQOM_RELAY_UPSTREAM_TOKEN` and the key in `MOQOM_RELAY_UPSTREAM_KEY`. It is minted as a viewer in the room, which is
     /// enough to read the tracks an edge is there to forward and no more. A real
     /// fleet would give its relays a service credential scoped to the tenant rather
     /// than to one room.
@@ -189,6 +190,10 @@ struct TokenArgs {
     /// tiering not working.
     #[arg(long, default_value_t = 3600)]
     seconds: u64,
+
+    /// Where to write the PKCS#8 device key the token is bound to.
+    #[arg(long)]
+    key: std::path::PathBuf,
 }
 
 /// Where the relay is and who the identities belong to.
@@ -434,6 +439,7 @@ async fn run() -> Fallible<bool> {
             // never announces there, and a credential that could publish would let a
             // compromised edge inject tracks into the fleet.
             let who = Identity::relay(&args.tenant, &args.room);
+            std::fs::write(&args.key, Identity::pkcs8(&who.user))?;
             println!("{}", mint.token(&who, 0, args.seconds));
             Ok(true)
         }
@@ -471,7 +477,14 @@ async fn fanout(args: &FanoutArgs) -> Fallible<bool> {
     let before = read_metrics(args.common.metrics.as_deref()).await;
 
     let token = mint.token(&publisher, 0b11, TOKEN_SECONDS);
-    let mut session = connect(addr, &server_name, args.common.insecure, &token).await?;
+    let mut session = connect(
+        addr,
+        &server_name,
+        args.common.insecure,
+        &token,
+        &publisher.key,
+    )
+    .await?;
     let announcement = session
         .announce(track.namespace().clone())
         .await
@@ -540,7 +553,14 @@ async fn publish_only(args: &PublishArgs) -> Fallible<bool> {
     let before = read_metrics(args.common.metrics.as_deref()).await;
 
     let token = mint.token(&publisher, 0b11, TOKEN_SECONDS);
-    let mut session = connect(addr, &server_name, args.common.insecure, &token).await?;
+    let mut session = connect(
+        addr,
+        &server_name,
+        args.common.insecure,
+        &token,
+        &publisher.key,
+    )
+    .await?;
     let announcement = session
         .announce(track.namespace().clone())
         .await
@@ -687,6 +707,7 @@ fn gather(
                 server_name: server_name.to_owned(),
                 insecure: common.insecure,
                 token,
+                key: Arc::clone(&who.key),
                 track: track.clone(),
                 progress: Arc::clone(&progress),
                 wait: Duration::from_secs(wait),
@@ -710,6 +731,7 @@ struct Watching {
     server_name: String,
     insecure: bool,
     token: String,
+    key: Arc<DeviceKey>,
     track: FullTrackName,
     /// Objects received across every subscriber, so the drain can tell delivery
     /// still in flight from delivery that has stopped.
@@ -820,6 +842,7 @@ async fn watch_track(
         &watching.server_name,
         watching.insecure,
         &watching.token,
+        &watching.key,
     )
     .await;
     let mut session = match session {
@@ -1171,13 +1194,14 @@ async fn connect(
     server_name: &str,
     insecure: bool,
     token: &str,
+    key: &DeviceKey,
 ) -> Result<Session, moqom_client::Error> {
     let tls = if insecure {
         moqom_client::tls::insecure()
     } else {
         moqom_client::tls::native()
     };
-    let credentials = Credentials::bearer(token.as_bytes());
+    let credentials = Credentials::proven(token.as_bytes(), key);
     Session::connect(addr, server_name, tls, Some(&credentials)).await
 }
 

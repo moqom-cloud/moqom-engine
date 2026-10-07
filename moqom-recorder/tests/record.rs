@@ -1,8 +1,8 @@
 //! The recorder against the real relay.
 //!
-//! The relay verifies tokens and observes proofs: the recorder proves its
-//! token, as it must in production, while the publisher here is a bare MOQT
-//! peer presenting a bearer token. The publisher is written against the wire
+//! The relay verifies tokens and requires proofs, as every relay does: the
+//! recorder, the publisher and the viewer each prove the device key their token
+//! names. The publisher is a bare MOQT peer written against the wire
 //! types rather than `moqom-client`, because it has to answer subscriptions for
 //! two tracks in one namespace with two aliases, which is what a real media
 //! publisher does and what the client's publisher does not.
@@ -43,9 +43,17 @@ const PATIENCE: Duration = Duration::from_secs(15);
 const KEY_ID: &str = "test-key";
 const TENANT: &str = "acme";
 const ROOM: &str = "standup";
-/// The device field is the first sixteen characters of the token's thumbprint.
-const PUBLISHER_JKT: &str = "phonephonephone1-and-the-rest";
-const DEVICE: &str = "phonephonephone1";
+/// The publisher's device key, one for the whole process so its namespace
+/// stays put.
+fn publisher_key() -> &'static DeviceKey {
+    static KEY: std::sync::OnceLock<DeviceKey> = std::sync::OnceLock::new();
+    KEY.get_or_init(|| DeviceKey::generate().expect("a publisher key").0)
+}
+
+/// The device field: the first sixteen characters of the token's thumbprint.
+fn device() -> String {
+    publisher_key().thumbprint().chars().take(16).collect()
+}
 /// The subject the control plane mints every recorder token with.
 const RECORDER: &str = "moqom-recorder";
 
@@ -129,7 +137,7 @@ fn relay_with(limits: Limits, ceiling: u32) -> Relay {
                 bytes: signer().public_key().as_ref().to_vec(),
             }],
         ))
-        .proving(Possession::new(Enforcement::Observed, Some(identity)));
+        .proving(Possession::new(Enforcement::Required, Some(identity)));
     if ceiling > 0 {
         fabric.policy().describe(
             (TENANT.into(), ROOM.into()),
@@ -260,6 +268,20 @@ impl Publisher {
                 Bytes::copy_from_slice(token.as_bytes()),
             )
             .expect("a token that fits");
+        let relay_identity = URL_SAFE_NO_PAD.encode(
+            aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, relay.certificate.as_ref())
+                .as_ref(),
+        );
+        let proof = publisher_key()
+            .prove(token.as_bytes(), &relay_identity)
+            .expect("a proof");
+        setup
+            .options
+            .set_bytes(
+                moqom_proto::control::setup::option_type::AUTHORIZATION_PROOF,
+                Bytes::from(proof),
+            )
+            .expect("a proof that fits");
         write(&mut send, &setup).await;
         let mut frames = Frames {
             stream: recv,
@@ -572,9 +594,10 @@ async fn a_plaintext_room_is_archived_and_muxed_and_the_recorder_is_not_on_the_r
     let relay = relay();
     let out = scratch("plaintext");
     let namespace =
-        TrackNamespace::from_parts([TENANT, "r", ROOM, "ada", DEVICE]).expect("a namespace");
+        TrackNamespace::from_parts([TENANT, "r", ROOM, "ada", &device()]).expect("a namespace");
 
-    let mut publisher = Publisher::connect(&relay, &token("ada", PUBLISHER_JKT, 3)).await;
+    let mut publisher =
+        Publisher::connect(&relay, &token("ada", &publisher_key().thumbprint(), 3)).await;
     let mut asked = publisher.answer(&[(".catalog", 1), ("video", 2)]);
     publisher.announce(&namespace).await;
 
@@ -598,10 +621,13 @@ async fn a_plaintext_room_is_archived_and_muxed_and_the_recorder_is_not_on_the_r
         .expect("no panic");
     assert_eq!(summary.error, None);
 
-    let root = out.join("acme/rec_1/ada").join(DEVICE);
+    let root = out.join("acme/rec_1/ada").join(device());
     let (header, objects) = objects_in(&root.join("video/a1-s00000.mqa"));
     assert!(!header.encrypted);
-    assert_eq!(header.namespace, ["acme", "r", "standup", "ada", DEVICE]);
+    assert_eq!(
+        header.namespace,
+        ["acme", "r", "standup", "ada", device().as_str()]
+    );
     // In arrival order, which across groups is whatever order their streams
     // were read in; every object exactly once.
     let mut ids: Vec<(u64, u64)> = objects
@@ -660,9 +686,10 @@ async fn an_encrypted_room_is_archived_as_ciphertext_only() {
     let relay = relay();
     let out = scratch("e2ee");
     let namespace =
-        TrackNamespace::from_parts([TENANT, "r", ROOM, "ada", DEVICE]).expect("a namespace");
+        TrackNamespace::from_parts([TENANT, "r", ROOM, "ada", &device()]).expect("a namespace");
 
-    let mut publisher = Publisher::connect(&relay, &token("ada", PUBLISHER_JKT, 3)).await;
+    let mut publisher =
+        Publisher::connect(&relay, &token("ada", &publisher_key().thumbprint(), 3)).await;
     let mut asked = publisher.answer(&[(".catalog", 1), ("video", 2)]);
     publisher.announce(&namespace).await;
 
@@ -681,7 +708,7 @@ async fn an_encrypted_room_is_archived_as_ciphertext_only() {
         .expect("no panic");
     assert_eq!(summary.error, None);
 
-    let root = out.join("acme/rec_1/ada").join(DEVICE);
+    let root = out.join("acme/rec_1/ada").join(device());
     let (header, objects) = objects_in(&root.join("video/a1-s00000.mqa"));
     assert!(header.encrypted);
     assert_eq!(objects.len(), 6);
@@ -721,9 +748,10 @@ async fn a_publisher_leaving_finishes_its_files() {
     let relay = relay();
     let out = scratch("departed");
     let namespace =
-        TrackNamespace::from_parts([TENANT, "r", ROOM, "ada", DEVICE]).expect("a namespace");
+        TrackNamespace::from_parts([TENANT, "r", ROOM, "ada", &device()]).expect("a namespace");
 
-    let mut publisher = Publisher::connect(&relay, &token("ada", PUBLISHER_JKT, 3)).await;
+    let mut publisher =
+        Publisher::connect(&relay, &token("ada", &publisher_key().thumbprint(), 3)).await;
     let mut asked = publisher.answer(&[(".catalog", 1), ("video", 2)]);
     publisher.announce(&namespace).await;
 
@@ -739,7 +767,7 @@ async fn a_publisher_leaving_finishes_its_files() {
     publisher.withdraw();
     let first = out
         .join("acme/rec_1/ada")
-        .join(DEVICE)
+        .join(device())
         .join("video/a1-s00000.mqa");
     within("the departure to finish the archive", async {
         while !first.exists() {
@@ -781,8 +809,9 @@ struct Viewer {
 
 impl Viewer {
     async fn connect(relay: &Relay) -> Self {
-        let token = token("bea", "viewerviewerview-and-the-rest", 0);
-        let credentials = moqom_client::Credentials::bearer(token.as_bytes());
+        let (key, _) = DeviceKey::generate().expect("a viewer key");
+        let token = token("bea", &key.thumbprint(), 0);
+        let credentials = moqom_client::Credentials::proven(token.as_bytes(), &key);
         let session = moqom_client::Session::connect(
             relay.addr,
             "localhost",
@@ -853,9 +882,10 @@ async fn a_recorder_joining_mid_group_catches_up_on_the_group_in_flight() {
     let relay = relay();
     let out = scratch("catch-up");
     let namespace =
-        TrackNamespace::from_parts([TENANT, "r", ROOM, "ada", DEVICE]).expect("a namespace");
+        TrackNamespace::from_parts([TENANT, "r", ROOM, "ada", &device()]).expect("a namespace");
 
-    let mut publisher = Publisher::connect(&relay, &token("ada", PUBLISHER_JKT, 3)).await;
+    let mut publisher =
+        Publisher::connect(&relay, &token("ada", &publisher_key().thumbprint(), 3)).await;
     let mut asked = publisher.answer(&[(".catalog", 1), ("video", 2)]);
     publisher.announce(&namespace).await;
 
@@ -904,7 +934,7 @@ async fn a_recorder_joining_mid_group_catches_up_on_the_group_in_flight() {
         .expect("no panic");
     assert_eq!(summary.error, None);
 
-    let root = out.join("acme/rec_1/ada").join(DEVICE);
+    let root = out.join("acme/rec_1/ada").join(device());
     let (_, objects) = objects_in(&root.join("video/a1-s00000.mqa"));
     let mut ids: Vec<(u64, u64)> = objects.iter().map(|seen| (seen.0, seen.1)).collect();
     ids.sort_unstable();
@@ -948,9 +978,10 @@ async fn without_the_group_in_flight_the_recording_starts_at_the_next_and_says_s
     let relay = relay_with(Limits::none(), 0);
     let out = scratch("no-catch-up");
     let namespace =
-        TrackNamespace::from_parts([TENANT, "r", ROOM, "ada", DEVICE]).expect("a namespace");
+        TrackNamespace::from_parts([TENANT, "r", ROOM, "ada", &device()]).expect("a namespace");
 
-    let mut publisher = Publisher::connect(&relay, &token("ada", PUBLISHER_JKT, 3)).await;
+    let mut publisher =
+        Publisher::connect(&relay, &token("ada", &publisher_key().thumbprint(), 3)).await;
     let mut asked = publisher.answer(&[(".catalog", 1), ("video", 2)]);
     publisher.announce(&namespace).await;
 
@@ -1003,7 +1034,7 @@ async fn without_the_group_in_flight_the_recording_starts_at_the_next_and_says_s
         .expect("no panic");
     assert_eq!(summary.error, None);
 
-    let root = out.join("acme/rec_1/ada").join(DEVICE);
+    let root = out.join("acme/rec_1/ada").join(device());
     let (_, objects) = objects_in(&root.join("video/a1-s00000.mqa"));
     let ids: Vec<(u64, u64)> = objects.iter().map(|seen| (seen.0, seen.1)).collect();
     assert_eq!(ids, [(6, 0), (6, 1)]);
@@ -1030,18 +1061,20 @@ async fn a_full_room_admits_its_recorder_and_the_recorder_takes_no_seat() {
     let relay = relay_with(Limits::default(), 1);
     let out = scratch("full");
     let namespace =
-        TrackNamespace::from_parts([TENANT, "r", ROOM, "ada", DEVICE]).expect("a namespace");
+        TrackNamespace::from_parts([TENANT, "r", ROOM, "ada", &device()]).expect("a namespace");
 
-    let mut publisher = Publisher::connect(&relay, &token("ada", PUBLISHER_JKT, 3)).await;
+    let mut publisher =
+        Publisher::connect(&relay, &token("ada", &publisher_key().thumbprint(), 3)).await;
     let mut asked = publisher.answer(&[(".catalog", 1), ("video", 2)]);
     publisher.announce(&namespace).await;
 
     let refused = |relay: &Relay| {
-        let token = token("bea", "viewerviewerview-and-the-rest", 0);
+        let (key, _) = DeviceKey::generate().expect("a viewer key");
+        let token = token("bea", &key.thumbprint(), 0);
         let addr = relay.addr;
         let tls = moqom_client::tls::pinned(relay.certificate.clone());
         async move {
-            let credentials = moqom_client::Credentials::bearer(token.as_bytes());
+            let credentials = moqom_client::Credentials::proven(token.as_bytes(), &key);
             match moqom_client::Session::connect(addr, "localhost", tls, Some(&credentials)).await {
                 Ok(session) => {
                     // Refusal can arrive as the connection closing just after

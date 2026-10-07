@@ -582,7 +582,10 @@ impl Default for Fabric {
             metrics: Metrics::default(),
             governor: Governor::disabled(),
             authenticator: Authenticator::disabled(),
-            possession: Arc::new(Possession::bearer()),
+            possession: Arc::new(Possession::new(
+                crate::possession::Enforcement::Required,
+                None,
+            )),
             clock: Arc::default(),
             roster: Roster::new(),
             policy: Policy::new(),

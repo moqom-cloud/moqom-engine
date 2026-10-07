@@ -72,6 +72,10 @@
 //!   Being a relay is not a way past a parent's door, so against a parent that
 //!   verifies credentials an edge without this is anonymous and will not be able to
 //!   read the tracks it exists to serve.
+//! - `MOQOM_RELAY_UPSTREAM_KEY` — a PKCS#8 P-256 file holding the device key that
+//!   token is bound to. Required with the token: every parent requires proof of
+//!   possession, so this relay proves the token on each link, against the
+//!   certificate the parent presented.
 //! - `MOQOM_RELAY_LINK_URL` — the control plane's `/relay/link`, on its join
 //!   listener. Set beside `MOQOM_RELAY_UPSTREAM`, this edge links to its parent
 //!   once per room instead of once, each link on a short-lived credential minted
@@ -805,7 +809,33 @@ fn upstream() -> Result<Option<upstream::Parent>, Box<dyn std::error::Error>> {
     let host = host.trim_matches(['[', ']']).to_owned();
 
     let token = env("MOQOM_RELAY_UPSTREAM_TOKEN");
-    if token.is_none() {
+    let key = match env_path("MOQOM_RELAY_UPSTREAM_KEY") {
+        Some(path) => {
+            let pkcs8 = std::fs::read(&path)
+                .map_err(|e| format!("reading MOQOM_RELAY_UPSTREAM_KEY {}: {e}", path.display()))?;
+            let key = moqom_client::device::DeviceKey::from_pkcs8(&pkcs8)
+                .map_err(|e| format!("MOQOM_RELAY_UPSTREAM_KEY {}: {e}", path.display()))?;
+            Some(std::sync::Arc::new(key))
+        }
+        None => None,
+    };
+    let credential = match (token, key) {
+        (Some(token), Some(key)) => Some(upstream::Credential { token, key }),
+        (Some(_), None) => {
+            return Err(
+                "MOQOM_RELAY_UPSTREAM_TOKEN needs MOQOM_RELAY_UPSTREAM_KEY: \
+                        a parent refuses a token its holder cannot prove"
+                    .into(),
+            );
+        }
+        (None, Some(_)) => {
+            return Err(
+                "MOQOM_RELAY_UPSTREAM_KEY is set without MOQOM_RELAY_UPSTREAM_TOKEN".into(),
+            );
+        }
+        (None, None) => None,
+    };
+    if credential.is_none() {
         // Worth a line rather than silence: against a parent that verifies
         // credentials this relay is anonymous, and an anonymous edge can read only
         // what an anonymous client could, so the tracks it is there to serve will
@@ -817,7 +847,7 @@ fn upstream() -> Result<Option<upstream::Parent>, Box<dyn std::error::Error>> {
         server_name: host.clone(),
         host,
         port,
-        token,
+        credential,
     }))
 }
 
@@ -942,18 +972,11 @@ fn admin_guard() -> Result<(Guard, Option<AdminTls>), Box<dyn std::error::Error>
     Ok((guard, tls))
 }
 
-/// How strictly this relay holds a session to proving its credential is its own.
-///
-/// Defaults to [`Enforcement::Required`]: a token is bound to the device key it
-/// names, and a session that cannot prove it holds that key is refused. Every
-/// MOQOM SDK signs a proof, so there are no older clients to wait for.
-/// `observed` exists for a self-hosted deployment migrating hand-minted tokens,
-/// and `bearer` for one that needs to get back to pre-proof behaviour in a hurry;
-/// both are logged as warnings.
-///
-/// Logged at startup either way, because "are credentials bearer tokens here" is
-/// not a question anybody should have to answer by reading the environment of a
-/// running container.
+/// How strictly this relay holds a session to proving its credential is its own:
+/// always. A token is bound to the device key it names, and a session that
+/// cannot prove it holds that key is refused. `MOQOM_RELAY_POSSESSION` may be
+/// unset or `required`; the removed `bearer` and `observed` stop the relay at
+/// startup rather than being quietly upgraded.
 fn possession(certificate: String) -> Result<Possession, Box<dyn std::error::Error>> {
     let mode = match env("MOQOM_RELAY_POSSESSION") {
         Some(name) => {
@@ -961,17 +984,7 @@ fn possession(certificate: String) -> Result<Possession, Box<dyn std::error::Err
         }
         None => Enforcement::default(),
     };
-    match mode {
-        Enforcement::Required => {
-            tracing::info!("sessions must prove they hold the key their token names");
-        }
-        Enforcement::Observed => tracing::warn!(
-            "MOQOM_RELAY_POSSESSION=observed: sessions without a proof are admitted, so a stolen token works from any device until it expires"
-        ),
-        Enforcement::Bearer => {
-            tracing::warn!("tokens are bearer credentials: a stolen one works until it expires");
-        }
-    }
+    tracing::info!("sessions must prove they hold the key their token names");
     Ok(Possession::new(mode, Some(certificate)))
 }
 

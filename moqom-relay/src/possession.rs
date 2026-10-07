@@ -154,55 +154,37 @@ impl ProofError {
     }
 }
 
-/// How strictly a relay holds sessions to proving possession.
+/// How strictly a relay holds sessions to proving possession: completely.
 ///
-/// Three modes rather than a boolean, because turning this on is a migration and
-/// not a switch. A relay and the clients that dial it are deployed separately, so
-/// there is necessarily a period when some clients send proofs and some do not,
-/// and a deployment that could only choose between "ignore them all" and "refuse
-/// them all" would have to disconnect everybody to cross it.
+/// One mode. A token is bound to the device key its `cnf.jkt` names, and a
+/// session that cannot prove it holds that key is refused, on every relay. The
+/// `bearer` and `observed` modes that once let a deployment migrate are gone:
+/// every MOQOM SDK signs a proof, and a credential that works from any device
+/// is not one a zero-trust platform issues.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Enforcement {
-    /// Tokens are bearer credentials, as they were before proofs existed.
-    ///
-    /// A proof that arrives is not even checked, which is deliberate: checking
-    /// and ignoring the result costs a signature verification per connection to
-    /// produce a log line nobody has asked for.
-    Bearer,
-
-    /// Verify a proof when one is offered; admit a session that offers none.
-    ///
-    /// The mode to cross the migration in. A client that gets the format wrong
-    /// finds out here, in a log line and a metric, rather than by failing to
-    /// connect — and a *bad* proof is still refused, because a peer that presents
-    /// one and gets it wrong is not the same as a peer that presents none.
-    Observed,
-
     /// A token without a valid proof admits nobody.
-    ///
-    /// The destination. Note what it costs: a token minted for one device cannot
-    /// be pasted into another, which is the point, and is also what stops a
-    /// hand-minted token from being shared between two phones.
     #[default]
     Required,
 }
 
 impl Enforcement {
-    /// Read the mode from its configured name.
+    /// Read the mode from its configured name, which can only be `required`.
     ///
-    /// Unrecognised text is an error rather than a default, since the two useful
-    /// defaults sit at opposite ends of this and guessing which was meant would
-    /// be guessing whether the operator wanted enforcement.
+    /// `bearer` and `observed` are errors rather than silently upgraded, so a
+    /// deployment still configured for them finds out at startup.
     ///
     /// # Errors
-    /// The list of names, for the person who wrote the configuration.
+    /// What was wrong, for the person who wrote the configuration.
     pub fn parse(name: &str) -> Result<Self, String> {
         match name.trim().to_ascii_lowercase().as_str() {
-            "bearer" => Ok(Self::Bearer),
-            "observed" => Ok(Self::Observed),
             "required" => Ok(Self::Required),
+            "bearer" | "observed" => Err(format!(
+                "possession mode {:?} has been removed: every session must prove its device key",
+                name.trim()
+            )),
             other => Err(format!(
-                "unknown possession mode {other:?}: expected bearer, observed or required"
+                "unknown possession mode {other:?}: expected required"
             )),
         }
     }
@@ -297,13 +279,6 @@ impl Possession {
         }
     }
 
-    /// A checker that holds nobody to anything, for tests and for a relay whose
-    /// operator has not turned this on.
-    #[must_use]
-    pub fn bearer() -> Self {
-        Self::new(Enforcement::Bearer, None)
-    }
-
     /// The mode in force.
     #[must_use]
     pub const fn mode(&self) -> Enforcement {
@@ -323,8 +298,8 @@ impl Possession {
     /// flight — spend a legitimate client's proof for it.
     ///
     /// # Errors
-    /// [`ProofError`], which the caller reports as an authentication failure. In
-    /// [`Enforcement::Observed`] a missing proof is not one of them.
+    /// [`ProofError`], which the caller reports as an authentication failure,
+    /// [`ProofError::Missing`] included.
     pub fn check(
         &self,
         token: &[u8],
@@ -333,23 +308,8 @@ impl Possession {
         expires: SystemTime,
         now: SystemTime,
     ) -> Result<(), ProofError> {
-        if self.mode == Enforcement::Bearer {
-            return Ok(());
-        }
         let Some(proof) = proof else {
-            return match self.mode {
-                Enforcement::Required => Err(ProofError::Missing),
-                // Nothing to check and nothing to complain to the peer about.
-                // The absence is worth counting, which the caller does, since it
-                // is how a deployment knows whether it can move to `Required`.
-                Enforcement::Bearer | Enforcement::Observed => {
-                    tracing::warn!(
-                        thumbprint,
-                        "admitted a session without proof of possession; its token would work from any device"
-                    );
-                    Ok(())
-                }
-            };
+            return Err(ProofError::Missing);
         };
 
         let (header, claims, signed, signature) = split(proof)?;
@@ -736,61 +696,24 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_proof_is_refused_only_where_it_is_required() {
+    fn a_missing_proof_is_refused() {
         let token = b"a.token";
         let device = Device::new();
-
         assert_eq!(
             checker().check(token, None, &device.thumbprint(), expires(), now()),
             Err(ProofError::Missing)
         );
         assert_eq!(
-            Possession::new(Enforcement::Observed, Some(RELAY.to_owned())).check(
+            Possession::new(Enforcement::default(), None).check(
                 token,
                 None,
                 &device.thumbprint(),
                 expires(),
                 now()
             ),
-            Ok(()),
-            "the mode that exists to be deployed through must admit old clients"
+            Err(ProofError::Missing),
+            "a checker with no relay binding still demands a proof"
         );
-    }
-
-    /// Observed is not a mode that accepts anything: a peer that presents a
-    /// proof and gets it wrong is a different case from one that presents none.
-    #[test]
-    fn observed_still_refuses_a_bad_proof() {
-        let token = b"a.token";
-        let observing = Possession::new(Enforcement::Observed, Some(RELAY.to_owned()));
-
-        assert_eq!(
-            observing.check(
-                token,
-                Some(&Device::new().prove(token, "one", RELAY)),
-                &Device::new().thumbprint(),
-                expires(),
-                now()
-            ),
-            Err(ProofError::WrongKey)
-        );
-    }
-
-    #[test]
-    fn bearer_checks_nothing_at_all() {
-        let token = b"a.token";
-        let bearer = Possession::bearer();
-
-        assert_eq!(
-            bearer.check(token, None, "whatever", expires(), now()),
-            Ok(())
-        );
-        assert_eq!(
-            bearer.check(token, Some(b"not even a jws"), "whatever", expires(), now()),
-            Ok(()),
-            "checking and discarding the result would cost a verification per connection"
-        );
-        assert_eq!(bearer.remembered(), 0);
     }
 
     /// Identifiers are forgotten once the token they name has expired, which is
@@ -928,13 +851,11 @@ mod tests {
     }
 
     #[test]
-    fn modes_are_read_from_configuration() {
-        assert_eq!(Enforcement::parse("bearer"), Ok(Enforcement::Bearer));
+    fn only_required_is_read_from_configuration() {
         assert_eq!(Enforcement::parse(" Required "), Ok(Enforcement::Required));
-        assert!(
-            Enforcement::parse("yes").is_err(),
-            "guessing would be worse"
-        );
+        for removed in ["bearer", "observed", "yes"] {
+            assert!(Enforcement::parse(removed).is_err(), "{removed}");
+        }
     }
 
     /// The proofs above are made by the same code that checks them, which is the

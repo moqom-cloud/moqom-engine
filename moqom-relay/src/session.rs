@@ -1868,8 +1868,7 @@ impl Session {
         if !held.same_seat(fresh) {
             return refuse("seat", "a renewed credential named a different seat");
         }
-        let checked = self.fabric.possession().mode() != crate::possession::Enforcement::Bearer;
-        if !(proven && checked) {
+        if !proven {
             return refuse(
                 "unproven",
                 "a renewed credential changing grants carried no checked proof of possession",

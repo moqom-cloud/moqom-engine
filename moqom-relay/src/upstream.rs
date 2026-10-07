@@ -26,6 +26,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
+use moqom_client::device::DeviceKey;
 use tokio::sync::mpsc;
 
 use crate::fabric::{Fabric, RoomKey};
@@ -75,7 +76,19 @@ pub struct Parent {
     /// A relay in a fleet is authenticated like anything else. Being a relay is
     /// not a way past the door, and an unauthenticated interior tier would be an
     /// open proxy for every track the fleet carries.
-    pub token: Option<String>,
+    pub credential: Option<Credential>,
+}
+
+/// A token and the device key it is bound to.
+///
+/// Never a token alone: every relay requires a proof of possession, so a token
+/// this relay cannot prove would be refused at the parent's door.
+#[derive(Debug, Clone)]
+pub struct Credential {
+    /// The token, exactly as issued.
+    pub token: String,
+    /// The key its `cnf` names.
+    pub key: Arc<DeviceKey>,
 }
 
 impl std::fmt::Display for Parent {
@@ -100,18 +113,6 @@ pub struct Introduction {
     pub renewals: Option<mpsc::Receiver<Renewal>>,
     /// When to end the link for want of anything to carry.
     pub idle: Option<Idle>,
-}
-
-impl Introduction {
-    /// The single link of [`keep_attached`]: a credential, if any, and nothing
-    /// else.
-    #[must_use]
-    pub fn bearer(token: Option<&str>) -> Self {
-        Self {
-            token: token.map(|token| token.as_bytes().to_vec()),
-            ..Self::default()
-        }
-    }
 }
 
 /// A fresh credential for a link that is up, with its own proof.
@@ -158,6 +159,14 @@ pub enum Error {
         /// What each address said, in the order they were tried.
         tried: Vec<String>,
     },
+    /// The link was up but this relay could not prove its credential for it.
+    #[error("could not prove this relay's credential to {parent}: {why}")]
+    Unprovable {
+        /// The parent the proof was for.
+        parent: String,
+        /// Why no proof could be made.
+        why: String,
+    },
     /// The session was established and then ended, or the parent turned it away.
     #[error("the parent relay refused or ended the session: {0}")]
     Refused(#[from] crate::session::SessionError),
@@ -173,12 +182,31 @@ pub enum Error {
 /// [`Error`] if the parent cannot be reached, or if the session ends in a fault.
 pub async fn attach(dialer: &Dialer, parent: &Parent, fabric: Fabric) -> Result<(), Error> {
     let connection = connect(dialer, parent).await?;
-    attach_over(
-        connection,
-        fabric,
-        Introduction::bearer(parent.token.as_deref()),
-    )
-    .await
+    let introduction = match &parent.credential {
+        None => Introduction::default(),
+        Some(credential) => {
+            // Proved per connection, against the certificate this connection
+            // reached, so a proof cannot be replayed to another parent or reused
+            // after a reconnect.
+            let relay = certificate_identity(&connection).ok_or_else(|| Error::Unprovable {
+                parent: parent.to_string(),
+                why: "the parent presented no certificate".to_owned(),
+            })?;
+            let proof = credential
+                .key
+                .prove(credential.token.as_bytes(), &relay)
+                .map_err(|e| Error::Unprovable {
+                    parent: parent.to_string(),
+                    why: e.to_string(),
+                })?;
+            Introduction {
+                token: Some(credential.token.as_bytes().to_vec()),
+                proof: Some(proof),
+                ..Introduction::default()
+            }
+        }
+    };
+    attach_over(connection, fabric, introduction).await
 }
 
 /// Dial the parent, trying each address its name resolves to.

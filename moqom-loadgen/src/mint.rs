@@ -26,11 +26,19 @@
 //! than a weakness to note quietly. Anyone reading this file can mint tokens the
 //! relay trusts, so `jwks` prints a warning beside the key set. The failure worth
 //! preventing is an operator pasting it into a relay that is not a test relay.
+//!
+//! The device keys the tokens are bound to are derived the same way, from each
+//! identity's name, and are just as public. Derived rather than generated because
+//! the publisher's namespace is its thumbprint, and the hosts of a run agree on
+//! it without talking to each other.
+
+use std::sync::Arc;
 
 use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair};
 use aws_lc_rs::{digest, error};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use moqom_client::DeviceKey;
 
 /// The issuer the minted tokens name, and what a relay must be told to expect.
 pub const ISSUER: &str = "https://loadgen.moqom.invalid";
@@ -125,13 +133,9 @@ pub struct Identity {
     pub user: String,
     /// The room they were admitted to.
     pub room: String,
-    /// Stands in for the RFC 7638 thumbprint of a device key.
-    ///
-    /// A real client's is the hash of a key it holds. Nothing here holds one,
-    /// because a relay only insists on that under
-    /// `MOQOM_RELAY_POSSESSION=required` and this measures fan-out rather than
-    /// admission. What matters is that it is distinct per session, and shaped
-    /// like the real thing so that truncating it produces a legal device field.
+    /// The device key the token is bound to, which every session proves.
+    pub key: Arc<DeviceKey>,
+    /// The RFC 7638 thumbprint of `key`, which the token commits to as `cnf`.
     pub thumbprint: String,
 }
 
@@ -160,16 +164,35 @@ impl Identity {
     }
 
     fn new(tenant: &str, room: &str, user: &str) -> Self {
-        // A hash, so it is the length and alphabet of a real thumbprint, and
-        // deterministic, so a name in a log points at the same session on a
-        // rerun.
-        let hash = digest::digest(&digest::SHA256, user.as_bytes());
+        let key = DeviceKey::from_pkcs8(&Self::pkcs8(user)).expect("a P-256 scalar");
         Self {
             tenant: tenant.to_owned(),
             user: user.to_owned(),
             room: room.to_owned(),
-            thumbprint: URL_SAFE_NO_PAD.encode(hash.as_ref()),
+            thumbprint: key.thumbprint(),
+            key: Arc::new(key),
         }
+    }
+
+    /// The PKCS#8 P-256 private key for `user`, its scalar a hash of the name.
+    ///
+    /// A hash falls outside the curve's order with probability about 2^-32, and
+    /// the names used here are fixed, so the tests would catch the one that did.
+    #[must_use]
+    pub fn pkcs8(user: &str) -> Vec<u8> {
+        // PrivateKeyInfo { v1, id-ecPublicKey/prime256v1, ECPrivateKey { v1, d } },
+        // up to the 32 bytes of d.
+        const PREFIX: [u8; 35] = [
+            0x30, 0x41, 0x02, 0x01, 0x00, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d,
+            0x02, 0x01, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x04, 0x27,
+            0x30, 0x25, 0x02, 0x01, 0x01, 0x04, 0x20,
+        ];
+        let mut seed = b"moqom-loadgen device key ".to_vec();
+        seed.extend_from_slice(user.as_bytes());
+        let scalar = digest::digest(&digest::SHA256, &seed);
+        let mut der = PREFIX.to_vec();
+        der.extend_from_slice(scalar.as_ref());
+        der
     }
 
     /// The device field a namespace of this identity's carries.
@@ -248,6 +271,17 @@ mod tests {
     fn the_device_is_the_thumbprint_the_token_carries_truncated() {
         let who = Identity::publisher("acme", "room-42");
         assert!(who.thumbprint.starts_with(who.device()));
+    }
+
+    /// Every host derives the same key for the same name, which is what lets
+    /// them agree on the publisher's namespace.
+    #[test]
+    fn a_name_always_derives_the_same_device_key() {
+        let one = Identity::publisher("acme", "room-42");
+        let two = Identity::publisher("acme", "room-42");
+        assert_eq!(one.thumbprint, two.thumbprint);
+        assert_eq!(one.thumbprint, one.key.thumbprint());
+        assert_eq!(one.thumbprint.len(), 43, "base64url of a SHA-256");
     }
 
     #[test]

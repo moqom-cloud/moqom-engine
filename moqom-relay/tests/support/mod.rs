@@ -176,7 +176,7 @@ impl Relay {
             Limits::default(),
             Governor::disabled(),
             tokens::authenticator(),
-            Enforcement::Bearer,
+            Enforcement::Required,
             usage,
             None,
         )
@@ -190,7 +190,7 @@ impl Relay {
             Limits::default(),
             Governor::disabled(),
             tokens::authenticator(),
-            Enforcement::Bearer,
+            Enforcement::Required,
             usage,
             Some(moqom_relay::fabric::Ticketing {
                 keys: std::sync::Arc::new(tokens::ticket_keys()),
@@ -213,15 +213,14 @@ impl Relay {
     }
 
     fn assembled(limits: Limits, governor: Governor, authenticator: Authenticator) -> Self {
-        // Bearer, which is what every relay here did before proofs existed and
-        // what all but the possession tests still want: those tests are about who
-        // may forward what, and making each of them mint a device key as well
-        // would be ceremony that hid what they were checking.
+        // Required, as on every relay. With no token keys the relay admits
+        // anonymous sessions and never asks for a proof, which is what the
+        // forwarding tests here run under.
         Self::configured(
             limits,
             governor,
             authenticator,
-            Enforcement::Bearer,
+            Enforcement::Required,
             Usage::disabled(),
             None,
         )
@@ -379,7 +378,7 @@ impl Relay {
             host: self.addr.ip().to_string(),
             port: self.addr.port(),
             server_name: "localhost".to_owned(),
-            token: None,
+            credential: None,
         }
     }
 
@@ -430,7 +429,14 @@ impl Relay {
             // The certificate is pinned above, so the name here is only what
             // verification is told to expect and is independent of what is dialled.
             server_name: "localhost".to_owned(),
-            token: token.map(str::to_owned),
+            credential: token.map(|token| moqom_relay::upstream::Credential {
+                token: token.to_owned(),
+                key: Arc::new(
+                    moqom_client::device::DeviceKey::generate()
+                        .expect("a link key")
+                        .0,
+                ),
+            }),
         };
         let fabric = self.fabric.clone();
         let running = tokio::spawn(async move {
@@ -626,6 +632,20 @@ impl Client {
                 .expect("the relay accepts")
         })
         .await;
+
+        // A credential always travels with a proof, as from every MOQOM SDK.
+        // A test that wants none passes an empty one through
+        // `try_connect_proving`.
+        let made;
+        let proof = match (token, proof) {
+            (Some(token), None) => {
+                assert_eq!(tokens::device::thumbprint(), tokens::thumbprint_constant());
+                made =
+                    tokens::device::prove(token, &relay.certificate_identity(), &fresh_proof_id());
+                Some(made.as_str())
+            }
+            (_, proof) => proof,
+        };
 
         let session = moqom_transport::Session::raw(
             connection,
@@ -1589,6 +1609,15 @@ pub async fn dial(relay: &Relay, alpn: &[u8]) -> (quinn::Endpoint, moqom_transpo
 /// own code would prove the two agree with each other and nothing about the
 /// format. `tests/interop_tokens.rs` is what pins the format against Go; this
 /// is what puts a token through a socket.
+/// A proof identifier not used before in this process.
+fn fresh_proof_id() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    format!(
+        "auto-{}",
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
+
 pub mod tokens {
     use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair};
     use base64::Engine as _;
@@ -1598,11 +1627,16 @@ pub mod tokens {
     const KID: &str = "test-key";
     const ISSUER: &str = "https://api.moqom.cloud";
 
-    /// A thumbprint whose first sixteen characters are the device field a
-    /// client announces under. The relay derives one from the other, so these
-    /// two constants are one fact and have to be written as one.
-    const THUMBPRINT: &str = "OuXpLpEHW7dCPqjKWm8Zq1TfBb2nQ4Zt";
-    pub const DEVICE: &str = "OuXpLpEHW7dCPqjK";
+    /// The thumbprint of [`device`]'s key, whose first sixteen characters are
+    /// the device field a client announces under. The relay derives one from
+    /// the other, so these two constants are one fact and have to be written as
+    /// one; `device::thumbprint` is checked against it.
+    const THUMBPRINT: &str = "6sJbku90U16EBFQrQOCPWqR1Sg8BLxq7un4tlyvnTzY";
+    pub const DEVICE: &str = "6sJbku90U16EBFQr";
+
+    pub(crate) fn thumbprint_constant() -> &'static str {
+        THUMBPRINT
+    }
 
     /// A deterministic key, so a failing test fails the same way twice.
     fn signer() -> Ed25519KeyPair {
@@ -1805,24 +1839,17 @@ pub mod tokens {
         use base64::Engine as _;
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
-        /// One device key for the whole test process.
-        ///
-        /// Generated once and kept, rather than per call: everything a proving
-        /// test announces sits under a namespace derived from this key, so a key
-        /// that changed between two calls within a test would move the namespace
-        /// out from under it. Which key it is does not matter — nothing here is
-        /// written down against it, because [`id`] derives the device field from
-        /// whatever this turns out to be.
+        /// One device key for the whole test process, and a fixed one, so that
+        /// every token this harness mints — not only the ones a possession
+        /// test asks for — is bound to a key the harness holds, and a client
+        /// can prove it on a relay that requires that of everybody.
         fn pair() -> EcdsaKeyPair {
-            static DOCUMENT: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
-            let document = DOCUMENT.get_or_init(|| {
-                let rng = aws_lc_rs::rand::SystemRandom::new();
-                EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng)
-                    .expect("generating a device key")
-                    .as_ref()
-                    .to_vec()
-            });
-            EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, document)
+            const PKCS8: &str = "308187020100301306072a8648ce3d020106082a8648ce3d030107046d306b0201010420701e80798abc0b4a4f6e625cd20d685cc8ca00cb01e4986290cb021935acdf6ea14403420004ff93fe6aad058f6c091b26a29277f15484991e66fb044c007c5b7165c64bf5a498223001987d9e6a86695803807d7dbe850d382c7b76534d89badc5246badad5";
+            let document: Vec<u8> = (0..PKCS8.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&PKCS8[i..i + 2], 16).expect("hex"))
+                .collect();
+            EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &document)
                 .expect("a valid P-256 key")
         }
 

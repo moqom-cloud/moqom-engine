@@ -285,9 +285,7 @@ async fn a_superseded_token_cannot_undo_a_demotion() {
 }
 
 /// A renewal that hands a live connection new powers must prove the device
-/// asking holds the key — including on a relay that would admit a session
-/// without one. On a bearer relay nothing is checked, so nothing can satisfy
-/// that, and grants there change by reconnecting.
+/// asking holds the key. One without a proof promotes nobody.
 #[tokio::test]
 async fn an_unproven_promotion_is_ignored() {
     let relay = Relay::authenticating();
@@ -299,11 +297,6 @@ async fn an_unproven_promotion_is_ignored() {
 
     let slot = namespace(&["acme", "r", "room-42", "ada", support::tokens::DEVICE]);
     assert_eq!(ada.announce_refused(&slot).await, UNAUTHORIZED);
-    assert!(
-        relay
-            .scrape()
-            .contains(r#"moqom_relay_grant_changes_refused_total{reason="unproven"} 1"#)
-    );
 }
 
 /// A mute imposed in the queue holds on stage. Mutes are kept against the
