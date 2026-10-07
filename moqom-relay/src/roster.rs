@@ -166,6 +166,17 @@ impl std::fmt::Debug for Presence {
 }
 
 impl Presence {
+    /// Whether this is the hosted recorder. See [`crate::scope::is_recorder`].
+    #[must_use]
+    pub fn is_recorder(&self) -> bool {
+        crate::scope::is_recorder(
+            &self.user,
+            self.publish,
+            self.capabilities,
+            self.owner || self.backstage,
+        )
+    }
+
     /// Whether this session was closed on instruction rather than by accident.
     #[must_use]
     pub fn was_ejected(&self) -> bool {
@@ -541,12 +552,15 @@ impl Roster {
     }
 
     /// How many sessions one room holds, for the participant ceiling.
+    ///
+    /// The hosted recorder is not counted: it is not a participant, and a
+    /// recorder in a room must not be the reason a person is turned away.
     #[must_use]
     pub fn occupancy(&self, tenant: &str, room: &str) -> usize {
         self.lock()
             .sessions
             .values()
-            .filter(|p| &*p.tenant == tenant && &*p.room == room)
+            .filter(|p| &*p.tenant == tenant && &*p.room == room && !p.is_recorder())
             .count()
     }
 }
@@ -646,6 +660,22 @@ mod tests {
         assert_eq!(roster.rooms().len(), 2);
         assert_eq!(roster.occupancy("acme", "r1"), 2);
         assert_eq!(roster.count(), 3);
+    }
+
+    #[test]
+    fn the_recorder_is_on_the_roster_and_not_in_the_occupancy() {
+        let roster = Roster::new();
+        let ids = Fabric::new();
+        enrol(&roster, ids.next_session_id(), "ada", Some("r1"));
+        let mut recorder = scope(crate::scope::RECORDER_SUBJECT, Some("r1"));
+        recorder.publish = Publish::NONE;
+        let (commands, _queue) = mpsc::channel(4);
+        let presence = roster
+            .admit(ids.next_session_id(), &recorder, arrival(commands))
+            .expect("enrolled");
+        assert!(presence.is_recorder());
+        assert_eq!(roster.count(), 2);
+        assert_eq!(roster.occupancy("acme", "r1"), 1);
     }
 
     #[test]

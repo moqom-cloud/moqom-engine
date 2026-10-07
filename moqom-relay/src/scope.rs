@@ -184,6 +184,25 @@ impl Publish {
     }
 }
 
+/// The subject every hosted recorder token carries.
+///
+/// The control plane's `RecorderSubject`. It is reserved there: `MintClientToken`
+/// refuses it, so a signed token naming it was minted by the recording link and
+/// by nothing a customer can reach.
+pub const RECORDER_SUBJECT: &str = "moqom-recorder";
+
+/// Whether a verified session with these rights is the hosted recorder.
+///
+/// The subject alone would do, since only the control plane can sign it; the
+/// rights are checked as well so that a recorder token minted with anything
+/// beyond viewing -- which the control plane never does -- is held to the
+/// ceiling like anybody else rather than given a seat the room cannot see.
+/// `elevated` is owning the room, being backstage, or being a relay link.
+#[must_use]
+pub fn is_recorder(user: &str, publish: Publish, capabilities: u32, elevated: bool) -> bool {
+    user == RECORDER_SUBJECT && publish.is_none() && capabilities == 0 && !elevated
+}
+
 /// The most the control plane says somebody holds in a room right now.
 ///
 /// A ceiling rather than a grant, and the difference is the rule this whole
@@ -289,6 +308,20 @@ impl Scope {
     #[must_use]
     const fn runs_the_room(&self) -> bool {
         self.owner || self.capabilities & (capability::STAGE | capability::ROOM) != 0
+    }
+
+    /// Whether this is the hosted recorder rather than a person.
+    ///
+    /// See [`is_recorder`]. The recorder is a viewer the room is told about by
+    /// its watchdog, not a participant, so the room's ceiling does not count it.
+    #[must_use]
+    pub fn is_recorder(&self) -> bool {
+        is_recorder(
+            &self.user,
+            self.publish,
+            self.capabilities,
+            self.owner || self.backstage || self.relay,
+        )
     }
 
     /// Whether the tenant field of a namespace is this holder's tenant.

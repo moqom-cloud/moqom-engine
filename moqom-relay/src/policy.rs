@@ -586,8 +586,14 @@ impl Policy {
         // The owner is never refused for capacity. A room whose host cannot
         // rejoin after a dropped connection is a room nobody can moderate, and
         // the ceiling exists to bound cost rather than to keep anybody out in
-        // particular.
-        if rules.ceiling > 0 && occupancy >= rules.ceiling as usize && !scope.owner {
+        // particular. Nor is the hosted recorder, which is not a participant:
+        // a room someone asked to record is recorded however full it is, and
+        // `occupancy` does not count it, so it never takes a person's place.
+        if rules.ceiling > 0
+            && occupancy >= rules.ceiling as usize
+            && !scope.owner
+            && !scope.is_recorder()
+        {
             return Err(Refusal::Full);
         }
         Ok(())
@@ -737,6 +743,39 @@ mod tests {
         let mut host = scope("ada");
         host.owner = true;
         assert!(policy.admits(&host, address(4), 9).is_ok());
+    }
+
+    #[test]
+    fn a_full_room_still_admits_its_recorder_and_only_a_viewing_one() {
+        let policy = Policy::new();
+        policy.describe(
+            room(),
+            Rules {
+                ceiling: 2,
+                ..Rules::default()
+            },
+        );
+        let mut recorder = scope(crate::scope::RECORDER_SUBJECT);
+        recorder.publish = Publish::NONE;
+        assert!(recorder.is_recorder());
+        assert!(policy.admits(&recorder, address(4), 2).is_ok());
+        assert!(policy.admits(&recorder, address(4), 50).is_ok());
+
+        // The reserved name with anything beyond viewing is not the recorder
+        // the control plane mints, and gets no seat beyond the ceiling.
+        let publishing = scope(crate::scope::RECORDER_SUBJECT);
+        assert!(!publishing.is_recorder());
+        assert_eq!(
+            policy.admits(&publishing, address(4), 2),
+            Err(Refusal::Full)
+        );
+
+        // Nor does it get past anything else.
+        policy.close(room(), true);
+        assert_eq!(
+            policy.admits(&recorder, address(4), 0),
+            Err(Refusal::Closed)
+        );
     }
 
     #[test]
