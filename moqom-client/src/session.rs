@@ -25,6 +25,10 @@ use crate::device::{Credentials, certificate_identity};
 use crate::properties::ObjectProperties;
 use crate::tls::{apply_alpn, install_crypto_provider};
 
+mod fetch;
+
+pub use fetch::{FetchRange, Fetched};
+
 /// One object delivered on a subscription.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Object {
@@ -78,6 +82,9 @@ impl<'a> OutgoingObject<'a> {
 pub struct Subscription {
     /// The alias the peer assigned, which forwarded headers must carry.
     pub alias: TrackAlias,
+    /// The request, which a joining fetch names.
+    request: moqom_proto::control::RequestId,
+    track: FullTrackName,
     rx: mpsc::Receiver<Result<Object, Error>>,
     _send: SendStream,
     _recv: RecvStream,
@@ -108,6 +115,7 @@ pub struct Session {
     next_alias: AtomicU64,
     published: Arc<Mutex<HashMap<TrackNamespace, PublishSlot>>>,
     inbox: Arc<Mutex<Inbox>>,
+    fetches: Arc<Mutex<fetch::Fetches>>,
     /// Held open for the life of the session: closing the control stream ends it.
     _control: (SendStream, RecvStream),
     /// Owns the client socket. Dropping the endpoint closes every connection on
@@ -246,8 +254,14 @@ impl Session {
     ) -> Self {
         let published = Arc::new(Mutex::new(HashMap::new()));
         let inbox = Arc::new(Mutex::new(HashMap::new()));
+        let fetches = Arc::new(Mutex::new(HashMap::new()));
         spawn_publisher(draft, transport.clone(), Arc::clone(&published));
-        spawn_reader(draft, transport.clone(), Arc::clone(&inbox));
+        spawn_reader(
+            draft,
+            transport.clone(),
+            Arc::clone(&inbox),
+            Arc::clone(&fetches),
+        );
 
         Self {
             transport,
@@ -259,6 +273,7 @@ impl Session {
             next_alias: AtomicU64::new(7),
             published,
             inbox,
+            fetches,
             _control: control,
             _endpoint: endpoint,
         }
@@ -291,7 +306,7 @@ impl Session {
 
     async fn subscribe_in_draft(&mut self, track: FullTrackName) -> Result<Subscription, Error> {
         let (mut send, recv) = self.transport.open_bi().await?;
-        let request = Subscribe::new(self.next_request()?, track);
+        let request = Subscribe::new(self.next_request()?, track.clone());
         write(&mut send, &request).await?;
 
         let mut frames = Frames::new(recv);
@@ -306,6 +321,8 @@ impl Session {
                     .insert(ok.track_alias, tx);
                 Ok(Subscription {
                     alias: ok.track_alias,
+                    request: request.request_id,
+                    track,
                     rx,
                     _send: send,
                     _recv: frames.into_inner(),
@@ -759,7 +776,12 @@ async fn answer_subscribe(
     Ok(())
 }
 
-fn spawn_reader(draft: Draft, transport: moqom_transport::Session, inbox: Arc<Mutex<Inbox>>) {
+fn spawn_reader(
+    draft: Draft,
+    transport: moqom_transport::Session,
+    inbox: Arc<Mutex<Inbox>>,
+    fetches: Arc<Mutex<fetch::Fetches>>,
+) {
     tokio::spawn(draft.bind(async move {
         loop {
             let Ok(recv) = transport.accept_uni().await else {
@@ -770,18 +792,49 @@ fn spawn_reader(draft: Draft, transport: moqom_transport::Session, inbox: Arc<Mu
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .clear();
+                fetches
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clear();
                 return;
             };
             let inbox = Arc::clone(&inbox);
+            let fetches = Arc::clone(&fetches);
             tokio::spawn(draft.bind(async move {
-                let _ = read_subgroup(recv, &inbox).await;
+                let _ = read_stream(recv, &inbox, &fetches).await;
             }));
         }
     }));
 }
 
-async fn read_subgroup(mut recv: RecvStream, inbox: &Mutex<Inbox>) -> Result<(), Error> {
+/// A data stream is a subgroup or a fetch's answer, and its first varint says
+/// which.
+async fn read_stream(
+    mut recv: RecvStream,
+    inbox: &Mutex<Inbox>,
+    fetches: &Mutex<fetch::Fetches>,
+) -> Result<(), Error> {
     let mut buffer = BytesMut::new();
+    let is_fetch = loop {
+        if let Some(is_fetch) = fetch::is_fetch_stream(&buffer) {
+            break is_fetch;
+        }
+        if !fill(&mut recv, &mut buffer).await? {
+            return Ok(());
+        }
+    };
+    if is_fetch {
+        fetch::read_fetch(recv, buffer, fetches).await
+    } else {
+        read_subgroup(recv, buffer, inbox).await
+    }
+}
+
+async fn read_subgroup(
+    mut recv: RecvStream,
+    mut buffer: BytesMut,
+    inbox: &Mutex<Inbox>,
+) -> Result<(), Error> {
     let Some(header) = read_header(&mut recv, &mut buffer).await? else {
         return Ok(());
     };
