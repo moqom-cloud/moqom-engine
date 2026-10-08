@@ -4,7 +4,7 @@
 # crates in it -- moqom-proto, moqom-transport, moqom-rans -- and a context
 # scoped to moqom-relay/ cannot see them.
 #
-#   docker build -t moqom-relay .
+#   docker build --build-context security=../moqom-security -t moqom-relay .
 #
 # Prefer Cloud Build for anything that will actually be deployed. GKE and the
 # relay MIG are amd64, a Mac is not, and a Rust build under QEMU takes tens of
@@ -23,6 +23,9 @@ COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 # it changes about as often as the manifests do, and cargo cannot resolve the
 # workspace without it.
 COPY vendor vendor
+# The security libraries, which the workspace names by path (../moqom-security)
+# until they are published; a named context because they are outside this one.
+COPY --from=security rust /moqom-security/rust
 
 COPY moqom-proto/Cargo.toml moqom-proto/
 COPY moqom-rans/Cargo.toml moqom-rans/

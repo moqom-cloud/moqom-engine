@@ -3,7 +3,7 @@
 # Built from the workspace root, like the relay's, because the recorder is a
 # client of the relay built on moqom-client and the crates beneath it:
 #
-#   docker build -f Dockerfile.recorder -t moqom-recorder .
+#   docker build --build-context security=../moqom-security -f Dockerfile.recorder -t moqom-recorder .
 #
 # Every workspace member is copied, not only the ones the recorder links:
 # cargo will not resolve a workspace with a member missing, and the recorder's
@@ -17,6 +17,9 @@ WORKDIR /src
 
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY vendor vendor
+# The security libraries, which the workspace names by path (../moqom-security)
+# until they are published; a named context because they are outside this one.
+COPY --from=security rust /moqom-security/rust
 COPY moqom-proto moqom-proto
 COPY moqom-rans moqom-rans
 COPY moqom-rans-ffi moqom-rans-ffi
