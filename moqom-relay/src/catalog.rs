@@ -172,7 +172,7 @@ mod tests {
         assert_eq!(tracks_in(b"not json"), None);
     }
 
-    /// Byte for byte what `Catalog.disclosure()` writes in MoqomKit.
+    /// Byte for byte what `Catalog.disclosure()` writes in `MoqomKit`.
     #[test]
     fn a_disclosure_is_read_as_a_catalog() {
         let disclosure = br#"{"keyID":9,"locale":"fr-FR","tracks":[{"height":720,"kind":"video","name":"video\/720p","width":1280},{"kind":"audio","name":"audio"}],"version":1}"#;
