@@ -103,6 +103,57 @@ pub struct Announcement {
     _recv: RecvStream,
 }
 
+/// One track this session answers subscriptions to, from [`Session::publish`].
+/// Dropping it stops answering.
+pub struct Publication {
+    alias: TrackAlias,
+    track: FullTrackName,
+    subscribed: watch::Receiver<bool>,
+    tracks: Arc<Mutex<HashMap<FullTrackName, PublishSlot>>>,
+}
+
+impl Publication {
+    /// The alias to write into subgroup headers for this track.
+    #[must_use]
+    pub const fn alias(&self) -> TrackAlias {
+        self.alias
+    }
+
+    /// The track.
+    #[must_use]
+    pub const fn track(&self) -> &FullTrackName {
+        &self.track
+    }
+
+    /// Whether anybody has subscribed yet.
+    #[must_use]
+    pub fn has_subscribers(&self) -> bool {
+        *self.subscribed.borrow()
+    }
+
+    /// Wait until somebody subscribes.
+    pub async fn subscribed(&self) {
+        let mut watch = self.subscribed.clone();
+        let _ = watch.wait_for(|ready| *ready).await;
+    }
+}
+
+impl Drop for Publication {
+    fn drop(&mut self) {
+        let mut tracks = self
+            .tracks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A later publication of the same track replaced this one; leave it.
+        if tracks
+            .get(&self.track)
+            .is_some_and(|slot| slot.alias == self.alias)
+        {
+            tracks.remove(&self.track);
+        }
+    }
+}
+
 pub(crate) const IMPLEMENTATION: &[u8] = b"moqom-client";
 
 type Inbox = HashMap<TrackAlias, mpsc::Sender<Result<Object, Error>>>;
@@ -111,18 +162,26 @@ type Inbox = HashMap<TrackAlias, mpsc::Sender<Result<Object, Error>>>;
 const INBOX_DEPTH: usize = 64;
 
 /// A MOQT peer that has completed SETUP.
+///
+/// Cloning shares the session rather than opening another: every clone sends
+/// on the same connection and draws from the same request IDs and aliases. The
+/// session ends when the last clone is dropped, or at once on [`Self::close`].
+#[derive(Clone)]
 pub struct Session {
     transport: moqom_transport::Session,
     /// What the handshake negotiated. Every message this session writes or
     /// reads is in it, including those on the tasks it spawns.
     draft: Draft,
-    requests: RequestIdGenerator,
-    next_alias: AtomicU64,
+    requests: Arc<Mutex<RequestIdGenerator>>,
+    next_alias: Arc<AtomicU64>,
     published: Arc<Mutex<HashMap<TrackNamespace, PublishSlot>>>,
+    /// Tracks published one by one ([`Self::publish`]), answered before the
+    /// namespaces above.
+    tracks: Arc<Mutex<HashMap<FullTrackName, PublishSlot>>>,
     inbox: Arc<Mutex<Inbox>>,
     fetches: Arc<Mutex<fetch::Fetches>>,
     /// Held open for the life of the session: closing the control stream ends it.
-    _control: (SendStream, RecvStream),
+    _control: Arc<(SendStream, RecvStream)>,
     /// Owns the client socket. Dropping the endpoint closes every connection on
     /// it, so this has to outlive the session.
     _endpoint: quinn::Endpoint,
@@ -258,9 +317,15 @@ impl Session {
         role: Role,
     ) -> Self {
         let published = Arc::new(Mutex::new(HashMap::new()));
+        let tracks = Arc::new(Mutex::new(HashMap::new()));
         let inbox = Arc::new(Mutex::new(HashMap::new()));
         let fetches = Arc::new(Mutex::new(HashMap::new()));
-        spawn_publisher(draft, transport.clone(), Arc::clone(&published));
+        spawn_publisher(
+            draft,
+            transport.clone(),
+            Arc::clone(&published),
+            Arc::clone(&tracks),
+        );
         spawn_reader(
             draft,
             transport.clone(),
@@ -271,17 +336,58 @@ impl Session {
         Self {
             transport,
             draft,
-            requests: RequestIdGenerator::new(role),
+            requests: Arc::new(Mutex::new(RequestIdGenerator::new(role))),
             // Not zero: the relay hands out aliases from zero, so a publisher
             // that starts at 7 makes a forgotten rewrite observable — the
             // subscriber would see 7 in a header that should carry its own 0.
-            next_alias: AtomicU64::new(7),
+            next_alias: Arc::new(AtomicU64::new(7)),
             published,
+            tracks,
             inbox,
             fetches,
-            _control: control,
+            _control: Arc::new(control),
             _endpoint: endpoint,
         }
+    }
+
+    /// End the session now, for every clone, telling the peer `code` and
+    /// `reason`.
+    pub fn close(&self, code: u32, reason: &str) {
+        self.transport.close(code, reason.as_bytes());
+    }
+
+    /// Answer subscriptions to `track` with an alias of its own, so one
+    /// namespace can carry several tracks.
+    ///
+    /// On a relay the namespace still has to be announced, by this session or
+    /// through [`Self::announce`], for the relay to route subscriptions here;
+    /// on a direct session nothing else is needed. Subscriptions to `track` are
+    /// answered from here rather than by an announcement of its namespace.
+    /// Dropping the [`Publication`] stops answering.
+    ///
+    /// # Errors
+    /// Aliases exhausted.
+    pub fn publish(&self, track: FullTrackName) -> Result<Publication, Error> {
+        let raw = self.next_alias.fetch_add(1, Ordering::Relaxed);
+        let alias = TrackAlias::new(VarInt::new(raw)?);
+        let (subscribed, watch) = watch::channel(false);
+        self.tracks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                track.clone(),
+                PublishSlot {
+                    alias,
+                    subscribed,
+                    held: Arc::new(Mutex::new(Vec::new())),
+                },
+            );
+        Ok(Publication {
+            alias,
+            track,
+            subscribed: watch,
+            tracks: Arc::clone(&self.tracks),
+        })
     }
 
     /// Whether the underlying connection has closed.
@@ -293,7 +399,11 @@ impl Session {
     }
 
     fn next_request(&mut self) -> Result<moqom_proto::control::RequestId, Error> {
-        self.requests.allocate().ok_or(Error::RequestIdsExhausted)
+        self.requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .allocate()
+            .ok_or(Error::RequestIdsExhausted)
     }
 
     /// Subscribe to `track`.
@@ -759,12 +869,31 @@ impl Subscription {
         )
         .await
     }
+
+    /// Ask the publisher to stop sending this track (`false`) or to start
+    /// again (`true`), keeping the subscription: draft-19's `FORWARD` in a
+    /// `REQUEST_UPDATE`. A relay resumes at the next group.
+    ///
+    /// # Errors
+    /// Writing the update.
+    pub async fn set_forwarding(&mut self, forward: bool) -> Result<(), Error> {
+        let mut update = moqom_proto::control::RequestUpdate::new(self.request);
+        update.parameters.push(
+            moqom_proto::control::params::Parameter::varint(
+                moqom_proto::control::params::param_type::FORWARD,
+                VarInt::from(u32::from(forward)),
+            )
+            .map_err(Error::setup)?,
+        );
+        self.draft.bind(write(&mut self.send, &update)).await
+    }
 }
 
 fn spawn_publisher(
     draft: Draft,
     transport: moqom_transport::Session,
     published: Arc<Mutex<HashMap<TrackNamespace, PublishSlot>>>,
+    tracks: Arc<Mutex<HashMap<FullTrackName, PublishSlot>>>,
 ) {
     tokio::spawn(draft.bind(async move {
         loop {
@@ -772,8 +901,9 @@ fn spawn_publisher(
                 return;
             };
             let published = Arc::clone(&published);
+            let tracks = Arc::clone(&tracks);
             tokio::spawn(draft.bind(async move {
-                let _ = answer_subscribe(send, recv, &published).await;
+                let _ = answer_subscribe(send, recv, &published, &tracks).await;
             }));
         }
     }));
@@ -783,6 +913,7 @@ async fn answer_subscribe(
     mut send: SendStream,
     recv: RecvStream,
     published: &Mutex<HashMap<TrackNamespace, PublishSlot>>,
+    tracks: &Mutex<HashMap<FullTrackName, PublishSlot>>,
 ) -> Result<(), Error> {
     let mut frames = Frames::new(recv);
     let frame = frames.next().await?.ok_or(Error::Closed)?;
@@ -790,11 +921,18 @@ async fn answer_subscribe(
         return Ok(());
     }
     let request = Subscribe::decode(&mut frame.body.clone())?;
-    let slot = published
+    let track = tracks
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(request.track.namespace())
+        .get(&request.track)
         .cloned();
+    let slot = track.or_else(|| {
+        published
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(request.track.namespace())
+            .cloned()
+    });
     match slot {
         Some(slot) => {
             write(&mut send, &SubscribeOk::new(slot.alias)).await?;

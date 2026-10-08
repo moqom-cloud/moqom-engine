@@ -22,6 +22,19 @@
 //!
 //! Stalls are judged against the relay rather than against a clock, so a
 //! publisher that simply stops sending does not look like a broken path.
+//!
+//! # Pausing the relay copy
+//!
+//! Once on the direct path the relay is asked to stop forwarding the track
+//! (draft-19's `FORWARD=0` in a `REQUEST_UPDATE`), because a copy nobody plays
+//! is still relay egress somebody pays for. The subscription stays open, so
+//! the fallback is one message rather than a new subscription. Two things
+//! resume it: any fallback, and the direct path delivering nothing for
+//! [`PathSettings::quiet`] while the relay is paused, because with no relay
+//! copy a silent direct path cannot be judged against one. A relay resumes at
+//! the next group, so a fallback from a paused relay costs the rest of the
+//! group in flight; [`PathSettings::pauses_relay`] turns the pause off for a
+//! track where that matters more than the egress. The rules are `MoqomKit`'s.
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::time::Duration;
@@ -52,10 +65,17 @@ pub struct PathSettings {
     /// discarded, which bounds memory and also bounds how far back a fallback
     /// can recover.
     pub held: usize,
+    /// Whether to ask the relay to stop forwarding while the direct path is in
+    /// use.
+    pub pauses_relay: bool,
+    /// How long the direct path may deliver nothing, while the relay is
+    /// paused, before the relay is asked to resume.
+    pub quiet: Duration,
 }
 
 impl Default for PathSettings {
-    /// Three seconds to settle, a quarter of a second to give up.
+    /// Three seconds to settle, a quarter of a second to give up, the relay
+    /// paused while direct and resumed after half a second of silence.
     ///
     /// The stall bound is what a fallback costs in added delay on the objects
     /// caught in it, so it is short; the relay copy is already on hand.
@@ -64,6 +84,8 @@ impl Default for PathSettings {
             settle: Duration::from_secs(3),
             stall: Duration::from_millis(250),
             held: 1024,
+            pauses_relay: true,
+            quiet: Duration::from_millis(500),
         }
     }
 }
@@ -80,6 +102,7 @@ pub struct Delivery {
 type Key = (u64, u64);
 
 /// A track read over the relay, with a direct path when there is one.
+#[allow(clippy::struct_excessive_bools)]
 pub struct DualSubscription {
     relay: Subscription,
     direct: Option<Subscription>,
@@ -100,6 +123,18 @@ pub struct DualSubscription {
     ready: VecDeque<Delivery>,
     relay_ended: bool,
     switches: u32,
+    /// The relay has been asked to stop forwarding.
+    relay_paused: bool,
+    /// When the direct path last delivered anything.
+    last_direct: Option<Instant>,
+    /// The direct path went quiet while the relay was paused, so the relay
+    /// was resumed; the next direct object pauses it again.
+    quiet_tripped: bool,
+    /// Objects that arrived over the relay, duplicates included.
+    relay_objects: u64,
+    /// Direct subscriptions handed over while [`Self::next`] runs, by a room
+    /// that opens them as paths come and go.
+    attachments: Option<tokio::sync::mpsc::Receiver<Subscription>>,
 }
 
 /// How many delivered identities to remember for deduplication.
@@ -122,6 +157,41 @@ impl DualSubscription {
             ready: VecDeque::new(),
             relay_ended: false,
             switches: 0,
+            relay_paused: false,
+            last_direct: None,
+            quiet_tripped: false,
+            relay_objects: 0,
+            attachments: None,
+        }
+    }
+
+    /// Attach each direct subscription `attachments` yields as it arrives,
+    /// from inside [`Self::next`].
+    pub(crate) fn attach_from(&mut self, attachments: tokio::sync::mpsc::Receiver<Subscription>) {
+        self.attachments = Some(attachments);
+    }
+
+    /// Whether the relay has been asked to stop forwarding.
+    #[must_use]
+    pub const fn relay_paused(&self) -> bool {
+        self.relay_paused
+    }
+
+    /// How many objects the relay has sent for this track, duplicates of
+    /// direct ones included: what reading it here has cost in relay egress.
+    #[must_use]
+    pub const fn relay_objects(&self) -> u64 {
+        self.relay_objects
+    }
+
+    /// Pause or resume the relay copy to match the path in use. Best effort:
+    /// a relay that cannot be told is a relay subscription about to fail,
+    /// which [`Self::next`] reports.
+    async fn sync_forwarding(&mut self) {
+        let paused = self.on_direct && self.settings.pauses_relay && !self.quiet_tripped;
+        if paused != self.relay_paused {
+            self.relay_paused = paused;
+            let _ = self.relay.set_forwarding(!paused).await;
         }
     }
 
@@ -174,12 +244,18 @@ impl DualSubscription {
     /// not an error.
     pub async fn next(&mut self) -> Result<Option<Delivery>, Error> {
         loop {
+            self.sync_forwarding().await;
             if let Some(delivery) = self.ready.pop_front() {
                 return Ok(Some(delivery));
             }
             if self.relay_ended {
                 return Ok(None);
             }
+            let quiet_at = self
+                .relay_paused
+                .then_some(self.last_direct)
+                .flatten()
+                .map(|last| last + self.settings.quiet);
 
             let stall_at = self
                 .held
@@ -195,15 +271,23 @@ impl DualSubscription {
 
             tokio::select! {
                 biased;
+                attached = attachment(self.attachments.as_mut()) => match attached {
+                    Some(direct) => self.attach_direct(direct),
+                    None => self.attachments = None,
+                },
                 received = next_or_pending(self.direct.as_mut()) => match received {
                     Ok(Some(object)) => self.received_direct(object),
                     Ok(None) | Err(_) => self.fall_back(),
                 },
                 received = self.relay.next_object() => match received? {
-                    Some(object) => self.received_relay(object),
+                    Some(object) => {
+                        self.relay_objects += 1;
+                        self.received_relay(object);
+                    }
                     None => self.relay_ended = true,
                 },
                 () = sleep_until_or_pending(stall_at) => self.fall_back(),
+                () = sleep_until_or_pending(quiet_at) => self.quiet_tripped = true,
                 () = sleep_until_or_pending(lagging_at) => {
                     // Probation restarts rather than ending: a direct path
                     // that drops an object while settling may still be
@@ -241,6 +325,8 @@ impl DualSubscription {
         self.held.remove(&key);
         self.awaiting.remove(&key);
         let now = Instant::now();
+        self.last_direct = Some(now);
+        self.quiet_tripped = false;
         if !self.on_direct {
             let since = *self.keeping_up_since.get_or_insert(now);
             if now.duration_since(since) >= self.settings.settle {
@@ -300,6 +386,15 @@ fn key(object: &Object) -> Key {
 async fn next_or_pending(direct: Option<&mut Subscription>) -> Result<Option<Object>, Error> {
     match direct {
         Some(direct) => direct.next_object().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn attachment(
+    attachments: Option<&mut tokio::sync::mpsc::Receiver<Subscription>>,
+) -> Option<Subscription> {
+    match attachments {
+        Some(attachments) => attachments.recv().await,
         None => std::future::pending().await,
     }
 }

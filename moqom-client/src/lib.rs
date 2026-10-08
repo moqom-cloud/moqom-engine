@@ -27,8 +27,8 @@ pub use device::{Credentials, DeviceKey, DeviceKeyError};
 pub use error::Error;
 pub use properties::ObjectProperties;
 pub use session::{
-    Announcement, FetchRange, Fetched, GroupWriter, Metadata, Object, OutgoingObject, Session,
-    Subscription,
+    Announcement, FetchRange, Fetched, GroupWriter, Metadata, Object, OutgoingObject, Publication,
+    Session, Subscription,
 };
 pub use watch::{NamespaceEvent, NamespaceWatch};
 

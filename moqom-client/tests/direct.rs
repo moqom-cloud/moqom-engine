@@ -449,10 +449,13 @@ async fn a_dual_subscription_moves_to_the_direct_path_and_falls_back_to_the_rela
 
     let mut dual = DualSubscription::new(
         relay_subscription,
+        // The relay keeps forwarding, so the stall is judged against its copy.
         PathSettings {
             settle: Duration::ZERO,
             stall: Duration::from_millis(150),
             held: 64,
+            pauses_relay: false,
+            ..PathSettings::default()
         },
     );
     dual.attach_direct(direct_subscription);
