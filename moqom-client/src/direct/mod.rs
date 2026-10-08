@@ -49,6 +49,7 @@ mod verify;
 pub use link::{DirectConfig, DirectEndpoint};
 pub use offer::{CandidateOffer, RoomSecret};
 pub use path::{Delivery, DualSubscription, Path, PathSettings};
+pub use socket::StunServer;
 pub use verify::{PeerCredentials, PeerVerifier, VerifiedPeer};
 
 /// The most participants a room may have and still use direct paths.
@@ -148,46 +149,80 @@ impl Eligibility {
 /// One participant not opting in keeps the whole room on the relay, so a device
 /// on [`DirectPolicy::RelayOnly`] keeps everyone's addresses private from
 /// everyone else in its rooms.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DirectPolicy {
     /// Direct paths wherever the room qualifies, with the relay as the fallback.
     /// Choosing it accepts, on the user's behalf, that the other participants of
     /// a qualifying room learn this device's IP addresses.
-    #[default]
-    Automatic,
-    /// Every participant's media through the relay, and this device's addresses
-    /// never offered.
+    Automatic {
+        /// Where to learn this device's public address. `None`, the default,
+        /// asks the STUN server the token's room names
+        /// ([`RoomDirectPolicy::stun`]): a MOQOM relay's.
+        stun: Option<StunServer>,
+    },
+    /// Every participant's media through the relay, this device's addresses
+    /// never offered, and no STUN server asked.
     RelayOnly,
+}
+
+impl Default for DirectPolicy {
+    fn default() -> Self {
+        Self::AUTOMATIC
+    }
 }
 
 /// What the control plane allows of direct paths in a room, as stated with each
 /// token (`MintClientTokenResponse.direct`, or `direct` from the join endpoint).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoomDirectPolicy {
     /// The room may use direct paths at all.
     pub allowed: bool,
     /// The most participants the room may have and still use them.
     pub max_participants: usize,
+    /// The relays' STUN responder, as the grant names it (`direct.stun`).
+    pub stun: Option<StunServer>,
 }
 
 impl Default for RoomDirectPolicy {
     /// What a control plane that says nothing means: allowed, up to
-    /// [`MAX_PARTICIPANTS`].
+    /// [`MAX_PARTICIPANTS`], with no STUN server named.
     fn default() -> Self {
         Self {
             allowed: true,
             max_participants: MAX_PARTICIPANTS,
+            stun: None,
         }
     }
 }
 
+/// What [`DirectPolicy::opt_in`] decided for a room: the limit for
+/// [`Eligibility::limit`], and the STUN server for [`DirectConfig::stun`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OptIn {
+    /// The room's limit on participants, never above [`MAX_PARTICIPANTS`].
+    pub limit: usize,
+    /// Where to learn this device's public address, if anywhere. Without one
+    /// only interface addresses are offered, which cross no NAT.
+    pub stun: Option<StunServer>,
+}
+
 impl DirectPolicy {
+    /// [`Self::Automatic`], asking the STUN server the room names.
+    pub const AUTOMATIC: Self = Self::Automatic { stun: None };
+
     /// Whether this device opts in to direct paths in a room with `room`'s
-    /// policy, and if so the room's limit for [`Eligibility::limit`].
+    /// policy, and if so with what limit and which STUN server. A STUN server
+    /// given to [`Self::Automatic`] wins over the room's.
     #[must_use]
-    pub fn opt_in(self, room: RoomDirectPolicy) -> Option<usize> {
+    pub fn opt_in(&self, room: &RoomDirectPolicy) -> Option<OptIn> {
+        let Self::Automatic { stun } = self else {
+            return None;
+        };
         let limit = room.max_participants.min(MAX_PARTICIPANTS);
-        (self == Self::Automatic && room.allowed && limit >= 2).then_some(limit)
+        (room.allowed && limit >= 2).then(|| OptIn {
+            limit,
+            stun: stun.clone().or_else(|| room.stun.clone()),
+        })
     }
 }
 
@@ -224,24 +259,27 @@ mod tests {
 
     #[test]
     fn the_room_policy_decides_whether_and_how_many() {
+        let limit = |policy: &DirectPolicy, room: &RoomDirectPolicy| {
+            policy.opt_in(room).map(|opted| opted.limit)
+        };
         assert_eq!(
-            DirectPolicy::default().opt_in(RoomDirectPolicy::default()),
+            limit(&DirectPolicy::default(), &RoomDirectPolicy::default()),
             Some(4)
         );
         assert_eq!(
-            DirectPolicy::RelayOnly.opt_in(RoomDirectPolicy::default()),
+            limit(&DirectPolicy::RelayOnly, &RoomDirectPolicy::default()),
             None
         );
         let relay_only = RoomDirectPolicy {
             allowed: false,
             ..RoomDirectPolicy::default()
         };
-        assert_eq!(DirectPolicy::Automatic.opt_in(relay_only), None);
+        assert_eq!(limit(&DirectPolicy::AUTOMATIC, &relay_only), None);
         let pair = RoomDirectPolicy {
-            allowed: true,
             max_participants: 2,
+            ..RoomDirectPolicy::default()
         };
-        assert_eq!(DirectPolicy::Automatic.opt_in(pair), Some(2));
+        assert_eq!(limit(&DirectPolicy::AUTOMATIC, &pair), Some(2));
         let three = Eligibility {
             participants: 3,
             limit: 2,
@@ -254,6 +292,41 @@ mod tests {
             ..ALLOWED
         };
         assert_eq!(generous.check(), Err(Ineligible::TooManyParticipants(5)));
+    }
+
+    /// Automatic asks the relays' STUN server unless the application named its
+    /// own, and relay-only asks none.
+    #[test]
+    fn the_stun_server_is_the_rooms_unless_one_was_named() {
+        let relays = StunServer::Name {
+            host: "relay.moqom.cloud".to_owned(),
+            port: 3478,
+        };
+        let own = StunServer::Address("192.0.2.1:3478".parse().expect("address"));
+        let room = RoomDirectPolicy {
+            stun: Some(relays.clone()),
+            ..RoomDirectPolicy::default()
+        };
+        let stun = |policy: &DirectPolicy, room: &RoomDirectPolicy| {
+            policy.opt_in(room).and_then(|opted| opted.stun)
+        };
+
+        assert_eq!(stun(&DirectPolicy::AUTOMATIC, &room), Some(relays));
+        let named = DirectPolicy::Automatic {
+            stun: Some(own.clone()),
+        };
+        assert_eq!(stun(&named, &room), Some(own.clone()));
+        assert_eq!(stun(&named, &RoomDirectPolicy::default()), Some(own));
+        assert_eq!(
+            stun(&DirectPolicy::AUTOMATIC, &RoomDirectPolicy::default()),
+            None
+        );
+        assert_eq!(DirectPolicy::RelayOnly.opt_in(&room), None);
+        let closed = RoomDirectPolicy {
+            allowed: false,
+            ..room
+        };
+        assert_eq!(named.opt_in(&closed), None);
     }
 
     #[test]

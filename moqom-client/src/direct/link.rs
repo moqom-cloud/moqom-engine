@@ -59,12 +59,13 @@ pub struct DirectConfig {
     /// Where to bind. The default is every interface in both families on an
     /// ephemeral port; see [`SocketConfig::bind`].
     pub bind: SocketAddr,
-    /// A STUN server to learn the public address from, if any.
+    /// A STUN server to learn the public address from, if any: usually the
+    /// relays' own, from [`OptIn::stun`](super::OptIn::stun).
     ///
     /// Without one, only this device's own interface addresses are offered,
     /// which reach a peer on the same network or one with a public address and
     /// nothing behind a NAT.
-    pub stun: Option<SocketAddr>,
+    pub stun: Option<StunServer>,
     /// Whether to send probes to open this side's NAT.
     ///
     /// On by default and only worth turning off to measure what it buys: two
@@ -138,7 +139,7 @@ impl DirectEndpoint {
 
         let socket = DirectSocket::bind(SocketConfig {
             bind: config.bind,
-            stun: config.stun.map(StunServer::Address),
+            stun: config.stun.clone(),
             stun_timeout: STUN_PATIENCE,
             idle_timeout: config.idle_timeout,
             datagrams: true,

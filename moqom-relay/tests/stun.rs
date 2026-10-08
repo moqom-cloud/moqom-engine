@@ -6,7 +6,9 @@
 use std::net::{SocketAddr, UdpSocket};
 use std::time::Duration;
 
+use moqom_client::direct::socket::{DirectSocket, SocketConfig};
 use moqom_client::direct::stun::{binding_request, reflexive, reflexive_each};
+use moqom_client::direct::{DirectPolicy, RoomDirectPolicy, StunServer};
 use moqom_relay::Metrics;
 use moqom_relay::metrics::Gauges;
 use moqom_relay::stun::{Config, Limits, Responder};
@@ -102,6 +104,39 @@ async fn garbage_and_a_flooding_source_go_unanswered() {
     assert!(exposed.contains(r#"moqom_relay_stun_requests_total{outcome="answered"} 2"#));
     assert!(exposed.contains(r#"moqom_relay_stun_requests_total{outcome="limited"} 3"#));
     assert!(exposed.contains(r#"moqom_relay_stun_requests_total{outcome="ignored"} 2"#));
+}
+
+/// The default path end to end: a room whose grant names this relay's STUN
+/// server, a device on the automatic policy naming none of its own, and the
+/// direct socket it binds learning its address from the relay.
+#[tokio::test]
+async fn the_automatic_policy_asks_the_relay_the_grant_names() {
+    let (server, _) = responder("[::]:0", Limits::default());
+    let room = RoomDirectPolicy {
+        stun: Some(StunServer::Name {
+            host: "localhost".to_owned(),
+            port: server.port(),
+        }),
+        ..RoomDirectPolicy::default()
+    };
+    let opted = DirectPolicy::default().opt_in(&room).expect("opted in");
+
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let mut config = SocketConfig::new(b"moqt-19".to_vec());
+    config.stun = opted.stun;
+    config.stun_timeout = Duration::from_secs(3);
+    let socket = DirectSocket::bind(config).await.expect("binds");
+    let port = socket.local_addr().expect("local").port();
+    assert!(
+        socket
+            .reflexive_addresses()
+            .contains(&SocketAddr::from(([127, 0, 0, 1], port))),
+        "learned {:?}",
+        socket.reflexive_addresses()
+    );
+
+    // Relay only asks nobody.
+    assert_eq!(DirectPolicy::RelayOnly.opt_in(&room), None);
 }
 
 /// Asking for both families at once from one dual-stack socket, as the client
