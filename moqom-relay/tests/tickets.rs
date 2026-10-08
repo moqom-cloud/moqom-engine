@@ -7,10 +7,12 @@
 
 mod support;
 
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use moqom_proto::control::RequestErrorCode;
 use moqom_relay::Usage;
+use moqom_relay::policy::Rules;
 use moqom_relay::ticket::{Expected, TicketError, TicketKeys, verify};
 use support::tokens::{DEVICE, Grant, ticket_keys};
 use support::{Client, Relay, track};
@@ -121,6 +123,25 @@ async fn a_viewer_cannot_get_a_ticket() {
     let mut viewer = Client::connect_as(&relay, &Grant::viewer().token()).await;
     assert_eq!(
         viewer.subscribe(&own_ticket_track(PEER)).await.err(),
+        Some(RequestErrorCode::UNAUTHORIZED.get())
+    );
+}
+
+/// A room whose policy keeps media on the relay gets no tickets, so nobody in it
+/// keeps a direct path.
+#[tokio::test]
+async fn a_relay_only_room_gets_no_tickets() {
+    let relay = Relay::ticketing(Usage::disabled(), Duration::from_mins(1));
+    relay.fabric.policy().describe(
+        (Arc::from("acme"), Arc::from("room-42")),
+        Rules {
+            relay_only: true,
+            ..Rules::default()
+        },
+    );
+    let mut client = Client::connect_as(&relay, &Grant::default().token()).await;
+    assert_eq!(
+        client.subscribe(&own_ticket_track(PEER)).await.err(),
         Some(RequestErrorCode::UNAUTHORIZED.get())
     );
 }

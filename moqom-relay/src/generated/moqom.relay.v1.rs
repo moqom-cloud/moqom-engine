@@ -329,6 +329,10 @@ pub struct RoomSnapshot {
     pub grant_overrides: ::prost::alloc::vec::Vec<GrantOverride>,
     #[prost(uint32, tag = "7")]
     pub max_participants: u32,
+    /// What the room allows of direct paths, so a relay can refuse direct
+    /// tickets in a room that keeps media on the relay.
+    #[prost(message, optional, tag = "8")]
+    pub direct: ::core::option::Option<super::super::admin::v1::DirectGrant>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Ban {

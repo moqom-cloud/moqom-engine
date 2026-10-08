@@ -250,6 +250,9 @@ pub struct Rules {
     pub mutes: Vec<Mute>,
     /// Grant ceilings in force. See [`Override`].
     pub grants: Vec<Override>,
+    /// The room keeps every participant's media on the relay, so no direct
+    /// tickets are issued in it.
+    pub relay_only: bool,
 }
 
 /// Why a session was not let in.
@@ -463,6 +466,19 @@ impl Policy {
             }
         }
         silence
+    }
+
+    /// Whether the room's policy keeps media on the relay.
+    ///
+    /// `false` for a room this relay knows nothing about, which is the same
+    /// permissive answer [`Self::silenced`] gives: a peer still checks the
+    /// other's credentials, and `MoqomKit` opts out on its own policy too.
+    #[must_use]
+    pub fn relay_only(&self, room: &Where) -> bool {
+        self.lock()
+            .rooms
+            .get(room)
+            .is_some_and(|rules| rules.relay_only)
     }
 
     /// Set the most one participant may hold, replacing what was set before.

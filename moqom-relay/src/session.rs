@@ -2947,7 +2947,19 @@ impl Session {
                 Err("direct tickets need a verified participant")
             }
         };
-        if let Err(why) = eligible(&self.permission()) {
+        let scope = match eligible(&self.permission()) {
+            Ok(scope) => scope,
+            Err(why) => {
+                tracing::info!(session = %self.id, %track, reason = why, "direct ticket refused");
+                return send(send_stream, &refuse(RequestErrorCode::UNAUTHORIZED, why)).await;
+            }
+        };
+        let room = (
+            scope.tenant.clone(),
+            Arc::from(scope.room.as_deref().unwrap_or_default()),
+        );
+        if self.fabric.policy().relay_only(&room) {
+            let why = "this room keeps media on the relay";
             tracing::info!(session = %self.id, %track, reason = why, "direct ticket refused");
             return send(send_stream, &refuse(RequestErrorCode::UNAUTHORIZED, why)).await;
         }

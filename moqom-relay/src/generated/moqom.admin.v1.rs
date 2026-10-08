@@ -102,6 +102,16 @@ pub struct ActorContext {
     #[prost(string, tag = "3")]
     pub idempotency_key: ::prost::alloc::string::String,
 }
+/// What a room allows of direct (device-to-device) paths, as stated to a client
+/// with its token. See `RoomPolicy.direct_paths`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DirectGrant {
+    #[prost(bool, tag = "1")]
+    pub allowed: bool,
+    /// The most participants the room may have and still use direct paths.
+    #[prost(uint32, tag = "2")]
+    pub max_participants: u32,
+}
 /// How much a timecode should be believed.
 ///
 /// Mirrors `MoqomCore.TimeTrust` in the Swift SDK. The names are shared on
@@ -573,6 +583,10 @@ pub struct MintClientTokenResponse {
     /// Which key signed it, matching a `VerificationKey.key_id`.
     #[prost(string, tag = "4")]
     pub key_id: ::prost::alloc::string::String,
+    /// What the token's room allows of direct paths, for the backend to hand to
+    /// the client with the token. Unset for a token that names no room.
+    #[prost(message, optional, tag = "5")]
+    pub direct: ::core::option::Option<DirectGrant>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ListVerificationKeysRequest {

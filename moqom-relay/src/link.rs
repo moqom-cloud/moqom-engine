@@ -686,6 +686,7 @@ fn apply(fabric: &Fabric, snapshot: &pb::RoomSnapshot) {
             ceiling: snapshot.max_participants,
             mutes,
             grants,
+            relay_only: snapshot.direct.is_some_and(|direct| !direct.allowed),
         },
     );
 
@@ -1734,6 +1735,7 @@ mod tests {
                 mutes: Vec::new(),
                 grant_overrides: Vec::new(),
                 max_participants: 0,
+                direct: None,
             })),
         });
         let serving = control.start().await;
