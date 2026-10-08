@@ -115,7 +115,8 @@ impl Drop for Renewing {
 /// Keep the publisher's session alive past its first token.
 fn keep_renewed(mut announcement: Announcement, mint: Arc<Mint>, who: Identity) -> Renewing {
     Renewing(tokio::spawn(async move {
-        let mut renew = tokio::time::interval_at(tokio::time::Instant::now() + RENEW_EVERY, RENEW_EVERY);
+        let mut renew =
+            tokio::time::interval_at(tokio::time::Instant::now() + RENEW_EVERY, RENEW_EVERY);
         loop {
             renew.tick().await;
             let renewed = match mint.token(&who, 0b11, TOKEN_SECONDS) {
@@ -915,7 +916,8 @@ async fn watch_track(
         return tally;
     }
 
-    let mut renew = tokio::time::interval_at(tokio::time::Instant::now() + RENEW_EVERY, RENEW_EVERY);
+    let mut renew =
+        tokio::time::interval_at(tokio::time::Instant::now() + RENEW_EVERY, RENEW_EVERY);
     while !*listening.borrow() {
         tokio::select! {
             _ = listening.changed() => break,
