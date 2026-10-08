@@ -774,7 +774,7 @@ mod tests {
             "jti": "abc",
             "iat": issued,
             "exp": issued + 600,
-            "cnf": { "jkt": "OuXpLpEHW7dCPqjKWm8Zq1TfBb2nQ4Zt" },
+            "cnf": { "jkt": "OuXpLpEHW7dCPqjKWm8Zq1TfBb2nQ4ZtAAAAAAAAAAA" },
             "moqt": { "room": "r1", "pub": 3, "cap": 0 },
         })
     }
