@@ -69,7 +69,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
 use moqom_client::{
-    Bytes, Credentials, DeviceKey, FullTrackName, Metadata, Object, ObjectProperties,
+    Announcement, Bytes, Credentials, DeviceKey, FullTrackName, Metadata, Object, ObjectProperties,
     OutgoingObject, Session, TrackNamespace,
 };
 use moqom_media::annexb::{AccessUnit, Codec};
@@ -91,25 +91,45 @@ const SEED: [u8; 32] = [0x6d; 32];
 /// As long as allowed, because a session whose credential lapses is closed by
 /// the relay and would appear in the results as a subscriber that stopped
 /// receiving — which is a real behaviour, correctly implemented, and nothing to
-/// do with fan-out. [`within_token`] refuses a run longer than this.
+/// do with fan-out. Runs longer than this renew every [`RENEW_EVERY`].
 const TOKEN_SECONDS: u64 = moqom_token::MAX_LIFETIME.as_secs();
 
-/// Refuse a run its tokens can't outlast, before anything connects.
+/// How often every session presents a fresh token.
 ///
-/// Sessions here don't renew their credentials, so a run past the token's
-/// lifetime would end with the relay closing every session, reported as loss.
-/// `held` is how long sessions stay open once everyone is watching; standing
-/// them up gets up to [`READY_PATIENCE`] on top.
-fn within_token(held: u64) -> Fallible<()> {
-    let needed = held.saturating_add(READY_PATIENCE.as_secs());
-    if needed > TOKEN_SECONDS {
-        return Err(format!(
-            "a run holding sessions for {held}s needs tokens for {needed}s, beyond the \
-             {TOKEN_SECONDS}s a relay accepts; split it into shorter runs"
-        )
-        .into());
+/// Two thirds of the way through a token's life, so a renewal the relay is slow
+/// to apply still lands before the old deadline.
+const RENEW_EVERY: Duration = Duration::from_secs(TOKEN_SECONDS * 2 / 3);
+
+/// Holds an announcement and renews its session's token until dropped.
+///
+/// Dropping withdraws the announcement, exactly as dropping the announcement
+/// itself would.
+struct Renewing(tokio::task::JoinHandle<()>);
+
+impl Drop for Renewing {
+    fn drop(&mut self) {
+        self.0.abort();
     }
-    Ok(())
+}
+
+/// Keep the publisher's session alive past its first token.
+fn keep_renewed(mut announcement: Announcement, mint: Arc<Mint>, who: Identity) -> Renewing {
+    Renewing(tokio::spawn(async move {
+        let mut renew = tokio::time::interval_at(tokio::time::Instant::now() + RENEW_EVERY, RENEW_EVERY);
+        loop {
+            renew.tick().await;
+            let renewed = match mint.token(&who, 0b11, TOKEN_SECONDS) {
+                Ok(token) => announcement
+                    .renew(&Credentials::proven(token.as_bytes(), &who.key))
+                    .await
+                    .map_err(|e| e.to_string()),
+                Err(e) => Err(e.to_string()),
+            };
+            if let Err(e) = renewed {
+                eprintln!("renewing the publisher's token: {e}");
+            }
+        }
+    }))
 }
 
 /// How long to wait for every subscriber to be watching before publishing.
@@ -482,9 +502,8 @@ fn track_of(common: &Common) -> Fallible<(Identity, FullTrackName)> {
 
 /// One publisher, many subscribers, and a report.
 async fn fanout(args: &FanoutArgs) -> Fallible<bool> {
-    within_token(args.shape.seconds)?;
     let (server_name, addr) = resolve(&args.common.relay)?;
-    let mint = Mint::from_seed(&SEED)?;
+    let mint = Arc::new(Mint::from_seed(&SEED)?);
     let (publisher, track) = track_of(&args.common)?;
     // Before connecting, so that an unreadable file fails the run immediately
     // rather than after a few hundred subscribers have been stood up.
@@ -532,6 +551,8 @@ async fn fanout(args: &FanoutArgs) -> Fallible<bool> {
     tokio::time::timeout(READY_PATIENCE, announcement.subscribed())
         .await
         .map_err(|_| "the relay never asked for the track")?;
+    let alias = announcement.alias();
+    let _renewing = keep_renewed(announcement, Arc::clone(&mint), publisher.clone());
 
     let live = spawn_live(
         args.common.live,
@@ -539,7 +560,7 @@ async fn fanout(args: &FanoutArgs) -> Fallible<bool> {
         args.common.metrics.clone(),
         Some(Arc::clone(&crowd.progress)),
     );
-    let sent = publish(&session, announcement.alias(), &args.shape, film.as_ref()).await?;
+    let sent = publish(&session, alias, &args.shape, film.as_ref()).await?;
     live.abort();
     // Drop nothing yet: the publisher's session has to outlive the drain below,
     // or the relay withdraws the track and the tail of the last group is lost for
@@ -563,9 +584,8 @@ async fn fanout(args: &FanoutArgs) -> Fallible<bool> {
 
 /// Publish the track and hold it, for the one host that feeds a fleet.
 async fn publish_only(args: &PublishArgs) -> Fallible<bool> {
-    within_token(args.shape.seconds.saturating_add(args.linger))?;
     let (server_name, addr) = resolve(&args.common.relay)?;
-    let mint = Mint::from_seed(&SEED)?;
+    let mint = Arc::new(Mint::from_seed(&SEED)?);
     let (publisher, track) = track_of(&args.common)?;
     let film = args.shape.film()?;
 
@@ -594,6 +614,8 @@ async fn publish_only(args: &PublishArgs) -> Fallible<bool> {
     tokio::time::timeout(READY_PATIENCE, announcement.subscribed())
         .await
         .map_err(|_| "nobody subscribed, so there was nothing to publish to")?;
+    let alias = announcement.alias();
+    let _renewing = keep_renewed(announcement, Arc::clone(&mint), publisher.clone());
 
     let live = spawn_live(
         args.common.live,
@@ -601,7 +623,7 @@ async fn publish_only(args: &PublishArgs) -> Fallible<bool> {
         args.common.metrics.clone(),
         None,
     );
-    let sent = publish(&session, announcement.alias(), &args.shape, film.as_ref()).await?;
+    let sent = publish(&session, alias, &args.shape, film.as_ref()).await?;
     println!(
         "published     {} frames in {} group(s), {:.1} MiB at {:.1}/s",
         sent.frames,
@@ -641,9 +663,8 @@ async fn publish_only(args: &PublishArgs) -> Fallible<bool> {
 
 /// Watch a track somebody else is publishing, for the hosts that are the load.
 async fn watch_only(args: &WatchArgs) -> Fallible<bool> {
-    within_token(args.shape.seconds)?;
     let (server_name, addr) = resolve(&args.common.relay)?;
-    let mint = Mint::from_seed(&SEED)?;
+    let mint = Arc::new(Mint::from_seed(&SEED)?);
     let (_, track) = track_of(&args.common)?;
     // Read for its group lengths, not to publish it: this host has to know how
     // long a complete group is to say whether one arrived whole, and a clip is
@@ -705,7 +726,7 @@ struct Crowded {
 fn gather(
     common: &Common,
     crowd: &Crowd,
-    mint: &Mint,
+    mint: &Arc<Mint>,
     addr: SocketAddr,
     server_name: &str,
     track: &FullTrackName,
@@ -731,7 +752,8 @@ fn gather(
                 server_name: server_name.to_owned(),
                 insecure: common.insecure,
                 token,
-                key: Arc::clone(&who.key),
+                mint: Arc::clone(mint),
+                who,
                 track: track.clone(),
                 progress: Arc::clone(&progress),
                 wait: Duration::from_secs(wait),
@@ -755,7 +777,9 @@ struct Watching {
     server_name: String,
     insecure: bool,
     token: String,
-    key: Arc<DeviceKey>,
+    /// What renews `token`, for the identity it was minted for.
+    mint: Arc<Mint>,
+    who: Identity,
     track: FullTrackName,
     /// Objects received across every subscriber, so the drain can tell delivery
     /// still in flight from delivery that has stopped.
@@ -866,7 +890,7 @@ async fn watch_track(
         &watching.server_name,
         watching.insecure,
         &watching.token,
-        &watching.key,
+        &watching.who.key,
     )
     .await;
     let mut session = match session {
@@ -891,9 +915,23 @@ async fn watch_track(
         return tally;
     }
 
+    let mut renew = tokio::time::interval_at(tokio::time::Instant::now() + RENEW_EVERY, RENEW_EVERY);
     while !*listening.borrow() {
         tokio::select! {
             _ = listening.changed() => break,
+            _ = renew.tick() => {
+                let renewed = match watching.mint.token(&watching.who, 0, TOKEN_SECONDS) {
+                    Ok(token) => subscription
+                        .renew(&Credentials::proven(token.as_bytes(), &watching.who.key))
+                        .await
+                        .map_err(|e| e.to_string()),
+                    Err(e) => Err(e.to_string()),
+                };
+                if let Err(e) = renewed {
+                    tally.fault = Some(format!("renewing the token: {e}"));
+                    break;
+                }
+            }
                 next = subscription.next_object() => match next {
                 Ok(Some(object)) => {
                     tally.record(&object);
@@ -1483,10 +1521,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_run_its_tokens_cannot_outlast_is_refused() {
-        assert!(within_token(60).is_ok());
-        assert!(within_token(TOKEN_SECONDS - READY_PATIENCE.as_secs()).is_ok());
-        assert!(within_token(TOKEN_SECONDS - READY_PATIENCE.as_secs() + 1).is_err());
+    fn sessions_renew_well_before_their_token_lapses() {
+        let margin = Duration::from_secs(TOKEN_SECONDS)
+            .checked_sub(RENEW_EVERY)
+            .expect("renewal comes before the token lapses");
+        assert!(margin >= READY_PATIENCE);
     }
 
     const PER_GROUP: u64 = 30;

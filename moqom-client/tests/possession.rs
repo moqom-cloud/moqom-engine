@@ -107,6 +107,14 @@ fn signer() -> Signer {
 
 /// A token committed to `thumbprint`, shaped the way the control plane mints one.
 fn token_bound_to(thumbprint: &str) -> Vec<u8> {
+    token_bound_to_lasting(thumbprint, 600)
+}
+
+/// A token for `thumbprint` that expires `seconds` from now. A negative value
+/// mints one, issued two seconds before that, that is already inside the clock
+/// skew a relay forgives, which is how a test gets one that lapses within
+/// seconds.
+fn token_bound_to_lasting(thumbprint: &str, seconds: i64) -> Vec<u8> {
     let issued = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("after the epoch")
@@ -117,8 +125,8 @@ fn token_bound_to(thumbprint: &str) -> Vec<u8> {
             iss: "https://api.moqom.cloud".to_owned(),
             sub: "ada".to_owned(),
             tenant: "acme".to_owned(),
-            iat: issued,
-            exp: issued + 600,
+            iat: if seconds > 0 { issued } else { issued + seconds - 2 },
+            exp: issued + seconds,
             cnf: Confirmation {
                 jkt: thumbprint.to_owned(),
             },
@@ -129,7 +137,7 @@ fn token_bound_to(thumbprint: &str) -> Vec<u8> {
             },
             ..Claims::default()
         })
-        .expect("a complete ten-minute token")
+        .expect("a complete token")
         .into_bytes()
 }
 
@@ -266,4 +274,57 @@ async fn one_token_admits_two_sessions() {
     .expect("the second session is admitted with a fresh proof");
 
     drop((first, second));
+}
+
+/// A publisher renews on its announcement and its session outlives the token it
+/// opened with. A subscription renews the same way, through the same code.
+#[tokio::test]
+async fn a_renewal_on_an_announcement_outlives_the_first_token() {
+    let relay = Relay::requiring_proofs();
+    let tls = moqom_client::tls::pinned(relay.certificate.clone());
+    let (key, _) = DeviceKey::generate().expect("a device key");
+    let thumbprint = key.thumbprint();
+
+    let lapsing = token_bound_to_lasting(&thumbprint, -28);
+    let mut session = within(
+        "connect with a token about to lapse",
+        Session::connect(
+            relay.addr,
+            "localhost",
+            tls,
+            Some(&Credentials::proven(&lapsing, &key)),
+        ),
+    )
+    .await
+    .expect("admitted inside the clock skew");
+
+    let device = &thumbprint[..16];
+    let mut announcement = within(
+        "announce",
+        session.announce(
+            moqom_client::TrackNamespace::from_parts(["acme", "r", "room-42", "ada", device])
+                .expect("a valid namespace"),
+        ),
+    )
+    .await
+    .expect("the relay accepts the announcement");
+
+    let fresh = token_bound_to(&thumbprint);
+    within(
+        "renew",
+        announcement.renew(&Credentials::proven(&fresh, &key)),
+    )
+    .await
+    .expect("the renewal is written");
+
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    within(
+        "watch the room after the first token lapsed",
+        session.watch(
+            moqom_client::TrackNamespace::from_parts(["acme", "r", "room-42"])
+                .expect("a valid namespace"),
+        ),
+    )
+    .await
+    .expect("the session outlived the token it opened with");
 }

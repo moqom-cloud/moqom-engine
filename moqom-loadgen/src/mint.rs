@@ -122,6 +122,7 @@ impl Mint {
 /// unauthenticated peer is charged by address instead, where the ceiling is four
 /// for the whole machine — which is why this harness presents tokens even to a
 /// relay that would admit it without one.
+#[derive(Clone)]
 pub struct Identity {
     /// The customer, which a token carries as `aud`.
     pub tenant: String,

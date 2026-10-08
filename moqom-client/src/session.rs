@@ -86,7 +86,9 @@ pub struct Subscription {
     request: moqom_proto::control::RequestId,
     track: FullTrackName,
     rx: mpsc::Receiver<Result<Object, Error>>,
-    _send: SendStream,
+    draft: Draft,
+    transport: moqom_transport::Session,
+    send: SendStream,
     _recv: RecvStream,
 }
 
@@ -94,7 +96,10 @@ pub struct Subscription {
 pub struct Announcement {
     alias: TrackAlias,
     subscribed: watch::Receiver<bool>,
-    _send: SendStream,
+    request: moqom_proto::control::RequestId,
+    draft: Draft,
+    transport: moqom_transport::Session,
+    send: SendStream,
     _recv: RecvStream,
 }
 
@@ -324,7 +329,9 @@ impl Session {
                     request: request.request_id,
                     track,
                     rx,
-                    _send: send,
+                    draft: self.draft,
+                    transport: self.transport.clone(),
+                    send,
                     _recv: frames.into_inner(),
                 })
             }
@@ -397,7 +404,10 @@ impl Session {
         Ok(Announcement {
             alias,
             subscribed: watch,
-            _send: send,
+            request: request.request_id,
+            draft: self.draft,
+            transport: self.transport.clone(),
+            send,
             _recv: recv,
         })
     }
@@ -701,6 +711,22 @@ impl Announcement {
         let mut watch = self.subscribed.clone();
         let _ = watch.wait_for(|ready| *ready).await;
     }
+
+    /// Hand the relay a fresh credential on this announcement, so the session
+    /// outlives the token it opened with. See [`NamespaceWatch::renew`](crate::NamespaceWatch::renew).
+    ///
+    /// # Errors
+    /// Signing the proof, or writing the update.
+    pub async fn renew(&mut self, credentials: &Credentials<'_>) -> Result<(), Error> {
+        crate::watch::renew_on(
+            self.draft,
+            &self.transport,
+            &mut self.send,
+            self.request,
+            credentials,
+        )
+        .await
+    }
 }
 
 impl Subscription {
@@ -716,6 +742,22 @@ impl Subscription {
             Some(result) => result.map(Some),
             None => Ok(None),
         }
+    }
+
+    /// Hand the relay a fresh credential on this subscription, so the session
+    /// outlives the token it opened with. See [`NamespaceWatch::renew`](crate::NamespaceWatch::renew).
+    ///
+    /// # Errors
+    /// Signing the proof, or writing the update.
+    pub async fn renew(&mut self, credentials: &Credentials<'_>) -> Result<(), Error> {
+        crate::watch::renew_on(
+            self.draft,
+            &self.transport,
+            &mut self.send,
+            self.request,
+            credentials,
+        )
+        .await
     }
 }
 

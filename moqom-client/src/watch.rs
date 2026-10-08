@@ -136,22 +136,44 @@ impl NamespaceWatch {
     /// # Errors
     /// Signing the proof, or writing the update.
     pub async fn renew(&mut self, credentials: &Credentials<'_>) -> Result<(), Error> {
-        let mut update = RequestUpdate::new(self.request);
-        update.parameters.push(
-            Parameter::bytes(
-                param_type::AUTHORIZATION_TOKEN,
-                Bytes::copy_from_slice(credentials.token),
-            )
-            .map_err(Error::setup)?,
-        );
-        if let Some(key) = credentials.key {
-            let relay = relay_identity(&self.transport).ok_or(Error::NoRelayIdentity)?;
-            let proof = key.prove(credentials.token, &relay)?;
-            update.parameters.push(
-                Parameter::bytes(param_type::AUTHORIZATION_PROOF, Bytes::from(proof))
-                    .map_err(Error::setup)?,
-            );
-        }
-        self.draft.bind(write(&mut self.send, &update)).await
+        renew_on(
+            self.draft,
+            &self.transport,
+            &mut self.send,
+            self.request,
+            credentials,
+        )
+        .await
     }
+}
+
+/// Present `credentials` in a `REQUEST_UPDATE` on `request`'s stream.
+///
+/// The relay accepts a renewal on any established request, and moves the whole
+/// session's deadline, so every handle that owns a request stream renews the
+/// same way.
+pub(crate) async fn renew_on(
+    draft: moqom_proto::Draft,
+    transport: &moqom_transport::Session,
+    send: &mut SendStream,
+    request: RequestId,
+    credentials: &Credentials<'_>,
+) -> Result<(), Error> {
+    let mut update = RequestUpdate::new(request);
+    update.parameters.push(
+        Parameter::bytes(
+            param_type::AUTHORIZATION_TOKEN,
+            Bytes::copy_from_slice(credentials.token),
+        )
+        .map_err(Error::setup)?,
+    );
+    if let Some(key) = credentials.key {
+        let relay = relay_identity(transport).ok_or(Error::NoRelayIdentity)?;
+        let proof = key.prove(credentials.token, &relay)?;
+        update.parameters.push(
+            Parameter::bytes(param_type::AUTHORIZATION_PROOF, Bytes::from(proof))
+                .map_err(Error::setup)?,
+        );
+    }
+    draft.bind(write(send, &update)).await
 }
