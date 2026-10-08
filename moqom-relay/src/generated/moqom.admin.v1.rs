@@ -104,13 +104,29 @@ pub struct ActorContext {
 }
 /// What a room allows of direct (device-to-device) paths, as stated to a client
 /// with its token. See `RoomPolicy.direct_paths`.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DirectGrant {
     #[prost(bool, tag = "1")]
     pub allowed: bool,
     /// The most participants the room may have and still use direct paths.
     #[prost(uint32, tag = "2")]
     pub max_participants: u32,
+    /// Where a device asks for its public address (a STUN Binding request, RFC
+    /// 8489) before offering a direct path: a MOQOM relay's STUN responder. Unset
+    /// when direct paths are not allowed or the deployment names none, in which
+    /// case a device offers only its own interface addresses unless it was given a
+    /// STUN server of its own.
+    #[prost(message, optional, tag = "3")]
+    pub stun: ::core::option::Option<StunEndpoint>,
+}
+/// A STUN server, as a host name or address literal and a UDP port.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct StunEndpoint {
+    #[prost(string, tag = "1")]
+    pub host: ::prost::alloc::string::String,
+    /// Usually 3478.
+    #[prost(uint32, tag = "2")]
+    pub port: u32,
 }
 /// How much a timecode should be believed.
 ///

@@ -686,7 +686,7 @@ fn apply(fabric: &Fabric, snapshot: &pb::RoomSnapshot) {
             ceiling: snapshot.max_participants,
             mutes,
             grants,
-            relay_only: snapshot.direct.is_some_and(|direct| !direct.allowed),
+            relay_only: snapshot.direct.as_ref().is_some_and(|direct| !direct.allowed),
         },
     );
 
