@@ -10,9 +10,10 @@
 //! handed to QUIC: afterwards QUIC owns every datagram that arrives on it, and
 //! would discard the answer as a packet it could not parse.
 //!
-//! Only the Binding exchange, without authentication or `FINGERPRINT`. The
-//! server is chosen by the caller; any public STUN server works, and a relay
-//! could answer the same request later.
+//! Only the Binding exchange, without authentication or `FINGERPRINT`. Every
+//! MOQOM relay answers it (`moqom_relay::stun`, UDP 3478 by default), and a
+//! room's direct grant names one, which [`super::DirectPolicy::AUTOMATIC`]
+//! asks. Any public STUN server works as well.
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};

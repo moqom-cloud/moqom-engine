@@ -164,6 +164,17 @@ or IPv4 alone where the host has no IPv6. It gathers a host candidate and a
 STUN reflexive address for each family it can reach, and probes and dials
 either. `moqom-client/tests/ipv6.rs` runs on `::1`.
 
+The relay answers STUN Binding requests on its own UDP socket, 3478 by default
+(`MOQOM_RELAY_STUN_ADDR`, or `off`), so a device behind NAT can learn its
+public address without a third-party server. Only well-formed Binding requests
+get an answer: XOR-MAPPED-ADDRESS and FINGERPRINT, smaller than the request.
+Anything else is dropped. Each source address, or IPv6 /64, has a token bucket
+(`MOQOM_RELAY_STUN_RATE`, `MOQOM_RELAY_STUN_BURST`). The reply leaves from the
+address the request was sent to, so it works behind a passthrough load
+balancer. The control plane names this server in a room's direct grant, and
+`DirectPolicy::AUTOMATIC` asks it unless the application named its own.
+`moqom-relay/tests/stun.rs` runs the client against the relay.
+
 Draft-22 authorization tokens parse in all four Alias Types (§8.9), and
 `moqom_proto::control::tokens::TokenCache` keeps the alias state with the
 accounting of §9.1.3. The relay advertises no token cache, so a registration or
