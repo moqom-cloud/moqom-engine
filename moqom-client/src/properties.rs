@@ -59,6 +59,14 @@ pub const SILENCE: u64 = 0x7C;
 /// it with the ciphertext, so it can be read on the way through and not changed.
 pub const CATALOG_DISCLOSURE: u64 = 0x7D;
 
+/// The room authority's ML-DSA-65 signature over a `.control` entry.
+///
+/// One byte of key ID length, the key ID, then the signature over
+/// `"moqom room log v1" ‖ 0 ‖ tenant ‖ 0 ‖ room ‖ 0 ‖ entry`. Clients apply
+/// only entries that verify against the control plane's keys; it is carried
+/// here so that an archived control track still verifies on playback.
+pub const AUTHORITY_SIGNATURE: u64 = 0x7F;
+
 /// What a publisher said about one object.
 ///
 /// Every field is optional and absent means "not stated" rather than a default,
@@ -78,6 +86,8 @@ pub struct ObjectProperties {
     pub is_silence: Option<bool>,
     /// On a sealed catalog, the part of it that is not secret from the relay.
     pub disclosure: Option<Bytes>,
+    /// On a control-log entry, the room authority's signature over it.
+    pub authority_signature: Option<Bytes>,
 }
 
 impl ObjectProperties {
@@ -132,6 +142,12 @@ impl ObjectProperties {
         {
             properties.push(parameter);
         }
+        if let Some(signature) = &self.authority_signature
+            && !signature.is_empty()
+            && let Ok(parameter) = Parameter::bytes(AUTHORITY_SIGNATURE, signature.clone())
+        {
+            properties.push(parameter);
+        }
         properties
     }
 
@@ -161,6 +177,10 @@ impl ObjectProperties {
                 .get(CATALOG_DISCLOSURE)
                 .and_then(Parameter::as_bytes)
                 .cloned(),
+            authority_signature: properties
+                .get(AUTHORITY_SIGNATURE)
+                .and_then(Parameter::as_bytes)
+                .cloned(),
         }
     }
 }
@@ -185,6 +205,7 @@ mod tests {
             temporal_layer: Some(2),
             is_silence: Some(true),
             disclosure: Some(Bytes::from_static(br#"{"tracks":[],"version":1}"#)),
+            authority_signature: Some(Bytes::from(vec![0xAB; 3321])),
         };
         assert_eq!(
             ObjectProperties::from_wire(&properties.to_wire()),
