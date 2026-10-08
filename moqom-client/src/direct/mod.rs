@@ -74,6 +74,10 @@ pub struct Eligibility {
     pub watchdog_required: bool,
     /// This session is a viewer in an audience rather than a participant.
     pub audience: bool,
+    /// The room's own limit on participants, from its policy
+    /// ([`RoomDirectPolicy::max_participants`]). Never above
+    /// [`MAX_PARTICIPANTS`].
+    pub limit: usize,
 }
 
 /// Why a room or session may not use a direct path.
@@ -86,8 +90,8 @@ pub enum Ineligible {
     /// room those are already off, so nothing is lost that was not already gone.
     #[error("the room is not end-to-end encrypted")]
     NotEncrypted,
-    /// More participants than [`MAX_PARTICIPANTS`].
-    #[error("{0} participants is more than the {MAX_PARTICIPANTS} direct mode allows")]
+    /// More participants than the room's limit, or [`MAX_PARTICIPANTS`].
+    #[error("{0} participants is more than direct mode allows in this room")]
     TooManyParticipants(usize),
     /// Fewer than two, so there is nobody to connect to.
     #[error("there is no other participant")]
@@ -123,13 +127,67 @@ impl Eligibility {
         if self.participants < 2 {
             return Err(Ineligible::Alone);
         }
-        if self.participants > MAX_PARTICIPANTS {
+        let limit = if self.limit < MAX_PARTICIPANTS {
+            self.limit
+        } else {
+            MAX_PARTICIPANTS
+        };
+        if self.participants > limit {
             return Err(Ineligible::TooManyParticipants(self.participants));
         }
         if !self.everyone_opted_in {
             return Err(Ineligible::NotEveryoneOptedIn);
         }
         Ok(())
+    }
+}
+
+/// Whether this device's rooms use direct paths, as `DirectPolicy` is in
+/// `MoqomKit`.
+///
+/// One participant not opting in keeps the whole room on the relay, so a device
+/// on [`DirectPolicy::RelayOnly`] keeps everyone's addresses private from
+/// everyone else in its rooms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DirectPolicy {
+    /// Direct paths wherever the room qualifies, with the relay as the fallback.
+    /// Choosing it accepts, on the user's behalf, that the other participants of
+    /// a qualifying room learn this device's IP addresses.
+    #[default]
+    Automatic,
+    /// Every participant's media through the relay, and this device's addresses
+    /// never offered.
+    RelayOnly,
+}
+
+/// What the control plane allows of direct paths in a room, as stated with each
+/// token (`MintClientTokenResponse.direct`, or `direct` from the join endpoint).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoomDirectPolicy {
+    /// The room may use direct paths at all.
+    pub allowed: bool,
+    /// The most participants the room may have and still use them.
+    pub max_participants: usize,
+}
+
+impl Default for RoomDirectPolicy {
+    /// What a control plane that says nothing means: allowed, up to
+    /// [`MAX_PARTICIPANTS`].
+    fn default() -> Self {
+        Self {
+            allowed: true,
+            max_participants: MAX_PARTICIPANTS,
+        }
+    }
+}
+
+impl DirectPolicy {
+    /// Whether this device opts in to direct paths in a room with `room`'s
+    /// policy, and if so the room's limit for [`Eligibility::limit`].
+    #[must_use]
+    pub fn opt_in(self, room: RoomDirectPolicy) -> Option<usize> {
+        let limit = room.max_participants.min(MAX_PARTICIPANTS);
+        (self == Self::Automatic && room.allowed && limit >= 2).then_some(limit)
     }
 }
 
@@ -161,7 +219,42 @@ mod tests {
         everyone_opted_in: true,
         watchdog_required: false,
         audience: false,
+        limit: MAX_PARTICIPANTS,
     };
+
+    #[test]
+    fn the_room_policy_decides_whether_and_how_many() {
+        assert_eq!(
+            DirectPolicy::default().opt_in(RoomDirectPolicy::default()),
+            Some(4)
+        );
+        assert_eq!(
+            DirectPolicy::RelayOnly.opt_in(RoomDirectPolicy::default()),
+            None
+        );
+        let relay_only = RoomDirectPolicy {
+            allowed: false,
+            ..RoomDirectPolicy::default()
+        };
+        assert_eq!(DirectPolicy::Automatic.opt_in(relay_only), None);
+        let pair = RoomDirectPolicy {
+            allowed: true,
+            max_participants: 2,
+        };
+        assert_eq!(DirectPolicy::Automatic.opt_in(pair), Some(2));
+        let three = Eligibility {
+            participants: 3,
+            limit: 2,
+            ..ALLOWED
+        };
+        assert_eq!(three.check(), Err(Ineligible::TooManyParticipants(3)));
+        let generous = Eligibility {
+            participants: 5,
+            limit: 40,
+            ..ALLOWED
+        };
+        assert_eq!(generous.check(), Err(Ineligible::TooManyParticipants(5)));
+    }
 
     #[test]
     fn a_one_to_one_encrypted_call_where_both_opted_in_is_allowed() {

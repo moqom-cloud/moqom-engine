@@ -38,6 +38,7 @@ const ELIGIBLE: Eligibility = Eligibility {
     everyone_opted_in: true,
     watchdog_required: false,
     audience: false,
+    limit: moqom_client::direct::MAX_PARTICIPANTS,
 };
 
 async fn within<F: Future>(what: &str, future: F) -> F::Output {
