@@ -91,8 +91,26 @@ const SEED: [u8; 32] = [0x6d; 32];
 /// As long as allowed, because a session whose credential lapses is closed by
 /// the relay and would appear in the results as a subscriber that stopped
 /// receiving — which is a real behaviour, correctly implemented, and nothing to
-/// do with fan-out. A run longer than this measures that instead.
+/// do with fan-out. [`within_token`] refuses a run longer than this.
 const TOKEN_SECONDS: u64 = moqom_token::MAX_LIFETIME.as_secs();
+
+/// Refuse a run its tokens can't outlast, before anything connects.
+///
+/// Sessions here don't renew their credentials, so a run past the token's
+/// lifetime would end with the relay closing every session, reported as loss.
+/// `held` is how long sessions stay open once everyone is watching; standing
+/// them up gets up to [`READY_PATIENCE`] on top.
+fn within_token(held: u64) -> Fallible<()> {
+    let needed = held.saturating_add(READY_PATIENCE.as_secs());
+    if needed > TOKEN_SECONDS {
+        return Err(format!(
+            "a run holding sessions for {held}s needs tokens for {needed}s, beyond the \
+             {TOKEN_SECONDS}s a relay accepts; split it into shorter runs"
+        )
+        .into());
+    }
+    Ok(())
+}
 
 /// How long to wait for every subscriber to be watching before publishing.
 ///
@@ -464,6 +482,7 @@ fn track_of(common: &Common) -> Fallible<(Identity, FullTrackName)> {
 
 /// One publisher, many subscribers, and a report.
 async fn fanout(args: &FanoutArgs) -> Fallible<bool> {
+    within_token(args.shape.seconds)?;
     let (server_name, addr) = resolve(&args.common.relay)?;
     let mint = Mint::from_seed(&SEED)?;
     let (publisher, track) = track_of(&args.common)?;
@@ -544,6 +563,7 @@ async fn fanout(args: &FanoutArgs) -> Fallible<bool> {
 
 /// Publish the track and hold it, for the one host that feeds a fleet.
 async fn publish_only(args: &PublishArgs) -> Fallible<bool> {
+    within_token(args.shape.seconds.saturating_add(args.linger))?;
     let (server_name, addr) = resolve(&args.common.relay)?;
     let mint = Mint::from_seed(&SEED)?;
     let (publisher, track) = track_of(&args.common)?;
@@ -621,6 +641,7 @@ async fn publish_only(args: &PublishArgs) -> Fallible<bool> {
 
 /// Watch a track somebody else is publishing, for the hosts that are the load.
 async fn watch_only(args: &WatchArgs) -> Fallible<bool> {
+    within_token(args.shape.seconds)?;
     let (server_name, addr) = resolve(&args.common.relay)?;
     let mint = Mint::from_seed(&SEED)?;
     let (_, track) = track_of(&args.common)?;
@@ -1460,6 +1481,13 @@ fn millis(duration: Duration) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_run_its_tokens_cannot_outlast_is_refused() {
+        assert!(within_token(60).is_ok());
+        assert!(within_token(TOKEN_SECONDS - READY_PATIENCE.as_secs()).is_ok());
+        assert!(within_token(TOKEN_SECONDS - READY_PATIENCE.as_secs() + 1).is_err());
+    }
 
     const PER_GROUP: u64 = 30;
 
