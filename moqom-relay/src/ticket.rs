@@ -123,12 +123,18 @@ impl TicketKeys {
                         }
                         signer = Some((pair, jwk.kid.clone()));
                     }
-                    published.push(VerificationKey::ml_dsa_65(jwk.kid, public));
+                    published.push(
+                        VerificationKey::ml_dsa_65(jwk.kid, public)
+                            .map_err(|e| format!("ticket {e}"))?,
+                    );
                 }
                 ("OKP", "Ed25519") => {
                     let public = decode_32(&jwk.x)
                         .ok_or_else(|| format!("ticket key {}: bad x", jwk.kid))?;
-                    published.push(VerificationKey::ed25519(jwk.kid, public.to_vec()));
+                    published.push(
+                        VerificationKey::ed25519(jwk.kid, public.to_vec())
+                            .map_err(|e| format!("ticket {e}"))?,
+                    );
                 }
                 _ => {
                     return Err(format!(
@@ -157,10 +163,10 @@ impl TicketKeys {
         let signer =
             PqdsaKeyPair::from_seed(&ML_DSA_65_SIGNING, seed).expect("any 32 bytes are a seed");
         let kid = kid.into();
-        let published = vec![VerificationKey::ml_dsa_65(
-            kid.clone(),
-            signer.public_key().as_ref().to_vec(),
-        )];
+        let published = vec![
+            VerificationKey::ml_dsa_65(kid.clone(), signer.public_key().as_ref().to_vec())
+                .expect("an ML-DSA-65 public key is 1,952 bytes"),
+        ];
         Self {
             signer,
             kid,

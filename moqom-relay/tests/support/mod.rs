@@ -1652,10 +1652,10 @@ pub mod tokens {
     pub fn authenticator() -> Authenticator {
         Authenticator::new(
             ISSUER,
-            vec![VerificationKey::ml_dsa_65(
-                KID,
-                signer().public_key().as_ref().to_vec(),
-            )],
+            vec![
+                VerificationKey::ml_dsa_65(KID, signer().public_key().as_ref().to_vec())
+                    .expect("an ML-DSA-65 key"),
+            ],
         )
     }
 

@@ -136,7 +136,10 @@ mod tests {
         let check = PeerCheck::new(
             Authenticator::new(
                 "",
-                vec![VerificationKey::ed25519("k".to_owned(), vec![0u8; 32])],
+                vec![
+                    VerificationKey::ed25519("k".to_owned(), vec![0u8; 32])
+                        .expect("an Ed25519 key"),
+                ],
             ),
             "cert",
         );

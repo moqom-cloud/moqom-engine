@@ -740,10 +740,10 @@ mod tests {
     fn authenticator() -> Authenticator {
         Authenticator::new(
             "https://api.moqom.cloud",
-            vec![VerificationKey::ed25519(
-                KID.to_owned(),
-                signer().public_key().as_ref().to_vec(),
-            )],
+            vec![
+                VerificationKey::ed25519(KID.to_owned(), signer().public_key().as_ref().to_vec())
+                    .expect("an Ed25519 key"),
+            ],
         )
     }
 
@@ -1034,10 +1034,10 @@ mod tests {
         Authenticator::for_tenant(
             "https://api.moqom.cloud",
             tenant,
-            vec![VerificationKey::ed25519(
-                KID.to_owned(),
-                signer().public_key().as_ref().to_vec(),
-            )],
+            vec![
+                VerificationKey::ed25519(KID.to_owned(), signer().public_key().as_ref().to_vec())
+                    .expect("an Ed25519 key"),
+            ],
         )
     }
 
@@ -1071,10 +1071,10 @@ mod tests {
         // the operator's and must not go with them.
         let now = at(0);
         let authenticator = pinned("acme");
-        let count = authenticator.accept(vec![VerificationKey::ed25519(
-            KID.to_owned(),
-            signer().public_key().as_ref().to_vec(),
-        )]);
+        let count = authenticator.accept(vec![
+            VerificationKey::ed25519(KID.to_owned(), signer().public_key().as_ref().to_vec())
+                .expect("an Ed25519 key"),
+        ]);
         assert_eq!(count, 1);
         let mut theirs = claims(now);
         theirs["aud"] = serde_json::json!("globex");
@@ -1241,10 +1241,10 @@ mod tests {
             "before any key arrives the token is not read, only ignored"
         );
 
-        let pushed = authenticator.accept(vec![VerificationKey::ed25519(
-            KID.to_owned(),
-            signer().public_key().as_ref().to_vec(),
-        )]);
+        let pushed = authenticator.accept(vec![
+            VerificationKey::ed25519(KID.to_owned(), signer().public_key().as_ref().to_vec())
+                .expect("an Ed25519 key"),
+        ]);
 
         assert_eq!(pushed, 1);
         assert!(authenticator.is_verifying());
@@ -1265,10 +1265,10 @@ mod tests {
         let token = mint(&header(), &claims(now));
         let authenticator = authenticator();
 
-        let _ = authenticator.accept(vec![VerificationKey::ed25519(
-            "some-other-key".to_owned(),
-            vec![7u8; 32],
-        )]);
+        let _ = authenticator.accept(vec![
+            VerificationKey::ed25519("some-other-key".to_owned(), vec![7u8; 32])
+                .expect("an Ed25519 key"),
+        ]);
 
         assert_eq!(
             authenticator.identify([token.as_bytes()], peer(), now),
@@ -1284,7 +1284,8 @@ mod tests {
         let now = at(0);
         let token = mint(&header(), &claims(now));
         let real =
-            VerificationKey::ed25519(KID.to_owned(), signer().public_key().as_ref().to_vec());
+            VerificationKey::ed25519(KID.to_owned(), signer().public_key().as_ref().to_vec())
+                .expect("an Ed25519 key");
 
         let authenticator = Authenticator::new("https://api.moqom.cloud", Vec::new());
         let _ = authenticator.accept(vec![real]);
@@ -1294,10 +1295,10 @@ mod tests {
                 .is_ok()
         );
 
-        let _ = authenticator.accept(vec![VerificationKey::ed25519(
-            "the-only-key-now".to_owned(),
-            vec![9u8; 32],
-        )]);
+        let _ = authenticator.accept(vec![
+            VerificationKey::ed25519("the-only-key-now".to_owned(), vec![9u8; 32])
+                .expect("an Ed25519 key"),
+        ]);
 
         assert!(
             authenticator
@@ -1376,8 +1377,10 @@ mod tests {
         Authenticator::new(
             "https://api.moqom.cloud",
             vec![
-                VerificationKey::ml_dsa_65("pq", ml_dsa_signer().public_key().as_ref().to_vec()),
-                VerificationKey::ed25519(KID, signer().public_key().as_ref().to_vec()),
+                VerificationKey::ml_dsa_65("pq", ml_dsa_signer().public_key().as_ref().to_vec())
+                    .expect("an ML-DSA-65 key"),
+                VerificationKey::ed25519(KID, signer().public_key().as_ref().to_vec())
+                    .expect("an Ed25519 key"),
             ],
         )
     }
@@ -1426,7 +1429,8 @@ mod tests {
 
     #[test]
     fn an_akp_key_is_read_from_a_set() {
-        let key = VerificationKey::ml_dsa_65("pq", ml_dsa_signer().public_key().as_ref().to_vec());
+        let key = VerificationKey::ml_dsa_65("pq", ml_dsa_signer().public_key().as_ref().to_vec())
+            .expect("an ML-DSA-65 key");
         let document = serde_json::json!({ "keys": [key.jwk()] }).to_string();
         assert_eq!(VerificationKey::parse_set(&document), Ok(vec![key]));
 
