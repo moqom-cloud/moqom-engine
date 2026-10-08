@@ -34,7 +34,7 @@
 
 use std::sync::Arc;
 
-use aws_lc_rs::{digest, error};
+use aws_lc_rs::digest;
 use moqom_client::DeviceKey;
 use moqom_token::{Claims, Confirmation, Grant, Signer};
 
@@ -60,8 +60,8 @@ impl Mint {
     /// Derive the signer from `seed`.
     ///
     /// # Errors
-    /// A seed the curve will not accept.
-    pub fn from_seed(seed: &[u8; 32]) -> Result<Self, error::KeyRejected> {
+    /// A seed ML-DSA-65 will not accept.
+    pub fn from_seed(seed: &[u8; 32]) -> Result<Self, moqom_token::KeyError> {
         Ok(Self {
             signer: Signer::from_seed(seed)?.with_id(KEY_ID),
         })

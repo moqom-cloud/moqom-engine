@@ -168,7 +168,7 @@ impl From<moqom_token::Error> for AuthError {
             Error::WrongIssuer => Self::WrongIssuer,
             Error::WrongTenant => Self::WrongTenant,
             Error::Incomplete => Self::Incomplete,
-            // A signing refusal; verification never returns it.
+            // `cnf.jkt` is not a SHA-256 thumbprint, so no proof can match it.
             Error::Thumbprint => Self::Malformed("thumbprint"),
         }
     }
