@@ -12,8 +12,11 @@ description = "A MOQT subscriber and publisher, for recorders, classifiers, and 
 [dependencies]
 moqom-proto = { path = "../moqom-proto" }
 moqom-transport = { path = "../moqom-transport" }
-# For the device key and the proof it signs. Already the provider rustls and
-# quinn are built against here, so this adds an API rather than a library.
+# The device key and the proof it signs: ML-DSA-65, and ES256 for P-256 keys
+# made before the move.
+moqom-proof = { workspace = true }
+# Already the provider rustls and quinn are built against here, so this adds an
+# API rather than a library.
 aws-lc-rs = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
@@ -32,16 +35,15 @@ socket2 = { workspace = true }
 
 [dev-dependencies]
 moqom-relay = { path = "../moqom-relay" }
+# Minting tokens with the claim shape the Go control plane produces, through the
+# library it mints with, so a typo cannot read as a verification bug.
+moqom-token = { workspace = true }
 # Adds the negotiated key exchange group to quinn's handshake data, which is how the post-quantum
 # tests read it. Unlike quinn's feature of the same name this one does not also switch on rustls's
 # post-quantum preference, so the tests see what the build itself chose.
 quinn-proto = { workspace = true, features = ["__rustls-post-quantum-test"] }
 rcgen = { workspace = true }
 rustls = { workspace = true }
-# Minting a token in the possession test, where the claim shape is what the Go
-# control plane produces and writing it by hand invites a typo that reads as a
-# verification bug.
-serde_json = { workspace = true }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time"] }
 
 [lints]

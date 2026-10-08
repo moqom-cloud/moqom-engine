@@ -16,6 +16,8 @@ moqom-transport = { path = "../moqom-transport" }
 # The device key and the proof it signs, for an edge's links to its parent: the
 # same proof a client makes, so a parent checks a link exactly as it checks one.
 moqom-client = { path = "../moqom-client" }
+# Checking proofs of possession: ML-DSA-65, and ES256 during the rollover.
+moqom-proof = { workspace = true }
 bytes = { workspace = true }
 quinn = { workspace = true }
 rustls = { workspace = true }
@@ -30,6 +32,7 @@ webpki-roots = "0.26"
 # already here as the rustls provider, so the signature check costs no new
 # cryptography; serde reads the claims, which are JSON precisely so that the
 # media-path binary does not have to carry a CBOR/COSE stack.
+moqom-token = { workspace = true }
 aws-lc-rs = { workspace = true }
 base64 = { workspace = true }
 serde = { workspace = true }

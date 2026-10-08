@@ -29,10 +29,11 @@
 //! # The format
 //!
 //! ML-DSA-65 (FIPS 204) over JSON claims in the compact JWS serialisation,
-//! minted by the Go control plane's `token` package. Ed25519 keys are still read,
-//! so tokens signed before the move to ML-DSA verify until they expire. The full
-//! design target is CAT/CWT with COSE; this is the subset that exists on both
-//! sides today.
+//! verified by `moqom-token`, the same library the Go control plane mints with
+//! and `MoqomKit` verifies with, all three held to one set of vectors. Ed25519
+//! keys are still read, so tokens signed before the move to ML-DSA verify until
+//! they expire. What is here is the relay's half: which capability bits exist,
+//! what a relay link may carry, and what a verified token becomes.
 //!
 //! The `cnf.jkt` thumbprint names the device the token was issued to, and
 //! [`crate::possession`] turns naming into proving: every session shows a
@@ -42,24 +43,15 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use aws_lc_rs::signature::{ED25519, ML_DSA_65, UnparsedPublicKey};
-use base64::Engine as _;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use serde::Deserialize;
+pub use moqom_token::{Algorithm as KeyAlgorithm, PublicKey as VerificationKey};
 
 use crate::possession::Possession;
 use crate::quota::Principal;
 use crate::scope::{self, Permission, Publish, capability};
 
-/// The token type, so a JWS minted for something else cannot be replayed here.
-const TOKEN_TYPE: &str = "MOQT";
-
-/// How much clock disagreement between minting and verifying is tolerated.
-///
-/// One-directional, matching the control plane: a token from slightly in the
-/// future is a clock, but an expired one is a security boundary and is not
-/// extended.
-const CLOCK_SKEW: Duration = Duration::from_secs(30);
+/// How much clock disagreement between minting and verifying is tolerated, as
+/// `moqom-token` tolerates it.
+const CLOCK_SKEW: Duration = moqom_token::CLOCK_SKEW;
 
 /// How much of the thumbprint becomes the device identifier.
 ///
@@ -67,15 +59,6 @@ const CLOCK_SKEW: Duration = Duration::from_secs(30);
 /// `MoqomKit`. A limit keyed on one derivation and a ban keyed on another would
 /// be two names for one device, and the ban would be the one that missed.
 const DEVICE_ID_LENGTH: usize = 16;
-
-/// A token may not be larger than this.
-///
-/// Checked before anything is decoded, because the work below is proportional
-/// to the input and a peer that can hand us a megabyte of base64 to parse per
-/// connection attempt has found a cheaper attack than the one the rate limiter
-/// is watching for. Real tokens are about five kilobytes, nearly all of it the
-/// 3,309-byte ML-DSA-65 signature in base64.
-const MAX_TOKEN_BYTES: usize = 8192;
 
 /// Why a token was not accepted.
 ///
@@ -102,6 +85,9 @@ pub enum AuthError {
     /// Issued in the future by more than the tolerated skew.
     #[error("token is not valid yet")]
     NotYetValid,
+    /// Valid for longer than the fifteen minutes any issuer may grant.
+    #[error("token lifetime is out of range")]
+    Lifetime,
     /// Issued by a different deployment.
     #[error("token was issued by another deployment")]
     WrongIssuer,
@@ -134,7 +120,9 @@ impl AuthError {
         use moqom_proto::control::RequestErrorCode as Code;
         match self {
             Self::Expired | Self::NotYetValid => Code::EXPIRED_AUTH_TOKEN,
-            Self::Malformed(_) | Self::Unsupported | Self::Incomplete => Code::MALFORMED_AUTH_TOKEN,
+            Self::Malformed(_) | Self::Unsupported | Self::Lifetime | Self::Incomplete => {
+                Code::MALFORMED_AUTH_TOKEN
+            }
             // `Unproven` belongs here rather than with the malformed cases, even
             // when the proof itself is what was malformed: the token is fine, and
             // a client told its token was malformed goes and fetches another one,
@@ -157,6 +145,7 @@ impl AuthError {
             Self::BadSignature => "bad_signature",
             Self::Expired => "expired",
             Self::NotYetValid => "not_yet_valid",
+            Self::Lifetime => "lifetime",
             Self::WrongIssuer => "wrong_issuer",
             Self::WrongTenant => "wrong_tenant",
             Self::Incomplete => "incomplete",
@@ -165,276 +154,23 @@ impl AuthError {
     }
 }
 
-#[derive(Deserialize)]
-struct Header {
-    alg: String,
-    typ: String,
-    kid: String,
-}
-
-/// The claims this relay reads.
-///
-/// A subset, and unknown top-level fields are ignored rather than refused. That
-/// was once safe because these claims decided only *who* somebody is, and it is
-/// no longer the whole story: [`Claims::moqt`] now decides what they may do. So
-/// the strictness lives where the decision does — see [`Scope`], which refuses
-/// a field or a capability bit it does not recognise. A claim beside it that
-/// this build has never heard of still cannot make the subject wrong, and
-/// refusing those would mean a control plane could not add one without
-/// upgrading every relay first.
-#[derive(Deserialize)]
-struct Claims {
-    #[serde(default)]
-    iss: String,
-    #[serde(default)]
-    sub: String,
-    /// The tenant. Named `aud` because the tenant is who the token is *for*, and
-    /// the control plane mints it into the audience claim.
-    #[serde(default)]
-    aud: String,
-    #[serde(default)]
-    iat: i64,
-    #[serde(default)]
-    exp: i64,
-    #[serde(default)]
-    cnf: Confirmation,
-    /// The username whose following brought this session in, if any.
-    ///
-    /// Read here and not acted on here. It exists so that the relay can report
-    /// which audience a session belongs to, and later attribute per-track egress
-    /// to it -- when two cohosts bring their own followings to one room, whose
-    /// bandwidth B's media is when it reaches A's viewers is a question only the
-    /// party forwarding the bytes can answer.
-    ///
-    /// Deliberately not part of the lax-parsing caveat above: this decides
-    /// nothing about what anybody may do, so a token that omits it is a session
-    /// nobody brought rather than a session with unknown rights.
-    #[serde(default)]
-    via: String,
-
-    /// What the holder may do. See [`Scope`].
-    ///
-    /// Defaulted rather than required, and the default is the least permission
-    /// there is: no room, nothing publishable, no powers. A token minted before
-    /// this claim existed therefore reaches its holder's own personal channel
-    /// and nothing else, which is the failure a missing grant should have.
-    #[serde(default)]
-    moqt: Scope,
-}
-
-#[derive(Deserialize, Default)]
-struct Confirmation {
-    #[serde(default)]
-    jkt: String,
-}
-
-/// The `moqt` claim, as the Go control plane mints it.
-///
-/// Strict, unlike the claims around it, and this is the struct the note there
-/// refers to. Two rules, both fail-closed and both matching the minter:
-///
-/// - An unrecognised **capability bit** is refused, exactly as `Scope.Grants`
-///   does in Go. Dropping it would mean a token from a newer control plane
-///   quietly granting less than it says, which presents as a moderator whose
-///   buttons stopped working and no error anywhere.
-/// - An unrecognised **field** is refused too, which Go does not do. The
-///   asymmetry is deliberate: this is the enforcement point, and a field added
-///   later is at least as likely to narrow a grant as to widen one. Ignoring a
-///   narrowing is the failure that matters, so a scope this build cannot fully
-///   read is not one it will act on. The cost is an ordering constraint on
-///   rollouts — relays learn a new field before the control plane mints it —
-///   which the capability rule already imposed.
-#[derive(Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-#[allow(clippy::struct_excessive_bools)] // the claim's shape, which the minter decides
-struct Scope {
-    #[serde(default)]
-    room: String,
-    /// Media kinds, as a bitmask. See [`scope::Publish`](crate::scope::Publish).
-    #[serde(default, rename = "pub")]
-    publish: u8,
-    #[serde(default)]
-    cap: u32,
-    #[serde(default)]
-    own: bool,
-    #[serde(default)]
-    bs: bool,
-    /// Whether the holder passed an age check.
-    ///
-    /// Declared so the claim parses — the struct refuses fields it does not
-    /// know — and deliberately not read. An age gate is a decision about
-    /// whether to admit somebody to a room at all, and the control plane makes
-    /// it when it mints the token; by the time a session is announcing
-    /// namespaces the question has already been answered.
-    #[serde(default)]
-    #[allow(dead_code)]
-    age: bool,
-    /// Whether the holder is another relay's link to this one. See
-    /// [`scope::Scope::relay`](crate::scope::Scope::relay).
-    #[serde(default)]
-    rly: bool,
-}
-
-/// What a [`VerificationKey`] verifies with.
-///
-/// A property of the key rather than of the token, which is the whole defence
-/// against algorithm confusion: a verifier that dispatches on the token's own
-/// `alg` can be told to use `none`, or to verify an HMAC using the public key
-/// as the shared secret. A token here must name its key's algorithm, and is
-/// verified with that algorithm and no other. The Go minter does the same.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum KeyAlgorithm {
-    /// ML-DSA-65, which every token and ticket is signed with.
-    MlDsa65,
-    /// Ed25519, read only to verify what was signed before ML-DSA.
-    Ed25519,
-}
-
-impl KeyAlgorithm {
-    /// The JOSE `alg` a token signed with this key carries.
-    #[must_use]
-    pub const fn jose(self) -> &'static str {
-        match self {
-            Self::MlDsa65 => "ML-DSA-65",
-            Self::Ed25519 => "EdDSA",
+impl From<moqom_token::Error> for AuthError {
+    fn from(error: moqom_token::Error) -> Self {
+        use moqom_token::Error;
+        match error {
+            Error::Malformed(why) => Self::Malformed(why),
+            Error::Unsupported => Self::Unsupported,
+            Error::UnknownKey => Self::UnknownKey,
+            Error::BadSignature => Self::BadSignature,
+            Error::Expired => Self::Expired,
+            Error::NotYetValid => Self::NotYetValid,
+            Error::Lifetime => Self::Lifetime,
+            Error::WrongIssuer => Self::WrongIssuer,
+            Error::WrongTenant => Self::WrongTenant,
+            Error::Incomplete => Self::Incomplete,
+            // A signing refusal; verification never returns it.
+            Error::Thumbprint => Self::Malformed("thumbprint"),
         }
-    }
-
-    const fn public_key_bytes(self) -> usize {
-        match self {
-            Self::MlDsa65 => 1952,
-            Self::Ed25519 => 32,
-        }
-    }
-}
-
-/// A public key this relay will accept tokens from.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct VerificationKey {
-    /// The `kid` naming it.
-    pub id: String,
-    /// What it verifies with.
-    pub algorithm: KeyAlgorithm,
-    /// The raw public key.
-    pub bytes: Vec<u8>,
-}
-
-impl VerificationKey {
-    /// An ML-DSA-65 key from its 1,952-byte encoding.
-    #[must_use]
-    pub fn ml_dsa_65(id: impl Into<String>, bytes: Vec<u8>) -> Self {
-        Self {
-            id: id.into(),
-            algorithm: KeyAlgorithm::MlDsa65,
-            bytes,
-        }
-    }
-
-    /// A legacy Ed25519 key from its 32 bytes.
-    #[must_use]
-    pub fn ed25519(id: impl Into<String>, bytes: Vec<u8>) -> Self {
-        Self {
-            id: id.into(),
-            algorithm: KeyAlgorithm::Ed25519,
-            bytes,
-        }
-    }
-
-    /// Whether `signature` is this key's over `message`, by this key's own
-    /// algorithm.
-    #[must_use]
-    pub fn verifies(&self, message: &[u8], signature: &[u8]) -> bool {
-        let algorithm: &dyn aws_lc_rs::signature::VerificationAlgorithm = match self.algorithm {
-            KeyAlgorithm::MlDsa65 => &ML_DSA_65,
-            KeyAlgorithm::Ed25519 => &ED25519,
-        };
-        UnparsedPublicKey::new(algorithm, self.bytes.as_slice())
-            .verify(message, signature)
-            .is_ok()
-    }
-
-    /// The key as a JWK, in the shape [`Self::parse_set`] reads.
-    #[must_use]
-    pub fn jwk(&self) -> serde_json::Value {
-        let encoded = URL_SAFE_NO_PAD.encode(&self.bytes);
-        match self.algorithm {
-            KeyAlgorithm::MlDsa65 => serde_json::json!({
-                "kty": "AKP", "alg": "ML-DSA-65", "kid": self.id, "pub": encoded,
-            }),
-            KeyAlgorithm::Ed25519 => serde_json::json!({
-                "kty": "OKP", "crv": "Ed25519", "kid": self.id, "x": encoded,
-            }),
-        }
-    }
-
-    /// Read keys from the JWK set the control plane serves.
-    ///
-    /// Accepts either a bare array of JWKs or the `{"keys": [...]}` wrapper, so
-    /// an operator can paste either shape.
-    ///
-    /// # Errors
-    /// A string describing what was wrong with the document, since this runs at
-    /// startup and the only useful audience is the person who wrote the config.
-    pub fn parse_set(document: &str) -> Result<Vec<Self>, String> {
-        #[derive(Deserialize)]
-        struct Jwk {
-            kty: String,
-            #[serde(default)]
-            crv: String,
-            #[serde(default)]
-            alg: String,
-            kid: String,
-            #[serde(default)]
-            x: String,
-            #[serde(default, rename = "pub")]
-            public: String,
-        }
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Document {
-            Wrapped { keys: Vec<Jwk> },
-            Bare(Vec<Jwk>),
-        }
-
-        let parsed: Document =
-            serde_json::from_str(document).map_err(|e| format!("not a JWK set: {e}"))?;
-        let jwks = match parsed {
-            Document::Wrapped { keys } | Document::Bare(keys) => keys,
-        };
-
-        jwks.into_iter()
-            .map(|jwk| {
-                let (algorithm, field, name) = match (jwk.kty.as_str(), jwk.crv.as_str()) {
-                    ("AKP", _) if jwk.alg == "ML-DSA-65" => {
-                        (KeyAlgorithm::MlDsa65, &jwk.public, "pub")
-                    }
-                    ("OKP", "Ed25519") => (KeyAlgorithm::Ed25519, &jwk.x, "x"),
-                    _ => {
-                        return Err(format!(
-                            "key {}: only AKP/ML-DSA-65 and OKP/Ed25519 are supported, got {}/{}{}",
-                            jwk.kid, jwk.kty, jwk.alg, jwk.crv
-                        ));
-                    }
-                };
-                let bytes = URL_SAFE_NO_PAD
-                    .decode(field.as_bytes())
-                    .map_err(|e| format!("key {}: {name} is not base64url: {e}", jwk.kid))?;
-                if bytes.len() != algorithm.public_key_bytes() {
-                    return Err(format!(
-                        "key {}: an {} public key is {} bytes, got {}",
-                        jwk.kid,
-                        algorithm.jose(),
-                        algorithm.public_key_bytes(),
-                        bytes.len()
-                    ));
-                }
-                Ok(Self {
-                    id: jwk.kid,
-                    algorithm,
-                    bytes,
-                })
-            })
-            .collect()
     }
 }
 
@@ -483,6 +219,20 @@ struct Keys {
     /// The one tenant this relay serves, or empty for any.
     tenant: String,
     by_id: HashMap<String, VerificationKey>,
+    verifier: moqom_token::Verifier,
+}
+
+impl Keys {
+    fn new(issuer: String, tenant: String, by_id: HashMap<String, VerificationKey>) -> Self {
+        let verifier = moqom_token::Verifier::new(issuer.as_str(), by_id.values().cloned())
+            .for_tenant(tenant.as_str());
+        Self {
+            issuer,
+            tenant,
+            by_id,
+            verifier,
+        }
+    }
 }
 
 impl std::fmt::Debug for Authenticator {
@@ -513,11 +263,11 @@ impl Authenticator {
         let configured: HashMap<_, _> = keys.into_iter().map(|key| (key.id.clone(), key)).collect();
         Self {
             inner: Arc::new(Shared {
-                effective: RwLock::new(Arc::new(Keys {
-                    issuer: issuer.into(),
-                    tenant: String::new(),
-                    by_id: configured.clone(),
-                })),
+                effective: RwLock::new(Arc::new(Keys::new(
+                    issuer.into(),
+                    String::new(),
+                    configured.clone(),
+                ))),
                 configured,
             }),
         }
@@ -544,11 +294,11 @@ impl Authenticator {
                 .effective
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            *effective = Arc::new(Keys {
-                issuer: effective.issuer.clone(),
+            *effective = Arc::new(Keys::new(
+                effective.issuer.clone(),
                 tenant,
-                by_id: effective.by_id.clone(),
-            });
+                effective.by_id.clone(),
+            ));
         }
         authenticator
     }
@@ -584,11 +334,11 @@ impl Authenticator {
             .effective
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *effective = Arc::new(Keys {
-            issuer: effective.issuer.clone(),
-            tenant: effective.tenant.clone(),
+        *effective = Arc::new(Keys::new(
+            effective.issuer.clone(),
+            effective.tenant.clone(),
             by_id,
-        });
+        ));
         count
     }
 
@@ -883,86 +633,24 @@ impl Admission {
 
 impl Keys {
     fn verify(&self, token: &[u8], now: SystemTime) -> Result<Admission, AuthError> {
-        if token.is_empty() || token.len() > MAX_TOKEN_BYTES {
-            return Err(AuthError::Malformed("token length is out of range"));
-        }
-
-        // Split before decoding anything. The signed message is the first two
-        // segments verbatim, so it has to be taken from the original bytes
-        // rather than re-encoded from parsed values — a round trip through a
-        // JSON parser and back would not reproduce them byte for byte, and the
-        // signature is over bytes.
-        let mut segments = token.splitn(3, |&byte| byte == b'.');
-        let (Some(header_segment), Some(claims_segment), Some(signature_segment)) =
-            (segments.next(), segments.next(), segments.next())
-        else {
-            return Err(AuthError::Malformed("expected three segments"));
-        };
-        if claims_segment.contains(&b'.') || signature_segment.contains(&b'.') {
-            return Err(AuthError::Malformed("expected three segments"));
-        }
-
-        let header: Header = decode_segment(header_segment, "header")?;
-        if header.typ != TOKEN_TYPE {
-            return Err(AuthError::Unsupported);
-        }
-        let Some(key) = self.by_id.get(&header.kid) else {
-            return Err(AuthError::UnknownKey);
-        };
-        if header.alg != key.algorithm.jose() {
-            return Err(AuthError::Unsupported);
-        }
-
-        let signature = URL_SAFE_NO_PAD
-            .decode(signature_segment)
-            .map_err(|_| AuthError::Malformed("signature is not base64url"))?;
-
-        // The signed message is `header.claims`, which is everything before the
-        // final separator.
-        let signed = &token[..header_segment.len() + 1 + claims_segment.len()];
-        if !key.verifies(signed, &signature) {
-            return Err(AuthError::BadSignature);
-        }
-
-        // Only now are the claims worth reading. Parsing them earlier and
-        // acting on the result — even to produce a better error message — is
-        // how a verifier becomes a parser an attacker can reach.
-        let claims: Claims = decode_segment(claims_segment, "claims")?;
-
-        if !self.issuer.is_empty() && claims.iss != self.issuer {
-            return Err(AuthError::WrongIssuer);
-        }
-        if claims.exp == 0 {
-            return Err(AuthError::Malformed("no expiry"));
-        }
-        let expires = unix(claims.exp);
-        if now.saturating_sub(CLOCK_SKEW) > expires {
-            return Err(AuthError::Expired);
-        }
-        let issued = (claims.iat != 0).then(|| unix(claims.iat));
-        if issued.is_some_and(|issued| now + CLOCK_SKEW < issued) {
-            return Err(AuthError::NotYetValid);
-        }
+        // Signature, issuer, expiry, lifetime, a complete identity and the
+        // tenant pin. Nothing below reads a claim the library has not verified.
+        let claims = self.verifier.verify(token, now)?;
 
         let device = device_from(&claims.cnf.jkt);
-        if claims.aud.is_empty() || claims.sub.is_empty() || device.is_empty() {
-            return Err(AuthError::Incomplete);
-        }
-        if !self.tenant.is_empty() && claims.aud != self.tenant {
-            return Err(AuthError::WrongTenant);
-        }
         // A token attributed to its own subject is dropped rather than refused.
         // The control plane will not mint one, so this is defence against a bug
         // rather than an attack, and rejecting the session over it would turn a
         // miscounted audience into somebody unable to watch.
-        let via = Some(claims.via)
+        let via = Some(claims.via.as_str())
             .filter(|via| !via.is_empty() && *via != claims.sub)
             .map(Arc::from);
 
         // Refused rather than masked, matching the Go minter bit for bit. A
         // relay that dropped the bits it did not know would enforce a narrower
         // grant than the one that was issued, silently.
-        if claims.moqt.cap & !capability::KNOWN != 0 {
+        let m = &claims.grant;
+        if m.capabilities & !capability::KNOWN != 0 {
             return Err(AuthError::Unsupported);
         }
         // A relay link reads and does nothing else, and is not metered. A link
@@ -973,53 +661,38 @@ impl Keys {
         // And it names a room. A link is minted per room so that a parent can
         // refuse whatever the edge asks for outside it; one naming none would
         // be an unmetered read of the whole tenant.
-        let m = &claims.moqt;
-        if m.rly && (m.publish != 0 || m.cap != 0 || m.own || m.bs || m.room.is_empty()) {
+        if m.relay
+            && (m.publish != 0
+                || m.capabilities != 0
+                || m.owner
+                || m.backstage
+                || m.room.is_empty())
+        {
             return Err(AuthError::Unsupported);
         }
         let permission = Permission::scoped(scope::Scope {
-            tenant: Arc::from(claims.aud.as_str()),
+            tenant: Arc::from(claims.tenant.as_str()),
             user: Arc::from(claims.sub.as_str()),
             device: Arc::from(device),
-            room: Some(claims.moqt.room)
+            room: Some(m.room.as_str())
                 .filter(|room| !room.is_empty())
                 .map(Arc::from),
-            publish: Publish::from_bits(claims.moqt.publish),
-            capabilities: claims.moqt.cap,
-            owner: claims.moqt.own,
-            backstage: claims.moqt.bs,
-            relay: claims.moqt.rly,
+            publish: Publish::from_bits(m.publish),
+            capabilities: m.capabilities,
+            owner: m.owner,
+            backstage: m.backstage,
+            relay: m.relay,
         });
 
         Ok(Admission {
-            who: Principal::verified(&claims.aud, &claims.sub, device),
+            who: Principal::verified(&claims.tenant, &claims.sub, device),
             permission,
             via,
-            expires: Some(expires),
-            issued,
+            expires: Some(unix(claims.exp)),
+            issued: (claims.iat != 0).then(|| unix(claims.iat)),
             thumbprint: Some(Arc::from(claims.cnf.jkt.as_str())),
         })
     }
-}
-
-fn decode_segment<T: for<'de> Deserialize<'de>>(
-    segment: &[u8],
-    what: &'static str,
-) -> Result<T, AuthError> {
-    let decoded = URL_SAFE_NO_PAD.decode(segment).map_err(|_| {
-        AuthError::Malformed(if what == "header" {
-            "header is not base64url"
-        } else {
-            "claims are not base64url"
-        })
-    })?;
-    serde_json::from_slice(&decoded).map_err(|_| {
-        AuthError::Malformed(if what == "header" {
-            "header is not JSON"
-        } else {
-            "claims are not JSON"
-        })
-    })
 }
 
 /// The device identifier a thumbprint implies.
@@ -1044,22 +717,13 @@ fn unix(seconds: i64) -> SystemTime {
     }
 }
 
-/// `SystemTime` has no saturating subtraction and the naive one panics on
-/// underflow, which a clock set before 1970 would reach.
-trait SaturatingSub {
-    fn saturating_sub(self, amount: Duration) -> Self;
-}
-
-impl SaturatingSub for SystemTime {
-    fn saturating_sub(self, amount: Duration) -> Self {
-        self.checked_sub(amount).unwrap_or(UNIX_EPOCH)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair};
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use moqom_token::MAX_TOKEN_BYTES;
     use std::net::{IpAddr, Ipv4Addr};
 
     const KID: &str = "test-key";
@@ -1475,10 +1139,7 @@ mod tests {
     #[test]
     fn the_first_token_that_verifies_wins() {
         let now = at(0);
-        let stale = mint(
-            &header(),
-            &claims(at(0).saturating_sub(Duration::from_hours(1))),
-        );
+        let stale = mint(&header(), &claims(at(0) - Duration::from_hours(1)));
         let fresh = mint(&header(), &claims(now));
 
         // A client mid-rotation sends both. The option is defined to repeat

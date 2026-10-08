@@ -34,11 +34,9 @@
 
 use std::sync::Arc;
 
-use aws_lc_rs::signature::{KeyPair, ML_DSA_65_SIGNING, PqdsaKeyPair};
 use aws_lc_rs::{digest, error};
-use base64::Engine as _;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use moqom_client::DeviceKey;
+use moqom_token::{Claims, Confirmation, Grant, Signer};
 
 /// The issuer the minted tokens name, and what a relay must be told to expect.
 pub const ISSUER: &str = "https://loadgen.moqom.invalid";
@@ -55,7 +53,7 @@ const DEVICE_ID_LENGTH: usize = 16;
 
 /// The signing half of a run's identities.
 pub struct Mint {
-    pair: PqdsaKeyPair,
+    signer: Signer,
 }
 
 impl Mint {
@@ -65,7 +63,7 @@ impl Mint {
     /// A seed the curve will not accept.
     pub fn from_seed(seed: &[u8; 32]) -> Result<Self, error::KeyRejected> {
         Ok(Self {
-            pair: PqdsaKeyPair::from_seed(&ML_DSA_65_SIGNING, seed)?,
+            signer: Signer::from_seed(seed)?.with_id(KEY_ID),
         })
     }
 
@@ -73,10 +71,7 @@ impl Mint {
     /// document `MOQOM_RELAY_JWKS` reads.
     #[must_use]
     pub fn jwks(&self) -> String {
-        let public = URL_SAFE_NO_PAD.encode(self.pair.public_key().as_ref());
-        format!(
-            r#"{{"keys":[{{"kty":"AKP","alg":"ML-DSA-65","kid":"{KEY_ID}","pub":"{public}"}}]}}"#
-        )
+        serde_json::json!({ "keys": [self.signer.public_key().jwk()] }).to_string()
     }
 
     /// A token for one identity, valid for `seconds`.
@@ -84,43 +79,37 @@ impl Mint {
     /// `publish` is the media-kind bitmask: non-empty for the publisher, zero for
     /// a viewer. That is the difference between a session that may announce its
     /// own slot and one that may only watch.
-    #[must_use]
-    pub fn token(&self, who: &Identity, publish: u8, seconds: u64) -> String {
+    ///
+    /// # Errors
+    /// [`moqom_token::Error::Lifetime`] for `seconds` beyond the fifteen minutes
+    /// a relay accepts, which is refused here rather than at the relay.
+    pub fn token(
+        &self,
+        who: &Identity,
+        publish: u8,
+        seconds: u64,
+    ) -> Result<String, moqom_token::Error> {
         let issued = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("a clock after the epoch")
             .as_secs();
-        let claims = serde_json::json!({
-            "iss": ISSUER,
-            "sub": who.user,
-            "aud": who.tenant,
-            "iat": issued,
-            "exp": issued + seconds,
-            "cnf": { "jkt": who.thumbprint },
-            "moqt": {
-                "room": who.room,
-                "pub": publish,
-                "cap": 0,
-                "own": false,
-                "bs": false,
+        let issued = i64::try_from(issued).expect("a representable clock");
+        self.signer.sign(&Claims {
+            iss: ISSUER.to_owned(),
+            sub: who.user.clone(),
+            tenant: who.tenant.clone(),
+            iat: issued,
+            exp: issued.saturating_add(i64::try_from(seconds).unwrap_or(i64::MAX)),
+            cnf: Confirmation {
+                jkt: who.thumbprint.clone(),
             },
-        });
-        let header = serde_json::json!({ "alg": "ML-DSA-65", "typ": "MOQT", "kid": KEY_ID });
-        self.sign(&header, &claims)
-    }
-
-    /// Compact JWS over `header` and `claims`.
-    fn sign(&self, header: &serde_json::Value, claims: &serde_json::Value) -> String {
-        let header = URL_SAFE_NO_PAD.encode(header.to_string());
-        let claims = URL_SAFE_NO_PAD.encode(claims.to_string());
-        let signing = format!("{header}.{claims}");
-        let mut signature = vec![0u8; ML_DSA_65_SIGNING.signature_len()];
-        let written = self
-            .pair
-            .sign(signing.as_bytes(), &mut signature)
-            .expect("ML-DSA-65 signs any message");
-        signature.truncate(written);
-        format!("{signing}.{}", URL_SAFE_NO_PAD.encode(&signature))
+            grant: Grant {
+                room: who.room.clone(),
+                publish,
+                ..Grant::default()
+            },
+            ..Claims::default()
+        })
     }
 }
 
@@ -256,19 +245,31 @@ mod tests {
     #[test]
     fn a_token_is_three_base64_parts_a_relay_can_split() {
         let who = Identity::publisher("acme", "room-42");
-        let token = mint().token(&who, 0b11, 600);
-        let parts: Vec<&str> = token.split('.').collect();
-        assert_eq!(parts.len(), 3);
-        let claims = URL_SAFE_NO_PAD.decode(parts[1]).expect("base64url claims");
-        let claims: serde_json::Value =
-            serde_json::from_slice(&claims).expect("the claims are JSON");
-        assert_eq!(claims["aud"], "acme");
-        assert_eq!(claims["sub"], "publisher");
-        assert_eq!(claims["moqt"]["room"], "room-42");
-        assert_eq!(claims["moqt"]["pub"], 0b11);
+        let token = mint()
+            .token(&who, 0b11, 600)
+            .expect("ten minutes is allowed");
+        let keys = moqom_token::PublicKey::parse_set(&mint().jwks()).expect("a key set");
+        let claims = moqom_token::Verifier::new(ISSUER, keys)
+            .verify(token.as_bytes(), std::time::SystemTime::now())
+            .expect("the relay's verifier accepts it");
+        assert_eq!(claims.tenant, "acme");
+        assert_eq!(claims.sub, "publisher");
+        assert_eq!(claims.grant.room, "room-42");
+        assert_eq!(claims.grant.publish, 0b11);
         assert_eq!(
-            claims["cnf"]["jkt"], who.thumbprint,
+            claims.cnf.jkt, who.thumbprint,
             "the token has to commit to the device its namespace names"
+        );
+    }
+
+    /// Longer than a relay accepts is refused here, where the flag was given,
+    /// rather than as an authentication failure at the relay.
+    #[test]
+    fn a_token_longer_than_a_relay_accepts_is_refused() {
+        let who = Identity::publisher("acme", "room-42");
+        assert_eq!(
+            mint().token(&who, 0, 3600),
+            Err(moqom_token::Error::Lifetime)
         );
     }
 

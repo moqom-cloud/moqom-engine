@@ -16,12 +16,12 @@
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
-use aws_lc_rs::signature::{KeyPair, ML_DSA_65_SIGNING, PqdsaKeyPair};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use moqom_client::{Credentials, DeviceKey, Session};
 use moqom_relay::possession::{Enforcement, Possession};
-use moqom_relay::{Authenticator, Cache, Fabric, Limits, Session as RelaySession, VerificationKey};
+use moqom_relay::{Authenticator, Cache, Fabric, Limits, Session as RelaySession};
+use moqom_token::{Claims, Confirmation, Grant, Signer};
 use moqom_transport::{Server, server::with_moqt_alpn};
 
 const PATIENCE: Duration = Duration::from_secs(10);
@@ -63,13 +63,7 @@ impl Relay {
         );
 
         // An empty issuer accepts any, which is what the relay's own harness does.
-        let authenticator = Authenticator::new(
-            "",
-            vec![VerificationKey::ml_dsa_65(
-                KEY_ID.to_owned(),
-                signer().public_key().as_ref().to_vec(),
-            )],
-        );
+        let authenticator = Authenticator::new("", vec![signer().public_key()]);
         let fabric = Fabric::with_cache(Cache::new(Limits::default()))
             .authenticated(authenticator)
             .proving(Possession::new(Enforcement::Required, Some(identity)));
@@ -105,8 +99,10 @@ impl Drop for Relay {
 
 /// The issuing key. A fixed seed, because what varies between these tests is the
 /// device key and not the issuer.
-fn signer() -> PqdsaKeyPair {
-    PqdsaKeyPair::from_seed(&ML_DSA_65_SIGNING, &[7u8; 32]).expect("a valid ML-DSA-65 seed")
+fn signer() -> Signer {
+    Signer::from_seed(&[7u8; 32])
+        .expect("a valid ML-DSA-65 seed")
+        .with_id(KEY_ID)
 }
 
 /// A token committed to `thumbprint`, shaped the way the control plane mints one.
@@ -114,29 +110,27 @@ fn token_bound_to(thumbprint: &str) -> Vec<u8> {
     let issued = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("after the epoch")
-        .as_secs();
-    let header = serde_json::json!({ "alg": "ML-DSA-65", "typ": "MOQT", "kid": KEY_ID });
-    let claims = serde_json::json!({
-        "iss": "https://api.moqom.cloud",
-        "sub": "ada",
-        "aud": "acme",
-        "iat": issued,
-        "exp": issued + 600,
-        "cnf": { "jkt": thumbprint },
-        "moqt": { "room": "room-42", "pub": 3, "cap": 0, "own": false, "bs": false },
-    });
-
-    let signing_input = format!(
-        "{}.{}",
-        URL_SAFE_NO_PAD.encode(header.to_string()),
-        URL_SAFE_NO_PAD.encode(claims.to_string())
-    );
-    let mut signature = vec![0u8; ML_DSA_65_SIGNING.signature_len()];
-    let written = signer()
-        .sign(signing_input.as_bytes(), &mut signature)
-        .expect("ML-DSA-65 signs");
-    signature.truncate(written);
-    format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(&signature)).into_bytes()
+        .as_secs()
+        .cast_signed();
+    signer()
+        .sign(&Claims {
+            iss: "https://api.moqom.cloud".to_owned(),
+            sub: "ada".to_owned(),
+            tenant: "acme".to_owned(),
+            iat: issued,
+            exp: issued + 600,
+            cnf: Confirmation {
+                jkt: thumbprint.to_owned(),
+            },
+            grant: Grant {
+                room: "room-42".to_owned(),
+                publish: 3,
+                ..Grant::default()
+            },
+            ..Claims::default()
+        })
+        .expect("a complete ten-minute token")
+        .into_bytes()
 }
 
 async fn within<F: Future>(what: &str, future: F) -> F::Output {

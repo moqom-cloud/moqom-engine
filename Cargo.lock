@@ -1046,14 +1046,15 @@ dependencies = [
  "aws-lc-rs",
  "base64",
  "bytes",
+ "moqom-proof",
  "moqom-proto",
  "moqom-relay",
+ "moqom-token",
  "moqom-transport",
  "quinn",
  "quinn-proto",
  "rcgen",
  "rustls",
- "serde_json",
  "socket2",
  "thiserror 2.0.19",
  "tokio",
@@ -1083,6 +1084,7 @@ dependencies = [
  "clap",
  "moqom-client",
  "moqom-media",
+ "moqom-token",
  "serde_json",
  "thiserror 2.0.19",
  "tokio",
@@ -1094,6 +1096,17 @@ version = "0.0.0"
 dependencies = [
  "bytes",
  "clap",
+]
+
+[[package]]
+name = "moqom-proof"
+version = "0.1.0"
+dependencies = [
+ "aws-lc-rs",
+ "base64",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
 ]
 
 [[package]]
@@ -1135,6 +1148,7 @@ dependencies = [
  "moqom-client",
  "moqom-proto",
  "moqom-relay",
+ "moqom-token",
  "moqom-transport",
  "prost",
  "prost-types",
@@ -1171,7 +1185,9 @@ dependencies = [
  "hyper-util",
  "libc",
  "moqom-client",
+ "moqom-proof",
  "moqom-proto",
+ "moqom-token",
  "moqom-transport",
  "prost",
  "prost-types",
@@ -1193,6 +1209,17 @@ dependencies = [
  "url",
  "web-transport-quinn",
  "webpki-roots 0.26.11",
+]
+
+[[package]]
+name = "moqom-token"
+version = "0.1.0"
+dependencies = [
+ "aws-lc-rs",
+ "base64",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
 ]
 
 [[package]]

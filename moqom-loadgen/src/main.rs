@@ -86,13 +86,13 @@ use crate::scrape::Reading;
 /// rather than an oversight.
 const SEED: [u8; 32] = [0x6d; 32];
 
-/// How long a minted token lasts.
+/// How long a minted token lasts: the fifteen minutes a relay accepts at most.
 ///
-/// Comfortably longer than a run, because a session whose credential lapses is
-/// closed by the relay and would appear in the results as a subscriber that
-/// stopped receiving — which is a real behaviour, correctly implemented, and
-/// nothing to do with fan-out.
-const TOKEN_SECONDS: u64 = 3600;
+/// As long as allowed, because a session whose credential lapses is closed by
+/// the relay and would appear in the results as a subscriber that stopped
+/// receiving — which is a real behaviour, correctly implemented, and nothing to
+/// do with fan-out. A run longer than this measures that instead.
+const TOKEN_SECONDS: u64 = moqom_token::MAX_LIFETIME.as_secs();
 
 /// How long to wait for every subscriber to be watching before publishing.
 ///
@@ -185,10 +185,11 @@ struct TokenArgs {
 
     /// How long it lasts, in seconds.
     ///
-    /// Generous by default, because an edge holds one for the life of the process
-    /// and a link that drops mid-run because a token expired looks exactly like the
-    /// tiering not working.
-    #[arg(long, default_value_t = 3600)]
+    /// The fifteen-minute maximum by default, because an edge holds one for the
+    /// life of the process and a link that drops mid-run because a token expired
+    /// looks exactly like the tiering not working. Longer is refused: no relay
+    /// accepts it.
+    #[arg(long, default_value_t = TOKEN_SECONDS)]
     seconds: u64,
 
     /// Where to write the PKCS#8 device key the token is bound to.
@@ -440,7 +441,7 @@ async fn run() -> Fallible<bool> {
             // compromised edge inject tracks into the fleet.
             let who = Identity::relay(&args.tenant, &args.room);
             std::fs::write(&args.key, Identity::pkcs8(&who.user))?;
-            println!("{}", mint.token(&who, 0, args.seconds));
+            println!("{}", mint.token(&who, 0, args.seconds)?);
             Ok(true)
         }
         Command::Fanout(args) => fanout(&args).await,
@@ -476,7 +477,7 @@ async fn fanout(args: &FanoutArgs) -> Fallible<bool> {
     // fan-out deduplication as missing.
     let before = read_metrics(args.common.metrics.as_deref()).await;
 
-    let token = mint.token(&publisher, 0b11, TOKEN_SECONDS);
+    let token = mint.token(&publisher, 0b11, TOKEN_SECONDS)?;
     let mut session = connect(
         addr,
         &server_name,
@@ -552,7 +553,7 @@ async fn publish_only(args: &PublishArgs) -> Fallible<bool> {
     // the growth is measured over.
     let before = read_metrics(args.common.metrics.as_deref()).await;
 
-    let token = mint.token(&publisher, 0b11, TOKEN_SECONDS);
+    let token = mint.token(&publisher, 0b11, TOKEN_SECONDS)?;
     let mut session = connect(
         addr,
         &server_name,
@@ -700,7 +701,9 @@ fn gather(
 
     for n in 0..crowd.subscribers {
         let who = Identity::viewer(&common.tenant, &common.room, crowd.first_viewer + n);
-        let token = mint.token(&who, 0, TOKEN_SECONDS);
+        let token = mint
+            .token(&who, 0, TOKEN_SECONDS)
+            .expect("TOKEN_SECONDS is within the lifetime a token may have");
         watchers.push(tokio::spawn(watch_track(
             Watching {
                 addr,

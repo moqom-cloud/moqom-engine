@@ -53,6 +53,11 @@ tokio = { version = "1", default-features = false }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "env-filter"] }
 aws-lc-rs = "1"
+# The security libraries, from a sibling checkout until they are published.
+moqom-token = { path = "../moqom-security/rust/moqom-token" }
+moqom-proof = { path = "../moqom-security/rust/moqom-proof" }
+moqom-sframe = { path = "../moqom-security/rust/moqom-sframe" }
+moqom-mls = { path = "../moqom-security/rust/moqom-mls" }
 base64 = "0.22"
 rcgen = "0.14"
 rustls-pemfile = "2"

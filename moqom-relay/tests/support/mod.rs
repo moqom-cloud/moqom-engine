@@ -1893,8 +1893,12 @@ pub mod tokens {
             let header = format!(
                 r#"{{"alg":"ES256","typ":"MOQT-POP","jwk":{{"kty":"EC","crv":"P-256","x":"{x}","y":"{y}"}}}}"#
             );
+            let iat = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("after 1970")
+                .as_secs();
             let claims = format!(
-                r#"{{"ath":"{}","jti":"{id}","rel":"{relay}"}}"#,
+                r#"{{"ath":"{}","iat":{iat},"jti":"{id}","rel":"{relay}"}}"#,
                 sha256(token.as_bytes())
             );
             let signing = format!(

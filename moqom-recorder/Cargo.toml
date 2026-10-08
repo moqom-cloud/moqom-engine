@@ -51,6 +51,7 @@ tonic-prost-build = "0.14"
 
 [dev-dependencies]
 moqom-relay = { path = "../moqom-relay" }
+moqom-token = { workspace = true }
 moqom-transport = { path = "../moqom-transport" }
 aws-lc-rs = { workspace = true }
 quinn = { workspace = true }

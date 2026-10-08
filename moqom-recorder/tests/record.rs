@@ -13,7 +13,6 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use aws_lc_rs::signature::{KeyPair, ML_DSA_65_SIGNING, PqdsaKeyPair};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bytes::{Buf, Bytes, BytesMut};
@@ -32,9 +31,8 @@ use moqom_recorder::manifest::{ArtifactKind, Join, JoinFrom, Manifest};
 use moqom_recorder::store::{LocalDir, Store};
 use moqom_recorder::{Recorder, RecorderConfig};
 use moqom_relay::possession::{Enforcement, Possession};
-use moqom_relay::{
-    Authenticator, Cache, Fabric, Limits, Rules, Session as RelaySession, VerificationKey,
-};
+use moqom_relay::{Authenticator, Cache, Fabric, Limits, Rules, Session as RelaySession};
+use moqom_token::{Claims, Confirmation, Grant, Signer};
 use moqom_transport::{Server, alpn, server::with_moqt_alpn};
 use tokio::sync::{mpsc, watch};
 use web_transport_quinn::{RecvStream, SendStream};
@@ -63,36 +61,36 @@ async fn within<F: Future>(what: &str, future: F) -> F::Output {
         .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
 }
 
-fn signer() -> PqdsaKeyPair {
-    PqdsaKeyPair::from_seed(&ML_DSA_65_SIGNING, &[9u8; 32]).expect("a valid ML-DSA-65 seed")
+fn signer() -> Signer {
+    Signer::from_seed(&[9u8; 32])
+        .expect("a valid ML-DSA-65 seed")
+        .with_id(KEY_ID)
 }
 
-fn token(subject: &str, thumbprint: &str, publish: u32) -> String {
+fn token(subject: &str, thumbprint: &str, publish: u8) -> String {
     let issued = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("after the epoch")
-        .as_secs();
-    let header = serde_json::json!({ "alg": "ML-DSA-65", "typ": "MOQT", "kid": KEY_ID });
-    let claims = serde_json::json!({
-        "iss": "https://api.moqom.cloud",
-        "sub": subject,
-        "aud": TENANT,
-        "iat": issued,
-        "exp": issued + 600,
-        "cnf": { "jkt": thumbprint },
-        "moqt": { "room": ROOM, "pub": publish, "cap": 0, "own": false, "bs": false },
-    });
-    let input = format!(
-        "{}.{}",
-        URL_SAFE_NO_PAD.encode(header.to_string()),
-        URL_SAFE_NO_PAD.encode(claims.to_string())
-    );
-    let mut signature = vec![0u8; ML_DSA_65_SIGNING.signature_len()];
-    let written = signer()
-        .sign(input.as_bytes(), &mut signature)
-        .expect("ML-DSA-65 signs");
-    signature.truncate(written);
-    format!("{input}.{}", URL_SAFE_NO_PAD.encode(&signature))
+        .as_secs()
+        .cast_signed();
+    signer()
+        .sign(&Claims {
+            iss: "https://api.moqom.cloud".to_owned(),
+            sub: subject.to_owned(),
+            tenant: TENANT.to_owned(),
+            iat: issued,
+            exp: issued + 600,
+            cnf: Confirmation {
+                jkt: thumbprint.to_owned(),
+            },
+            grant: Grant {
+                room: ROOM.to_owned(),
+                publish,
+                ..Grant::default()
+            },
+            ..Claims::default()
+        })
+        .expect("a complete ten-minute token")
 }
 
 struct Relay {
@@ -134,13 +132,7 @@ fn relay_with(limits: Limits, ceiling: u32) -> Relay {
         aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, certificate.as_ref()).as_ref(),
     );
     let fabric = Fabric::with_cache(Cache::new(limits))
-        .authenticated(Authenticator::new(
-            "",
-            vec![VerificationKey::ml_dsa_65(
-                KEY_ID.to_owned(),
-                signer().public_key().as_ref().to_vec(),
-            )],
-        ))
+        .authenticated(Authenticator::new("", vec![signer().public_key()]))
         .proving(Possession::new(Enforcement::Required, Some(identity)));
     if ceiling > 0 {
         fabric.policy().describe(

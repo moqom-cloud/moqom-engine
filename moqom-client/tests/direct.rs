@@ -13,9 +13,6 @@
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::{Duration, SystemTime};
 
-use aws_lc_rs::signature::{KeyPair, ML_DSA_65_SIGNING, PqdsaKeyPair};
-use base64::Engine as _;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bytes::Bytes;
 use moqom_client::direct::{
     CandidateOffer, DirectConfig, DirectEndpoint, DualSubscription, Eligibility, IpExposure, Path,
@@ -26,7 +23,8 @@ use moqom_client::{
     TrackNamespace,
 };
 use moqom_relay::direct::PeerCheck;
-use moqom_relay::{Authenticator, Cache, Fabric, Limits, Session as RelaySession, VerificationKey};
+use moqom_relay::{Authenticator, Cache, Fabric, Limits, Session as RelaySession};
+use moqom_token::{Claims, Confirmation, Grant, Signer};
 use moqom_transport::{Server, server::with_moqt_alpn};
 
 const PATIENCE: Duration = Duration::from_secs(10);
@@ -48,48 +46,43 @@ async fn within<F: Future>(what: &str, future: F) -> F::Output {
         .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
 }
 
-fn signer() -> PqdsaKeyPair {
-    PqdsaKeyPair::from_seed(&ML_DSA_65_SIGNING, &[7u8; 32]).expect("a valid ML-DSA-65 seed")
+fn signer() -> Signer {
+    Signer::from_seed(&[7u8; 32])
+        .expect("a valid ML-DSA-65 seed")
+        .with_id(KEY_ID)
 }
 
 fn authenticator() -> Authenticator {
-    Authenticator::new(
-        "",
-        vec![VerificationKey::ml_dsa_65(
-            KEY_ID.to_owned(),
-            signer().public_key().as_ref().to_vec(),
-        )],
-    )
+    Authenticator::new("", vec![signer().public_key()])
 }
 
 /// A token for `user` in `room`, bound to `key`, minted the way the control
 /// plane mints one. `publish` is the media-kind bitmask; zero is a viewer.
 fn token(user: &str, room: &str, key: &DeviceKey, publish: u32) -> Vec<u8> {
-    let issued = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
+    let issued = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
         .expect("after the epoch")
-        .as_secs();
-    let header = serde_json::json!({ "alg": "ML-DSA-65", "typ": "MOQT", "kid": KEY_ID });
-    let claims = serde_json::json!({
-        "iss": "https://api.moqom.cloud",
-        "sub": user,
-        "aud": TENANT,
-        "iat": issued,
-        "exp": issued + 600,
-        "cnf": { "jkt": key.thumbprint() },
-        "moqt": { "room": room, "pub": publish, "cap": 0, "own": false, "bs": false },
-    });
-    let signing_input = format!(
-        "{}.{}",
-        URL_SAFE_NO_PAD.encode(header.to_string()),
-        URL_SAFE_NO_PAD.encode(claims.to_string())
-    );
-    let mut signature = vec![0u8; ML_DSA_65_SIGNING.signature_len()];
-    let written = signer()
-        .sign(signing_input.as_bytes(), &mut signature)
-        .expect("ML-DSA-65 signs");
-    signature.truncate(written);
-    format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(&signature)).into_bytes()
+        .as_secs()
+        .cast_signed();
+    signer()
+        .sign(&Claims {
+            iss: "https://api.moqom.cloud".to_owned(),
+            sub: user.to_owned(),
+            tenant: TENANT.to_owned(),
+            iat: issued,
+            exp: issued + 600,
+            cnf: Confirmation {
+                jkt: key.thumbprint(),
+            },
+            grant: Grant {
+                room: room.to_owned(),
+                publish: u8::try_from(publish).expect("a media-kind bitmask"),
+                ..Grant::default()
+            },
+            ..Claims::default()
+        })
+        .expect("a complete ten-minute token")
+        .into_bytes()
 }
 
 /// `user/device`, with the device derived from the key the way the relay does.
