@@ -32,12 +32,14 @@ rcgen = { workspace = true }
 # Direct paths: turning `IPV6_V6ONLY` off before the bind, for one dual-stack socket. Already in
 # the tree beneath quinn-udp and moqom-transport.
 socket2 = { workspace = true }
+# Direct tickets: the relay's ticket objects are JSON, and a peer's ticket is checked against the
+# relay's ticket keys the way a token is checked against token keys.
+moqom-token = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 moqom-relay = { path = "../moqom-relay" }
-# Minting tokens with the claim shape the Go control plane produces, through the
-# library it mints with, so a typo cannot read as a verification bug.
-moqom-token = { workspace = true }
 # Adds the negotiated key exchange group to quinn's handshake data, which is how the post-quantum
 # tests read it. Unlike quinn's feature of the same name this one does not also switch on rustls's
 # post-quantum preference, so the tests see what the build itself chose.

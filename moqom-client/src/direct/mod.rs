@@ -18,17 +18,25 @@
 //!    [`PeerVerifier`] before a single object moves.
 //! 6. Read media through a [`DualSubscription`], which keeps the relay
 //!    subscription open as the fallback, moves to the direct path once it has
-//!    delivered for a while, and returns to the relay without a gap when the
-//!    direct path stalls or closes.
+//!    delivered for a while, pauses the relay copy, and resumes it and returns
+//!    to the relay when the direct path stalls or closes.
+//!
+//! [`DirectRoom`] does all of that for a room, as `MoqomKit`'s room does: given
+//! who is in the room and the key, it opts in under [`DirectPolicy`] and the
+//! room's grant, exchanges the offers, holds each peer to direct tickets from
+//! its relay, and copies publications and attaches subscriptions as paths come
+//! and go. The steps are public for a caller that wants them one at a time.
 //!
 //! # What the relay still does
 //!
 //! Admission, tokens, keys, room state, and every participant this room has
-//! beyond the direct pair. The relay subscription stays open throughout, so the
-//! relay keeps forwarding the same objects while the direct path is in use. That
-//! is what makes falling back gapless, and it is also why a direct path does not
-//! yet save relay egress: pausing the relay copy needs the relay to honour a
-//! paused subscription, which it does not do yet.
+//! beyond the direct pair. The relay subscription stays open throughout, paused
+//! while the direct path is in use (`FORWARD` 0 in a `REQUEST_UPDATE`), so the
+//! relay stops sending this device what the peer is already sending it. Falling
+//! back resumes it, which costs a short gap for the objects in flight, and a
+//! direct path that goes quiet while the relay is paused has the relay resumed
+//! after [`PathSettings::quiet`] in case the silence is the path's and not the
+//! publisher's.
 //!
 //! # Only the socket
 //!
@@ -42,14 +50,21 @@ mod link;
 mod offer;
 mod path;
 mod punch;
+mod room;
 pub mod socket;
 pub mod stun;
+mod ticket;
 mod verify;
 
 pub use link::{DirectConfig, DirectEndpoint};
 pub use offer::{CandidateOffer, RoomSecret};
 pub use path::{Delivery, DualSubscription, Path, PathSettings};
+pub use room::{
+    DirectRoom, DirectRoomConfig, Fallback, OFFERS_TRACK, PathState, RoomCredentials,
+    RoomPublication, RoomSubscription, RoomView,
+};
 pub use socket::StunServer;
+pub use ticket::{DirectTicket, TICKET_TYPE, TicketRefusal, TicketSettings, verify_ticket};
 pub use verify::{PeerCredentials, PeerVerifier, VerifiedPeer};
 
 /// The most participants a room may have and still use direct paths.
