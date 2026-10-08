@@ -5,7 +5,7 @@
 //! that connect in genuinely different ways, reaching one listener, and the
 //! server code handling them identically once the handshake is done.
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
 use moqom_transport::{Carrier, Dialect, Server, alpn};
@@ -189,4 +189,39 @@ async fn an_unoffered_alpn_never_connects() {
         .await;
 
     assert!(result.is_err(), "the retired ALPN must not connect");
+}
+
+/// A relay bound to `[::]` behind a dual-stack load balancer must still answer
+/// IPv4 clients, as mapped addresses, on the same socket.
+#[tokio::test]
+async fn a_dual_stack_wildcard_answers_ipv4_clients() {
+    let (cert, key) = self_signed();
+    let server = Server::bind(
+        SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
+        server_tls(cert.clone(), key),
+    )
+    .unwrap();
+    let port = server.local_addr().unwrap().port();
+
+    let serving = tokio::spawn(serve_one(server));
+
+    let endpoint = client_endpoint();
+    let conn = endpoint
+        .connect_with(
+            client_config(&cert, alpn::MOQT_DRAFT_19),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+            "localhost",
+        )
+        .unwrap()
+        .await
+        .unwrap();
+    let session = Session::raw(
+        conn,
+        ConnectRequest::new(url::Url::parse("https://localhost/").unwrap()),
+        ConnectResponse::OK,
+    );
+    assert_eq!(round_trip(&session, b"over ipv4").await, b"over ipv4");
+    session.close(0, b"done");
+
+    assert_eq!(serving.await.unwrap().carrier, Carrier::Quic);
 }

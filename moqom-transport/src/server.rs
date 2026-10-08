@@ -202,7 +202,7 @@ impl Server {
         dscp: Option<u8>,
         share_port: bool,
     ) -> io::Result<quinn::Endpoint> {
-        if dscp.is_none() && !share_port {
+        if dscp.is_none() && !share_port && addr.is_ipv4() {
             return quinn::Endpoint::server(config, addr);
         }
 
@@ -220,12 +220,20 @@ impl Server {
         if share_port {
             socket.set_reuse_port(true)?;
         }
+        if addr.is_ipv6() {
+            // A wildcard `[::]` serves IPv4 clients as mapped addresses only with this off, and
+            // the platform default is not something a deployment should depend on.
+            socket.set_only_v6(false)?;
+        }
         if let Some(dscp) = dscp {
             // Shifted into the top six bits: the value names a codepoint, and the two bits below
             // it are ECN's, which belong to the transport.
             let tos = u32::from(dscp) << 2;
             if addr.is_ipv6() {
                 set_tclass_v6(&socket, tos)?;
+                // IPv4 clients of a dual-stack socket are marked by IP_TOS, not the traffic
+                // class. Platforms that refuse it on an IPv6 socket still mark IPv6.
+                let _ = socket.set_tos_v4(tos);
             } else {
                 socket.set_tos_v4(tos)?;
             }
