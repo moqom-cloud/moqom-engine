@@ -6,8 +6,8 @@ rust-version.workspace = true
 authors.workspace = true
 repository.workspace = true
 publish = false
-# BUSL-1.1: the relay is the service half of the licence split. See LICENSING.md.
-license = "BUSL-1.1"
+# Proprietary: the relay is the service half of the licence split. See LICENSING.md.
+license = "LicenseRef-MOQOM-Proprietary"
 description = "A MOQT relay: session state, subscription matching, and fan-out"
 
 [dependencies]

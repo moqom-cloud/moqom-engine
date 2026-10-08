@@ -6,10 +6,10 @@ rust-version.workspace = true
 authors.workspace = true
 repository.workspace = true
 publish = false
-# BUSL-1.1: the hosted recorder is a service, on the relay's side of the licence
+# Proprietary: the hosted recorder is a service, on the relay's side of the licence
 # split. See LICENSING.md. What it writes is documented in docs/RECORDING.md so a
 # customer can read their own files without linking this.
-license = "BUSL-1.1"
+license = "LicenseRef-MOQOM-Proprietary"
 description = "A hosted MOQT recorder: joins a room as a recording watchdog and archives what it receives"
 
 [dependencies]

@@ -22,8 +22,8 @@ end-to-end encryption our decisions instead of someone else's.
 | `moqom-cli` | Apache-2.0 | The `moqom` binary: `subscribe`, `publish` and `cloudflare sub`, using only `moqom-client` |
 | `moqom-media` | Apache-2.0 | Framing coded video into MOQOM objects, shared by the CLI and the load generator |
 | `moqom-loadgen` | Apache-2.0 | Load generation and relay measurement |
-| `moqom-relay` | BUSL-1.1 | The relay: announcement, subscription, fan-out, retention, authorisation, usage metering, direct tickets |
-| `moqom-recorder` | BUSL-1.1 | The hosted recorder: joins as a subscribe-only viewer and writes what it receives |
+| `moqom-relay` | Proprietary | The relay: announcement, subscription, fan-out, retention, authorisation, usage metering, direct tickets |
+| `moqom-recorder` | Proprietary | The hosted recorder: joins as a subscribe-only viewer and writes what it receives |
 | `fuzz` | Apache-2.0 | Coverage-guided harnesses for the decoders |
 
 Two licences in one workspace is deliberate and [LICENSING.md](LICENSING.md)

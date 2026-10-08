@@ -1,0 +1,29 @@
+MOQOM Proprietary License
+
+Copyright 2026 Elliott Wave LLC. All rights reserved.
+
+This software, including its source code, object code, documentation and any
+derivative of them (the "Software"), is the confidential and proprietary
+property of Elliott Wave LLC and is protected by copyright, trade secret and
+patent law. Patents pending.
+
+No licence or other right in the Software is granted by possession, by access,
+or by implication, estoppel or otherwise. The Software may be used only under,
+and within the scope of, a separate written agreement signed by Elliott Wave
+LLC (for example a MOQOM Cloud or self-hosted (BYOC) licence), and only in the
+form Elliott Wave LLC provides under that agreement.
+
+Unless that agreement expressly permits it, you may not copy, modify, adapt,
+translate, distribute, sublicense, rent, lease or disclose the Software; reverse
+engineer, decompile or disassemble it, or attempt to derive its source code,
+except to the extent applicable law expressly permits despite this limitation;
+or use it to provide a hosted, managed or relay service to third parties.
+
+If you have received the Software, or any part of its source code, without
+such an agreement, you have no right to use it: delete every copy and notify
+legal@moqom.cloud.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXCEPT AS
+EXPRESSLY STATED IN A SIGNED AGREEMENT WITH ELLIOTT WAVE LLC.
+
+Licensing enquiries: legal@moqom.cloud

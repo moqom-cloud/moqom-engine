@@ -4,7 +4,8 @@ Copyright 2026 Elliott Wave LLC. All rights reserved except as licensed below.
 Each crate carries its own licence, declared in its Cargo.toml `license` field
 and mapped in LICENSING.md: Apache-2.0 for the protocol, transport, client,
 media, CLI, load generator and fuzz harness; MIT for moqom-rans and
-moqom-rans-ffi; BUSL-1.1 for moqom-relay. Full texts are in LICENSES/.
+moqom-rans-ffi; proprietary (LicenseRef-MOQOM-Proprietary) for moqom-relay and
+moqom-recorder, which are confidential. Full texts are in LICENSES/.
 
 "MOQOM" and the MOQOM logo are trademarks of Elliott Wave LLC.
 
