@@ -30,12 +30,12 @@
 //! rejecting earlier anyway.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use moqom_proto::control::{DoneReason, RequestErrorCode};
 use moqom_proto::model::{FullTrackName, TrackAlias, TrackNamespace};
-use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 
 use crate::cache::Cache;
 use crate::clock;
@@ -46,6 +46,9 @@ use crate::policy::{Policy, Silence};
 use crate::possession::Possession;
 use crate::quota::Governor;
 use crate::roster::Roster;
+use crate::scope::Ceiling;
+use crate::ticket::TicketKeys;
+use crate::usage::{Meter, Usage};
 
 /// Identifies a session within one relay process.
 ///
@@ -64,6 +67,11 @@ impl SessionId {
     #[must_use]
     pub const fn number(self) -> u64 {
         self.0
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_tests(number: u64) -> Self {
+        Self(number)
     }
 }
 
@@ -139,6 +147,59 @@ pub struct Route {
     /// reason a count is needed at all rather than an assumption that the last
     /// one seen was the last one sent.
     pub streams: Arc<AtomicU64>,
+    /// Where the bytes written to this subscriber are billed, if anywhere.
+    ///
+    /// Carried on the route so the writer bumps an atomic it already holds,
+    /// rather than looking the subscriber up per chunk on the media path.
+    pub meter: Option<Arc<Meter>>,
+    /// Whether the subscriber wants objects, from the FORWARD parameter of its
+    /// latest `REQUEST_UPDATE`.
+    ///
+    /// Read once per subgroup, because subgroups are what is forwarded: a pause
+    /// lets the subgroup in flight finish and a resume starts at the next one.
+    pub forward: Arc<AtomicBool>,
+    /// The draft the subscriber's session speaks, which is what the subgroup
+    /// streams to it are written in. When it differs from the publisher's,
+    /// the fan-out re-encodes instead of copying.
+    pub draft: moqom_proto::Draft,
+    /// The groups the subscriber's Location filter admits, if it narrowed
+    /// them. Read once per subgroup, like [`Self::forward`].
+    pub window: Arc<Mutex<GroupWindow>>,
+    /// Where the publisher's `PUBLISH_STATE_NOTIFY` parameters go, for a
+    /// subscriber whose draft has that message.
+    pub notices: Option<mpsc::UnboundedSender<moqom_proto::control::Parameters>>,
+}
+
+/// The groups a subscription's Location filter admits.
+///
+/// Subgroups are what the fan-out forwards, so this is applied a group at a
+/// time: a filter ending mid-group delivers that whole group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GroupWindow {
+    /// The first group admitted.
+    pub first: u64,
+    /// The last group admitted, or `None` for an open end.
+    pub last: Option<u64>,
+}
+
+impl GroupWindow {
+    /// Every group.
+    pub const ALL: Self = Self {
+        first: 0,
+        last: None,
+    };
+
+    /// Whether objects of `group` are delivered.
+    #[must_use]
+    pub fn admits(self, group: u64) -> bool {
+        group >= self.first && self.last.is_none_or(|last| group <= last)
+    }
+
+    /// Whether every group from `group` on is past the end.
+    #[must_use]
+    pub fn ended_by(self, group: u64) -> bool {
+        self.last.is_some_and(|last| group > last)
+    }
 }
 
 impl Route {
@@ -150,12 +211,45 @@ impl Route {
         alias: TrackAlias,
     ) -> Self {
         Self {
+            draft: crate::session::draft_of(&session),
             session,
             subscriber,
             alias,
             done: Arc::new(Notify::new()),
             streams: Arc::new(AtomicU64::new(0)),
+            meter: None,
+            forward: Arc::new(AtomicBool::new(true)),
+            window: Arc::new(Mutex::new(GroupWindow::ALL)),
+            notices: None,
         }
+    }
+
+    /// The same route, passing the publisher's state notifications to
+    /// `notices`.
+    #[must_use]
+    pub fn notifying(
+        self,
+        notices: mpsc::UnboundedSender<moqom_proto::control::Parameters>,
+    ) -> Self {
+        Self {
+            notices: Some(notices),
+            ..self
+        }
+    }
+
+    /// The groups currently admitted.
+    #[must_use]
+    pub fn window(&self) -> GroupWindow {
+        *self
+            .window
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The same route, billing what it carries to `meter`.
+    #[must_use]
+    pub fn metered(self, meter: Option<Arc<Meter>>) -> Self {
+        Self { meter, ..self }
     }
 }
 
@@ -168,6 +262,16 @@ impl std::fmt::Debug for Route {
             .field("alias", &self.alias)
             .finish_non_exhaustive()
     }
+}
+
+/// The records an upstream FETCH produced.
+#[derive(Debug, Default)]
+pub struct Upstreamed {
+    /// In stream order, as far as they arrived.
+    pub records: Vec<moqom_proto::data::FetchRecord>,
+    /// Whether the stream finished: `false` if the deadline cut it short or
+    /// the peer refused or reset it.
+    pub complete: bool,
 }
 
 /// Something one session asks another to do.
@@ -200,6 +304,22 @@ pub enum Command {
         /// Completed once upstream has answered.
         ready: oneshot::Sender<Result<Pulling, UpstreamError>>,
     },
+    /// FETCH a range of `track` from this session's peer, on behalf of a
+    /// draft-22 request this relay cannot answer from its cache alone
+    /// (draft-22 §3.2.3).
+    Fetch {
+        /// The track.
+        track: FullTrackName,
+        /// The first location wanted.
+        start: moqom_proto::model::Location,
+        /// The last location wanted, inclusive, or `None` for as far as the
+        /// peer has.
+        end: Option<moqom_proto::model::Location>,
+        /// When the requester stops waiting: its Fill Timeout.
+        deadline: tokio::time::Instant,
+        /// What arrived by then.
+        reply: oneshot::Sender<Upstreamed>,
+    },
     /// A subscriber has gone. Stop routing this track to it, and stop pulling
     /// the track altogether if it was the last one watching.
     ///
@@ -230,6 +350,16 @@ pub enum Command {
         /// that arrives twice must land twice identically, and a delta cannot
         /// promise that.
         silence: Silence,
+    },
+    /// A moderator has narrowed what this session may hold.
+    ///
+    /// Through the command channel for the reason a mute is: narrowing means
+    /// withdrawing the session's own announcements and ending its own
+    /// subscriptions, which only its own tasks can do.
+    Regrant {
+        /// The most the session may now hold. Absolute, like a mute, so that a
+        /// repeated directive lands identically.
+        ceiling: Ceiling,
     },
 }
 
@@ -305,7 +435,67 @@ struct State {
     /// announcement: nothing has said the parent holds any particular track. It is
     /// somewhere to ask, tried only when nothing here holds what was asked for.
     upstream: Option<mpsc::Sender<Command>>,
+    /// Where to ask for a per-room link, if this relay links per room. See
+    /// [`Fabric::link_rooms`].
+    linker: Option<mpsc::UnboundedSender<RoomKey>>,
+    /// The per-room links to the parent, each as its link task last said.
+    links: HashMap<RoomKey, watch::Sender<LinkState>>,
 }
+
+/// The room a namespace belongs to, which is what an edge holds one link for.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RoomKey {
+    /// The customer.
+    pub tenant: String,
+    /// The room.
+    pub room: String,
+}
+
+impl RoomKey {
+    /// The room `namespace` sits in: `(tenant, "r" or "bs", room, ...)`.
+    ///
+    /// `None` for anything else, a personal channel included, which no
+    /// per-room link can carry.
+    #[must_use]
+    pub fn of(namespace: &TrackNamespace) -> Option<Self> {
+        match namespace.fields() {
+            [tenant, marker, room, ..] if marker.as_ref() == b"r" || marker.as_ref() == b"bs" => {
+                Some(Self {
+                    tenant: std::str::from_utf8(tenant).ok()?.to_owned(),
+                    room: std::str::from_utf8(room).ok()?.to_owned(),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// The room's own namespace, `(tenant, "r", room)`.
+    #[must_use]
+    pub fn namespace(&self) -> Option<TrackNamespace> {
+        TrackNamespace::from_parts([self.tenant.as_str(), "r", self.room.as_str()]).ok()
+    }
+}
+
+impl std::fmt::Display for RoomKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.tenant, self.room)
+    }
+}
+
+/// Where one room's link to the parent stands.
+#[derive(Debug, Clone)]
+pub enum LinkState {
+    /// Being established, or re-established after it dropped.
+    Connecting,
+    /// Up, and reached through this.
+    Up(mpsc::Sender<Command>),
+    /// The control plane will not issue a credential for the room, so there is
+    /// no link to wait for.
+    Refused,
+}
+
+/// How long a subscription waits for its room's link to come up.
+const LINK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The state shared between every session on one relay.
 ///
@@ -356,6 +546,24 @@ pub struct Fabric {
     roster: Roster,
     /// What the control plane has said about the rooms this relay serves.
     policy: Policy,
+    /// What each session is billed for, and whether billing admits new ones.
+    usage: Usage,
+    /// The keys direct tickets are signed with, and how often they are
+    /// reissued. `None` issues none, so no participant here can hold a direct
+    /// path a peer will keep.
+    tickets: Option<Ticketing>,
+    /// `MAX_HOP_LIMIT`: the budget a request with none starts with, and the
+    /// most this relay honours on a request that names one.
+    hop_limit: u64,
+}
+
+/// How a relay issues direct tickets. See [`crate::ticket`].
+#[derive(Clone, Debug)]
+pub struct Ticketing {
+    /// What tickets are signed with and verified against.
+    pub keys: Arc<TicketKeys>,
+    /// How often a ticket is reissued while its subscription is open.
+    pub renew: std::time::Duration,
 }
 
 /// Defaults that limit nothing and verify nothing.
@@ -374,10 +582,16 @@ impl Default for Fabric {
             metrics: Metrics::default(),
             governor: Governor::disabled(),
             authenticator: Authenticator::disabled(),
-            possession: Arc::new(Possession::bearer()),
+            possession: Arc::new(Possession::new(
+                crate::possession::Enforcement::Required,
+                None,
+            )),
             clock: Arc::default(),
             roster: Roster::new(),
             policy: Policy::new(),
+            usage: Usage::disabled(),
+            tickets: None,
+            hop_limit: crate::hops::BUDGET,
         }
     }
 }
@@ -441,6 +655,45 @@ impl Fabric {
             possession: Arc::new(possession),
             ..self
         }
+    }
+
+    /// The same fabric, metering every session's usage into `usage`.
+    #[must_use]
+    pub fn metered(self, usage: Usage) -> Self {
+        Self { usage, ..self }
+    }
+
+    /// What sessions are billed for.
+    #[must_use]
+    pub const fn usage(&self) -> &Usage {
+        &self.usage
+    }
+
+    /// The same fabric, issuing direct tickets.
+    #[must_use]
+    pub fn ticketing(self, tickets: Ticketing) -> Self {
+        Self {
+            tickets: Some(tickets),
+            ..self
+        }
+    }
+
+    /// The same fabric, forwarding a request through at most `hop_limit` relays.
+    #[must_use]
+    pub fn with_hop_limit(self, hop_limit: u64) -> Self {
+        Self { hop_limit, ..self }
+    }
+
+    /// `MAX_HOP_LIMIT` for this relay. See [`crate::hops`].
+    #[must_use]
+    pub const fn hop_limit(&self) -> u64 {
+        self.hop_limit
+    }
+
+    /// How direct tickets are issued, if they are.
+    #[must_use]
+    pub const fn tickets(&self) -> Option<&Ticketing> {
+        self.tickets.as_ref()
     }
 
     /// The shared object cache.
@@ -648,6 +901,80 @@ impl Fabric {
     #[must_use]
     pub fn upstream(&self) -> Option<mpsc::Sender<Command>> {
         self.lock().upstream.clone()
+    }
+
+    /// Whether this relay has a parent to ask, linked or not yet.
+    #[must_use]
+    pub fn has_parent(&self) -> bool {
+        let state = self.lock();
+        state.linker.is_some() || state.upstream.is_some()
+    }
+
+    /// Link to the parent once per room, asking `linker` for each room's link
+    /// the first time something in it is wanted.
+    ///
+    /// Replaces the single link of [`Self::attach_upstream`] for an edge whose
+    /// parent requires per-room credentials: each room's link carries a token
+    /// scoped to that room alone, so the parent can refuse anything else it is
+    /// asked on it. See [`crate::edge`].
+    pub fn link_rooms(&self, linker: mpsc::UnboundedSender<RoomKey>) {
+        self.lock().linker = Some(linker);
+    }
+
+    /// How to reach the parent for something under `namespace`.
+    ///
+    /// Without per-room links this is [`Self::upstream`]. With them it is the
+    /// link for the namespace's room, asked for if there is none and waited for
+    /// if it is coming up, for at most a few seconds: a subscription that has
+    /// to wait longer is better refused than left without an answer.
+    pub async fn upstream_for(&self, namespace: &TrackNamespace) -> Option<mpsc::Sender<Command>> {
+        let mut state = {
+            let mut guard = self.lock();
+            let Some(linker) = guard.linker.clone() else {
+                return guard.upstream.clone();
+            };
+            let room = RoomKey::of(namespace)?;
+            if let Some(link) = guard.links.get(&room) {
+                link.subscribe()
+            } else {
+                let (link, state) = watch::channel(LinkState::Connecting);
+                guard.links.insert(room.clone(), link);
+                if linker.send(room.clone()).is_err() {
+                    guard.links.remove(&room);
+                    return None;
+                }
+                state
+            }
+        };
+        let up = state.wait_for(|state| !matches!(state, LinkState::Connecting));
+        match tokio::time::timeout(LINK_WAIT, up).await {
+            Ok(Ok(state)) => match &*state {
+                LinkState::Up(commands) => Some(commands.clone()),
+                LinkState::Connecting | LinkState::Refused => None,
+            },
+            Ok(Err(_)) | Err(_) => None,
+        }
+    }
+
+    /// Record where `room`'s link stands. Called by its link task.
+    pub fn set_link(&self, room: &RoomKey, state: LinkState) {
+        if let Some(link) = self.lock().links.get(room) {
+            link.send_replace(state);
+        }
+    }
+
+    /// Forget `room`'s link, so the next subscription in it asks again.
+    pub fn forget_link(&self, room: &RoomKey) {
+        self.lock().links.remove(room);
+    }
+
+    /// Where `room`'s link stands, if there is one.
+    #[must_use]
+    pub fn link(&self, room: &RoomKey) -> Option<LinkState> {
+        self.lock()
+            .links
+            .get(room)
+            .map(|link| link.borrow().clone())
     }
 
     /// Every announced namespace, for diagnostics.

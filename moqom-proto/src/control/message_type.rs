@@ -1,5 +1,6 @@
-//! Control message types, per the registry in draft-19 §10.
+//! Control message types, per the registry in draft-19 §10 and draft-22 §9.
 
+use crate::draft::Draft;
 use crate::error::DecodeError;
 
 /// Which stream a control message travels on.
@@ -39,6 +40,9 @@ pub enum MessageType {
     Subscribe = 0x3,
     /// Successful subscription response.
     SubscribeOk = 0x4,
+    /// The publisher changed a subscription's state on its own account.
+    /// Draft-22 only; under draft-19 the code is unknown.
+    PublishStateNotify = 0x22,
 
     /// Offer a track to a peer.
     Publish = 0x1D,
@@ -91,6 +95,16 @@ impl MessageType {
     #[must_use]
     pub const fn as_u64(self) -> u64 {
         self as u64
+    }
+
+    /// Whether `draft` defines this message. Receiving one it does not is an
+    /// unknown message type, and fatal.
+    #[must_use]
+    pub const fn defined_in(self, draft: Draft) -> bool {
+        match self {
+            Self::PublishStateNotify => matches!(draft, Draft::D22),
+            _ => true,
+        }
     }
 
     /// Which stream this message is valid on.
@@ -152,6 +166,7 @@ impl MessageType {
             0x10 => Self::Goaway,
             0x3 => Self::Subscribe,
             0x4 => Self::SubscribeOk,
+            0x22 => Self::PublishStateNotify,
             0x1D => Self::Publish,
             0xB => Self::PublishDone,
             0xF => Self::PublishSkipped,
@@ -183,6 +198,7 @@ impl std::fmt::Display for MessageType {
             Self::Goaway => "GOAWAY",
             Self::Subscribe => "SUBSCRIBE",
             Self::SubscribeOk => "SUBSCRIBE_OK",
+            Self::PublishStateNotify => "PUBLISH_STATE_NOTIFY",
             Self::Publish => "PUBLISH",
             Self::PublishDone => "PUBLISH_DONE",
             Self::PublishSkipped => "PUBLISH_SKIPPED",

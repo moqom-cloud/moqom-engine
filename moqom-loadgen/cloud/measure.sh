@@ -275,7 +275,7 @@ for size in "${sizes[@]}"; do
   # Only this host scrapes the relay's counters. Several scrapers would each compute
   # growth over a window containing the others' subscriptions, and every scrape
   # competes with the load for the relay's CPU.
-  on "$PUB_HOST" "$REMOTE_ROOT/bin/moqom-load publish \
+  on "$PUB_HOST" "MOQOM_RELAY_ADMIN_TOKEN_FILE=$REMOTE_ROOT/admin-token $REMOTE_ROOT/bin/moqom-load publish \
     --relay $relay_ip:$PORT \
     --metrics $relay_ip:$ADMIN_PORT \
     --seconds $seconds \

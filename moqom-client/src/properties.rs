@@ -50,6 +50,23 @@ pub const TEMPORAL_LAYER: u64 = 0x7A;
 /// decrypting.
 pub const SILENCE: u64 = 0x7C;
 
+/// What a sealed `.catalog` object discloses.
+///
+/// Odd, so it carries bytes: JSON in the shape of a catalog, holding the
+/// version, the `SFrame` key ID, the locale, and each track's name, kind and
+/// video geometry. The catalog itself is end-to-end encrypted; this is what a
+/// relay tiers usage on and a recorder files tracks by. `SFrame` authenticates
+/// it with the ciphertext, so it can be read on the way through and not changed.
+pub const CATALOG_DISCLOSURE: u64 = 0x7D;
+
+/// The room authority's ML-DSA-65 signature over a `.control` entry.
+///
+/// One byte of key ID length, the key ID, then the signature over
+/// `"moqom room log v1" ‖ 0 ‖ tenant ‖ 0 ‖ room ‖ 0 ‖ entry`. Clients apply
+/// only entries that verify against the control plane's keys; it is carried
+/// here so that an archived control track still verifies on playback.
+pub const AUTHORITY_SIGNATURE: u64 = 0x7F;
+
 /// What a publisher said about one object.
 ///
 /// Every field is optional and absent means "not stated" rather than a default,
@@ -67,6 +84,10 @@ pub struct ObjectProperties {
     pub temporal_layer: Option<u64>,
     /// Whether this audio packet is silence.
     pub is_silence: Option<bool>,
+    /// On a sealed catalog, the part of it that is not secret from the relay.
+    pub disclosure: Option<Bytes>,
+    /// On a control-log entry, the room authority's signature over it.
+    pub authority_signature: Option<Bytes>,
 }
 
 impl ObjectProperties {
@@ -115,6 +136,18 @@ impl ObjectProperties {
         if self.is_silence == Some(true) {
             push_varint(&mut properties, SILENCE, 1);
         }
+        if let Some(disclosure) = &self.disclosure
+            && !disclosure.is_empty()
+            && let Ok(parameter) = Parameter::bytes(CATALOG_DISCLOSURE, disclosure.clone())
+        {
+            properties.push(parameter);
+        }
+        if let Some(signature) = &self.authority_signature
+            && !signature.is_empty()
+            && let Ok(parameter) = Parameter::bytes(AUTHORITY_SIGNATURE, signature.clone())
+        {
+            properties.push(parameter);
+        }
         properties
     }
 
@@ -140,6 +173,14 @@ impl ObjectProperties {
                 .cloned(),
             temporal_layer: varint(TEMPORAL_LAYER),
             is_silence: varint(SILENCE).map(|value| value != 0),
+            disclosure: properties
+                .get(CATALOG_DISCLOSURE)
+                .and_then(Parameter::as_bytes)
+                .cloned(),
+            authority_signature: properties
+                .get(AUTHORITY_SIGNATURE)
+                .and_then(Parameter::as_bytes)
+                .cloned(),
         }
     }
 }
@@ -163,6 +204,8 @@ mod tests {
             configuration: Some(Bytes::from_static(b"sps/pps")),
             temporal_layer: Some(2),
             is_silence: Some(true),
+            disclosure: Some(Bytes::from_static(br#"{"tracks":[],"version":1}"#)),
+            authority_signature: Some(Bytes::from(vec![0xAB; 3321])),
         };
         assert_eq!(
             ObjectProperties::from_wire(&properties.to_wire()),

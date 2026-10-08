@@ -23,9 +23,13 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
-use crate::fabric::Fabric;
+use moqom_client::device::DeviceKey;
+use tokio::sync::mpsc;
+
+use crate::fabric::{Fabric, RoomKey};
 use crate::session::Session;
 
 /// How long to wait before dialling a parent again after the link fails.
@@ -47,6 +51,12 @@ const RETRY: Duration = Duration::from_secs(1);
 /// available on the other.
 const DIAL: Duration = Duration::from_secs(3);
 
+/// The drafts a link offers its parent, most preferred first.
+pub const LINK_ALPN: [&[u8]; 2] = [
+    moqom_transport::alpn::MOQT_DRAFT_22,
+    moqom_transport::alpn::MOQT_DRAFT_19,
+];
+
 /// Where a relay's parent is, and how to introduce itself.
 #[derive(Debug, Clone)]
 pub struct Parent {
@@ -66,13 +76,61 @@ pub struct Parent {
     /// A relay in a fleet is authenticated like anything else. Being a relay is
     /// not a way past the door, and an unauthenticated interior tier would be an
     /// open proxy for every track the fleet carries.
-    pub token: Option<String>,
+    pub credential: Option<Credential>,
+}
+
+/// A token and the device key it is bound to.
+///
+/// Never a token alone: every relay requires a proof of possession, so a token
+/// this relay cannot prove would be refused at the parent's door.
+#[derive(Debug, Clone)]
+pub struct Credential {
+    /// The token, exactly as issued.
+    pub token: String,
+    /// The key its `cnf` names.
+    pub key: Arc<DeviceKey>,
 }
 
 impl std::fmt::Display for Parent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}:{}", self.host, self.port)
     }
+}
+
+/// What a relay presents to its parent when it attaches.
+#[derive(Debug, Default)]
+pub struct Introduction {
+    /// This relay's credential, if the parent requires one.
+    pub token: Option<Vec<u8>>,
+    /// Proof that the credential is this relay's own, bound to the token and to
+    /// the parent's certificate. See [`crate::possession`].
+    pub proof: Option<Vec<u8>>,
+    /// The one room this link is for, when the relay links per room. Set, the
+    /// session registers as that room's link rather than as the relay's parent.
+    pub room: Option<RoomKey>,
+    /// Renewed credentials to hand the parent before the current one lapses.
+    /// Only used with `room`, whose namespace the renewals are sent under.
+    pub renewals: Option<mpsc::Receiver<Renewal>>,
+    /// When to end the link for want of anything to carry.
+    pub idle: Option<Idle>,
+}
+
+/// A fresh credential for a link that is up, with its own proof.
+#[derive(Debug, Clone)]
+pub struct Renewal {
+    /// The token.
+    pub token: Vec<u8>,
+    /// Its proof of possession, bound to this token and the parent's certificate.
+    pub proof: Vec<u8>,
+}
+
+/// When a per-room link ends itself.
+#[derive(Debug, Clone)]
+pub struct Idle {
+    /// How long the link may carry nothing before it ends.
+    pub after: Duration,
+    /// Raised when it ended for that reason rather than any other.
+    pub idled: Arc<AtomicBool>,
 }
 
 /// Could not attach to the parent.
@@ -101,6 +159,14 @@ pub enum Error {
         /// What each address said, in the order they were tried.
         tried: Vec<String>,
     },
+    /// The link was up but this relay could not prove its credential for it.
+    #[error("could not prove this relay's credential to {parent}: {why}")]
+    Unprovable {
+        /// The parent the proof was for.
+        parent: String,
+        /// Why no proof could be made.
+        why: String,
+    },
     /// The session was established and then ended, or the parent turned it away.
     #[error("the parent relay refused or ended the session: {0}")]
     Refused(#[from] crate::session::SessionError),
@@ -115,6 +181,39 @@ pub enum Error {
 /// # Errors
 /// [`Error`] if the parent cannot be reached, or if the session ends in a fault.
 pub async fn attach(dialer: &Dialer, parent: &Parent, fabric: Fabric) -> Result<(), Error> {
+    let connection = connect(dialer, parent).await?;
+    let introduction = match &parent.credential {
+        None => Introduction::default(),
+        Some(credential) => {
+            // Proved per connection, against the certificate this connection
+            // reached, so a proof cannot be replayed to another parent or reused
+            // after a reconnect.
+            let relay = certificate_identity(&connection).ok_or_else(|| Error::Unprovable {
+                parent: parent.to_string(),
+                why: "the parent presented no certificate".to_owned(),
+            })?;
+            let proof = credential
+                .key
+                .prove(credential.token.as_bytes(), &relay)
+                .map_err(|e| Error::Unprovable {
+                    parent: parent.to_string(),
+                    why: e.to_string(),
+                })?;
+            Introduction {
+                token: Some(credential.token.as_bytes().to_vec()),
+                proof: Some(proof),
+                ..Introduction::default()
+            }
+        }
+    };
+    attach_over(connection, fabric, introduction).await
+}
+
+/// Dial the parent, trying each address its name resolves to.
+///
+/// # Errors
+/// [`Error::Unresolvable`] or [`Error::Unreachable`].
+pub async fn connect(dialer: &Dialer, parent: &Parent) -> Result<quinn::Connection, Error> {
     let addresses = tokio::net::lookup_host((parent.host.as_str(), parent.port))
         .await
         .map_err(|source| Error::Unresolvable {
@@ -133,26 +232,48 @@ pub async fn attach(dialer: &Dialer, parent: &Parent, fabric: Fabric) -> Result<
             Err(failure) => tried.push(format!("{addr}: {failure}")),
         }
     }
-    let Some(connection) = established else {
-        return Err(Error::Unreachable {
-            parent: parent.to_string(),
-            tried,
-        });
-    };
+    established.ok_or_else(|| Error::Unreachable {
+        parent: parent.to_string(),
+        tried,
+    })
+}
 
+/// What a proof for this parent must name it by: the base64url SHA-256 of the
+/// leaf certificate it presented on `connection`.
+///
+/// The parent computes the same from the certificate it serves, so a proof
+/// made here is refused by any relay but the one this connection reached.
+#[must_use]
+pub fn certificate_identity(connection: &quinn::Connection) -> Option<String> {
+    use base64::Engine as _;
+    let certificates = connection
+        .peer_identity()?
+        .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+        .ok()?;
+    let leaf = certificates.first()?;
+    let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, leaf.as_ref());
+    Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest.as_ref()))
+}
+
+/// Serve a session to the parent over `connection`, introducing this relay
+/// with `introduction`.
+///
+/// # Errors
+/// [`Error::Refused`] if the session ends in a fault.
+pub async fn attach_over(
+    connection: quinn::Connection,
+    fabric: Fabric,
+    introduction: Introduction,
+) -> Result<(), Error> {
     let transport = moqom_transport::Session::raw(
         connection,
         web_transport_quinn::proto::ConnectRequest::new(placeholder_url()),
         web_transport_quinn::proto::ConnectResponse::OK,
     );
 
-    Session::attach(
-        transport,
-        fabric,
-        parent.token.as_deref().map(str::as_bytes),
-    )
-    .await
-    .map_err(Error::from)
+    Session::attach(transport, fabric, introduction)
+        .await
+        .map_err(Error::from)
 }
 
 /// Keep a parent attached, reconnecting when the link fails.
@@ -194,10 +315,15 @@ impl Dialer {
     /// outgoing sockets: the relay's own listener is elsewhere and a parent never
     /// dials back.
     ///
+    /// Offers draft-22 ahead of draft-19 whatever `tls` offered, because only a
+    /// draft-22 link negotiates `HOP_LIMIT`; a parent that speaks only draft-19
+    /// still gets a link, carrying the budget in `RELAY_HOPS`.
+    ///
     /// # Errors
     /// [`std::io::Error`] if no socket can be bound, or the TLS configuration is
     /// not usable for QUIC.
-    pub fn new(tls: rustls::ClientConfig) -> std::io::Result<Self> {
+    pub fn new(mut tls: rustls::ClientConfig) -> std::io::Result<Self> {
+        tls.alpn_protocols = LINK_ALPN.iter().map(|alpn| alpn.to_vec()).collect();
         let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls)
             .map_err(|e| std::io::Error::other(format!("TLS 1.3 is required for QUIC: {e}")))?;
         let config = quinn::ClientConfig::new(Arc::new(crypto));

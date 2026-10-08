@@ -25,6 +25,7 @@ use crate::control::MessageType;
 use crate::control::frame::MessageBody;
 use crate::control::params::Parameters;
 use crate::control::request_id::RequestId;
+use crate::control::typed::{Context, check_typed};
 use crate::error::DecodeError;
 use crate::model::{FullTrackName, TrackNamespace};
 use crate::varint::VarInt;
@@ -32,7 +33,7 @@ use crate::varint::VarInt;
 /// Generates a message body of `RequestId`, a namespace, and counted
 /// parameters — the shape shared by the three namespace requests.
 macro_rules! namespace_request {
-    ($(#[$meta:meta])* $name:ident, $ty:expr, $field:ident, $field_doc:literal) => {
+    ($(#[$meta:meta])* $name:ident, $ty:expr, $context:expr, $field:ident, $field_doc:literal) => {
         $(#[$meta])*
         #[derive(Debug, Clone, PartialEq, Eq)]
         pub struct $name {
@@ -72,11 +73,11 @@ macro_rules! namespace_request {
             /// [`DecodeError::Short`] if incomplete; [`DecodeError::Invalid`]
             /// if any field violates its constraints.
             pub fn decode<B: Buf>(buf: &mut B) -> Result<Self, DecodeError> {
-                Ok(Self {
-                    request_id: RequestId::decode(buf)?,
-                    $field: TrackNamespace::decode(buf)?,
-                    parameters: Parameters::decode_counted(buf)?,
-                })
+                let request_id = RequestId::decode(buf)?;
+                let $field = TrackNamespace::decode(buf)?;
+                let parameters = Parameters::decode_counted(buf)?;
+                check_typed($context, &parameters)?;
+                Ok(Self { request_id, $field, parameters })
             }
         }
 
@@ -102,6 +103,7 @@ namespace_request! {
     /// there is no `UNANNOUNCE`.
     PublishNamespace,
     MessageType::PublishNamespace,
+    Context::PublishNamespace,
     namespace,
     "The namespace whose tracks are on offer."
 }
@@ -116,6 +118,7 @@ namespace_request! {
     /// subscriptions would make the suffixes ambiguous.
     SubscribeNamespace,
     MessageType::SubscribeNamespace,
+    Context::SubscribeNamespace,
     prefix,
     "Matched against namespaces the publisher knows, with 0 to 32 fields. An \
      empty prefix matches everything."
@@ -134,6 +137,7 @@ namespace_request! {
     /// each may use the same prefix.
     SubscribeTracks,
     MessageType::SubscribeTracks,
+    Context::SubscribeTracks,
     prefix,
     "Matched against namespaces the publisher knows, with 0 to 32 fields."
 }

@@ -21,6 +21,7 @@ use bytes::{Buf, BufMut, Bytes};
 use crate::control::properties::Properties;
 use crate::data::flags::{SubgroupIdMode, SubgroupType};
 use crate::data::object::TerminalStatus;
+use crate::draft::Draft;
 use crate::error::DecodeError;
 use crate::model::{GroupId, ObjectSeq, ObjectStatus, SubgroupId, TrackAlias};
 use crate::varint::VarInt;
@@ -185,6 +186,13 @@ impl SubgroupHeader {
     /// [`DecodeError::Short`] if the header is incomplete.
     pub fn decode<B: Buf>(buf: &mut B) -> Result<Self, DecodeError> {
         let ty = SubgroupType::from_u64(VarInt::decode(buf)?.get())?;
+        // Draft-16 predates FIRST_OBJECT; there the bit is outside the form
+        // 0b00X1XXXX and the type is malformed.
+        if ty.is_first_object() && Draft::current() == Draft::D16 {
+            return Err(DecodeError::Invalid(
+                "subgroup type sets bit 0x40, which draft-16 does not define",
+            ));
+        }
         let track_alias = TrackAlias::new(VarInt::decode(buf)?);
         let group = GroupId::new(VarInt::decode(buf)?);
 
@@ -333,12 +341,13 @@ pub struct SubgroupReader {
     properties_present: bool,
     source: SubgroupSource,
     state: DeltaState,
+    draft: Draft,
 }
 
 impl SubgroupReader {
-    /// Start reading the stream this header opened.
+    /// Start reading the stream this header opened, in the ambient draft.
     #[must_use]
-    pub const fn new(header: &SubgroupHeader) -> Self {
+    pub fn new(header: &SubgroupHeader) -> Self {
         Self {
             properties_present: header.properties_present,
             source: header.subgroup,
@@ -346,7 +355,17 @@ impl SubgroupReader {
                 previous: None,
                 first_object_id: None,
             },
+            draft: Draft::current(),
         }
+    }
+
+    /// Read every object in `draft`, whatever the ambient draft is when
+    /// [`Self::read`] is called. A reader lives across awaits; see
+    /// [`crate::draft`].
+    #[must_use]
+    pub const fn in_draft(mut self, draft: Draft) -> Self {
+        self.draft = draft;
+        self
     }
 
     /// The stream's Subgroup ID, once it is known.
@@ -384,7 +403,7 @@ impl SubgroupReader {
     /// Object ID, or properties on a terminal object.
     pub fn read(&mut self, buf: &mut &[u8]) -> Result<SubgroupObject, DecodeError> {
         let mut cursor = *buf;
-        let object = self.read_from(&mut cursor)?;
+        let object = self.draft.scope(|| self.read_from(&mut cursor))?;
         *buf = cursor;
         self.state.advance(object.object);
         Ok(object)
@@ -449,19 +468,28 @@ impl SubgroupReader {
 pub struct SubgroupWriter {
     properties_present: bool,
     state: DeltaState,
+    draft: Draft,
 }
 
 impl SubgroupWriter {
-    /// Start writing the stream this header opens.
+    /// Start writing the stream this header opens, in the ambient draft.
     #[must_use]
-    pub const fn new(header: &SubgroupHeader) -> Self {
+    pub fn new(header: &SubgroupHeader) -> Self {
         Self {
             properties_present: header.properties_present,
             state: DeltaState {
                 previous: None,
                 first_object_id: None,
             },
+            draft: Draft::current(),
         }
+    }
+
+    /// Write every object in `draft`; see [`SubgroupReader::in_draft`].
+    #[must_use]
+    pub const fn in_draft(mut self, draft: Draft) -> Self {
+        self.draft = draft;
+        self
     }
 
     /// Bytes [`Self::write`] will append for this object.
@@ -470,6 +498,10 @@ impl SubgroupWriter {
     /// The same refusals as [`Self::write`], so a caller can size a buffer
     /// without risking a write that then fails partway.
     pub fn encoded_len(&self, object: &SubgroupObject) -> Result<usize, SubgroupError> {
+        self.draft.scope(|| self.encoded_len_scoped(object))
+    }
+
+    fn encoded_len_scoped(&self, object: &SubgroupObject) -> Result<usize, SubgroupError> {
         self.check(object)?;
         let mut len = self.state.delta_for(object.object)?.size();
         if self.properties_present {
@@ -499,6 +531,15 @@ impl SubgroupWriter {
     /// properties the header made no room for, or
     /// [`SubgroupError::NotIncreasing`] if the Object ID does not advance.
     pub fn write<B: BufMut>(
+        &mut self,
+        buf: &mut B,
+        object: &SubgroupObject,
+    ) -> Result<(), SubgroupError> {
+        let draft = self.draft;
+        draft.scope(|| self.write_scoped(buf, object))
+    }
+
+    fn write_scoped<B: BufMut>(
         &mut self,
         buf: &mut B,
         object: &SubgroupObject,

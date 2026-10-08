@@ -19,6 +19,8 @@ pub use namespace::{
     DoneReason, Namespace, NamespaceDone, PublishNamespace, PublishSkipped, SubscribeNamespace,
     SubscribeTracks,
 };
-pub use publish::{Publish, PublishDone, PublishDoneStatus, RequestUpdate, StreamCount};
+pub use publish::{
+    Publish, PublishDone, PublishDoneStatus, PublishStateNotify, RequestUpdate, StreamCount,
+};
 pub use request::{Redirect, RequestError, RequestErrorCode, RequestOk};
 pub use subscribe::{Subscribe, SubscribeOk, TrackStatus};

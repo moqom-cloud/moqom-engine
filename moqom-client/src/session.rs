@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes::{Buf, Bytes, BytesMut};
+use moqom_proto::Draft;
 use moqom_proto::control::{
     ControlFrame, MessageBody, MessageType, PublishNamespace, ReasonPhrase, RequestError,
     RequestErrorCode, RequestIdGenerator, Role, Setup, Subscribe, SubscribeOk, write_message,
@@ -23,6 +24,10 @@ use crate::Error;
 use crate::device::{Credentials, certificate_identity};
 use crate::properties::ObjectProperties;
 use crate::tls::{apply_alpn, install_crypto_provider};
+
+mod fetch;
+
+pub use fetch::{FetchRange, Fetched};
 
 /// One object delivered on a subscription.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,8 +82,13 @@ impl<'a> OutgoingObject<'a> {
 pub struct Subscription {
     /// The alias the peer assigned, which forwarded headers must carry.
     pub alias: TrackAlias,
+    /// The request, which a joining fetch names.
+    request: moqom_proto::control::RequestId,
+    track: FullTrackName,
     rx: mpsc::Receiver<Result<Object, Error>>,
-    _send: SendStream,
+    draft: Draft,
+    transport: moqom_transport::Session,
+    send: SendStream,
     _recv: RecvStream,
 }
 
@@ -86,11 +96,65 @@ pub struct Subscription {
 pub struct Announcement {
     alias: TrackAlias,
     subscribed: watch::Receiver<bool>,
-    _send: SendStream,
+    request: moqom_proto::control::RequestId,
+    draft: Draft,
+    transport: moqom_transport::Session,
+    send: SendStream,
     _recv: RecvStream,
 }
 
-const IMPLEMENTATION: &[u8] = b"moqom-client";
+/// One track this session answers subscriptions to, from [`Session::publish`].
+/// Dropping it stops answering.
+pub struct Publication {
+    alias: TrackAlias,
+    track: FullTrackName,
+    subscribed: watch::Receiver<bool>,
+    tracks: Arc<Mutex<HashMap<FullTrackName, PublishSlot>>>,
+}
+
+impl Publication {
+    /// The alias to write into subgroup headers for this track.
+    #[must_use]
+    pub const fn alias(&self) -> TrackAlias {
+        self.alias
+    }
+
+    /// The track.
+    #[must_use]
+    pub const fn track(&self) -> &FullTrackName {
+        &self.track
+    }
+
+    /// Whether anybody has subscribed yet.
+    #[must_use]
+    pub fn has_subscribers(&self) -> bool {
+        *self.subscribed.borrow()
+    }
+
+    /// Wait until somebody subscribes.
+    pub async fn subscribed(&self) {
+        let mut watch = self.subscribed.clone();
+        let _ = watch.wait_for(|ready| *ready).await;
+    }
+}
+
+impl Drop for Publication {
+    fn drop(&mut self) {
+        let mut tracks = self
+            .tracks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A later publication of the same track replaced this one; leave it.
+        if tracks
+            .get(&self.track)
+            .is_some_and(|slot| slot.alias == self.alias)
+        {
+            tracks.remove(&self.track);
+        }
+    }
+}
+
+pub(crate) const IMPLEMENTATION: &[u8] = b"moqom-client";
 
 type Inbox = HashMap<TrackAlias, mpsc::Sender<Result<Object, Error>>>;
 
@@ -98,14 +162,26 @@ type Inbox = HashMap<TrackAlias, mpsc::Sender<Result<Object, Error>>>;
 const INBOX_DEPTH: usize = 64;
 
 /// A MOQT peer that has completed SETUP.
+///
+/// Cloning shares the session rather than opening another: every clone sends
+/// on the same connection and draws from the same request IDs and aliases. The
+/// session ends when the last clone is dropped, or at once on [`Self::close`].
+#[derive(Clone)]
 pub struct Session {
     transport: moqom_transport::Session,
-    requests: RequestIdGenerator,
-    next_alias: AtomicU64,
+    /// What the handshake negotiated. Every message this session writes or
+    /// reads is in it, including those on the tasks it spawns.
+    draft: Draft,
+    requests: Arc<Mutex<RequestIdGenerator>>,
+    next_alias: Arc<AtomicU64>,
     published: Arc<Mutex<HashMap<TrackNamespace, PublishSlot>>>,
+    /// Tracks published one by one ([`Self::publish`]), answered before the
+    /// namespaces above.
+    tracks: Arc<Mutex<HashMap<FullTrackName, PublishSlot>>>,
     inbox: Arc<Mutex<Inbox>>,
+    fetches: Arc<Mutex<fetch::Fetches>>,
     /// Held open for the life of the session: closing the control stream ends it.
-    _control: (SendStream, RecvStream),
+    _control: Arc<(SendStream, RecvStream)>,
     /// Owns the client socket. Dropping the endpoint closes every connection on
     /// it, so this has to outlive the session.
     _endpoint: quinn::Endpoint,
@@ -126,8 +202,10 @@ impl Session {
     /// Connect to `addr` over raw QUIC and exchange SETUP.
     ///
     /// `server_name` is the SNI and the name verified against the certificate,
-    /// unless `tls` skips verification. The `moqt-19` ALPN is set on `tls` here, so
-    /// a caller cannot accidentally complete a handshake that is not MOQT.
+    /// unless `tls` skips verification. The ALPN is set on `tls` here, so a
+    /// caller cannot accidentally complete a handshake that is not MOQT: it
+    /// offers `moqt-22` then `moqt-19`, and the session speaks whichever the
+    /// relay picks. See [`Self::draft`].
     ///
     /// `credentials`, when present, are sent as `AUTHORIZATION_TOKEN`, and as
     /// `AUTHORIZATION_PROOF` when they carry a device key. The proof can only be
@@ -157,6 +235,7 @@ impl Session {
         endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(crypto)));
 
         let connection = endpoint.connect(addr, server_name)?.await?;
+        let draft = negotiated(&connection)?;
         let relay = relay_identity(&connection);
         // Kept past the move below, because how a relay refuses a session is by
         // closing the connection, and the reason it gives is on the connection
@@ -168,7 +247,6 @@ impl Session {
             web_transport_quinn::proto::ConnectResponse::OK,
         );
 
-        let (mut send, recv) = transport.open_bi().await?;
         let mut ours = Setup::new();
         ours.options
             .set_bytes(
@@ -176,6 +254,16 @@ impl Session {
                 IMPLEMENTATION,
             )
             .map_err(Error::setup)?;
+        if draft == Draft::D22 {
+            // Draft-22 relays send MOQOM's private parameters only to a peer
+            // that declares it reads them; this client does.
+            ours.options
+                .set_varint(
+                    moqom_proto::control::setup::option_type::MOQOM_PARAMETERS,
+                    1,
+                )
+                .map_err(Error::setup)?;
+        }
         if let Some(credentials) = credentials {
             ours.options
                 .set_bytes(
@@ -199,47 +287,123 @@ impl Session {
                     .map_err(Error::setup)?;
             }
         }
-        write(&mut send, &ours).await?;
-
-        let mut frames = Frames::new(recv);
-        // Nothing coming back is what a refusal looks like from here: the relay
-        // decides on the credentials in the SETUP it has just read and closes
-        // instead of answering. Asking the connection why turns "the peer closed
-        // the stream" into the sentence the relay actually wrote.
-        let Some(frame) = frames.next().await? else {
-            return Err(rejection(&quic).await);
-        };
-        if frame.message_type != MessageType::Setup {
-            return Err(Error::Unexpected {
-                found: frame.message_type,
-                during: "SETUP",
-            });
-        }
-        let mut body = frame.body.clone();
-        let len = body.len();
-        Setup::decode(&mut body, len)?;
-
-        let published = Arc::new(Mutex::new(HashMap::new()));
-        let inbox = Arc::new(Mutex::new(HashMap::new()));
-        spawn_publisher(transport.clone(), Arc::clone(&published));
-        spawn_reader(transport.clone(), Arc::clone(&inbox));
-
-        Ok(Self {
+        let control = draft.bind(exchange_setup(&transport, &quic, &ours)).await?;
+        Ok(Self::assemble(
+            draft,
             transport,
-            requests: RequestIdGenerator::new(Role::Client),
+            control,
+            endpoint,
+            Role::Client,
+        ))
+    }
+
+    /// The draft the handshake negotiated.
+    #[must_use]
+    pub const fn draft(&self) -> Draft {
+        self.draft
+    }
+
+    /// A session over a transport whose SETUP exchange has already completed.
+    ///
+    /// Shared by the relay path and the direct one, which differ only in how
+    /// SETUP is exchanged and checked: everything after it -- subscribing,
+    /// answering subscriptions, reading subgroups -- is the same code on both, so
+    /// media cannot behave differently depending on which path carried it.
+    pub(crate) fn assemble(
+        draft: Draft,
+        transport: moqom_transport::Session,
+        control: (SendStream, RecvStream),
+        endpoint: quinn::Endpoint,
+        role: Role,
+    ) -> Self {
+        let published = Arc::new(Mutex::new(HashMap::new()));
+        let tracks = Arc::new(Mutex::new(HashMap::new()));
+        let inbox = Arc::new(Mutex::new(HashMap::new()));
+        let fetches = Arc::new(Mutex::new(HashMap::new()));
+        spawn_publisher(
+            draft,
+            transport.clone(),
+            Arc::clone(&published),
+            Arc::clone(&tracks),
+        );
+        spawn_reader(
+            draft,
+            transport.clone(),
+            Arc::clone(&inbox),
+            Arc::clone(&fetches),
+        );
+
+        Self {
+            transport,
+            draft,
+            requests: Arc::new(Mutex::new(RequestIdGenerator::new(role))),
             // Not zero: the relay hands out aliases from zero, so a publisher
             // that starts at 7 makes a forgotten rewrite observable — the
             // subscriber would see 7 in a header that should carry its own 0.
-            next_alias: AtomicU64::new(7),
+            next_alias: Arc::new(AtomicU64::new(7)),
             published,
+            tracks,
             inbox,
-            _control: (send, frames.into_inner()),
+            fetches,
+            _control: Arc::new(control),
             _endpoint: endpoint,
+        }
+    }
+
+    /// End the session now, for every clone, telling the peer `code` and
+    /// `reason`.
+    pub fn close(&self, code: u32, reason: &str) {
+        self.transport.close(code, reason.as_bytes());
+    }
+
+    /// Answer subscriptions to `track` with an alias of its own, so one
+    /// namespace can carry several tracks.
+    ///
+    /// On a relay the namespace still has to be announced, by this session or
+    /// through [`Self::announce`], for the relay to route subscriptions here;
+    /// on a direct session nothing else is needed. Subscriptions to `track` are
+    /// answered from here rather than by an announcement of its namespace.
+    /// Dropping the [`Publication`] stops answering.
+    ///
+    /// # Errors
+    /// Aliases exhausted.
+    pub fn publish(&self, track: FullTrackName) -> Result<Publication, Error> {
+        let raw = self.next_alias.fetch_add(1, Ordering::Relaxed);
+        let alias = TrackAlias::new(VarInt::new(raw)?);
+        let (subscribed, watch) = watch::channel(false);
+        self.tracks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                track.clone(),
+                PublishSlot {
+                    alias,
+                    subscribed,
+                    held: Arc::new(Mutex::new(Vec::new())),
+                },
+            );
+        Ok(Publication {
+            alias,
+            track,
+            subscribed: watch,
+            tracks: Arc::clone(&self.tracks),
         })
     }
 
+    /// Whether the underlying connection has closed.
+    ///
+    /// Resolves with the reason once it has. A direct path watches this to fall
+    /// back as soon as the peer is gone, rather than waiting for media to stop.
+    pub async fn closed(&self) -> Error {
+        Error::Session(self.transport.closed().await)
+    }
+
     fn next_request(&mut self) -> Result<moqom_proto::control::RequestId, Error> {
-        self.requests.allocate().ok_or(Error::RequestIdsExhausted)
+        self.requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .allocate()
+            .ok_or(Error::RequestIdsExhausted)
     }
 
     /// Subscribe to `track`.
@@ -251,8 +415,13 @@ impl Session {
     /// # Errors
     /// The peer refused, answered with the wrong message, or the session failed.
     pub async fn subscribe(&mut self, track: FullTrackName) -> Result<Subscription, Error> {
+        let draft = self.draft;
+        draft.bind(self.subscribe_in_draft(track)).await
+    }
+
+    async fn subscribe_in_draft(&mut self, track: FullTrackName) -> Result<Subscription, Error> {
         let (mut send, recv) = self.transport.open_bi().await?;
-        let request = Subscribe::new(self.next_request()?, track);
+        let request = Subscribe::new(self.next_request()?, track.clone());
         write(&mut send, &request).await?;
 
         let mut frames = Frames::new(recv);
@@ -267,8 +436,12 @@ impl Session {
                     .insert(ok.track_alias, tx);
                 Ok(Subscription {
                     alias: ok.track_alias,
+                    request: request.request_id,
+                    track,
                     rx,
-                    _send: send,
+                    draft: self.draft,
+                    transport: self.transport.clone(),
+                    send,
                     _recv: frames.into_inner(),
                 })
             }
@@ -286,6 +459,28 @@ impl Session {
         }
     }
 
+    /// Watch which namespaces are published under `prefix`.
+    ///
+    /// The returned [`NamespaceWatch`](crate::NamespaceWatch) holds the request
+    /// stream; dropping it withdraws the watch.
+    ///
+    /// # Errors
+    /// Opening the request stream, writing the request, or exhausting request IDs.
+    pub async fn watch(&mut self, prefix: TrackNamespace) -> Result<crate::NamespaceWatch, Error> {
+        let (mut send, recv) = self.transport.open_bi().await?;
+        let request = self.next_request()?;
+        let message = moqom_proto::control::SubscribeNamespace::new(request, prefix.clone());
+        self.draft.bind(write(&mut send, &message)).await?;
+        Ok(crate::NamespaceWatch::new(
+            self.draft,
+            prefix,
+            request,
+            send,
+            Frames::new(recv),
+            self.transport.clone(),
+        ))
+    }
+
     /// Announce `namespace`, returning a handle that holds the announcement.
     ///
     /// Dropping the handle withdraws it: there is no `UNANNOUNCE` message.
@@ -299,7 +494,7 @@ impl Session {
     pub async fn announce(&mut self, namespace: TrackNamespace) -> Result<Announcement, Error> {
         let (mut send, recv) = self.transport.open_bi().await?;
         let request = PublishNamespace::new(self.next_request()?, namespace.clone());
-        write(&mut send, &request).await?;
+        self.draft.bind(write(&mut send, &request)).await?;
 
         let raw = self.next_alias.fetch_add(1, Ordering::Relaxed);
         let alias = TrackAlias::new(VarInt::new(raw)?);
@@ -319,7 +514,10 @@ impl Session {
         Ok(Announcement {
             alias,
             subscribed: watch,
-            _send: send,
+            request: request.request_id,
+            draft: self.draft,
+            transport: self.transport.clone(),
+            send,
             _recv: recv,
         })
     }
@@ -369,8 +567,8 @@ impl Session {
         header.properties_present = objects.iter().any(|object| !object.properties.is_empty());
 
         let mut buf = BytesMut::new();
-        header.encode(&mut buf);
-        let mut writer = SubgroupWriter::new(&header);
+        self.draft.scope(|| header.encode(&mut buf));
+        let mut writer = SubgroupWriter::new(&header).in_draft(self.draft);
         for (index, object) in objects.iter().enumerate() {
             let payload = Bytes::copy_from_slice(object.payload);
             let encoded = if header.properties_present {
@@ -419,11 +617,11 @@ impl Session {
         header.properties_present = metadata == Metadata::Present;
 
         let mut buf = BytesMut::new();
-        header.encode(&mut buf);
+        self.draft.scope(|| header.encode(&mut buf));
         stream.write_all(&buf).await.map_err(Error::write)?;
 
         Ok(GroupWriter {
-            writer: SubgroupWriter::new(&header),
+            writer: SubgroupWriter::new(&header).in_draft(self.draft),
             properties_present: header.properties_present,
             stream,
             next: 0,
@@ -431,12 +629,70 @@ impl Session {
     }
 }
 
+/// The draft the handshake settled on.
+///
+/// A relay that completed the handshake without choosing one of the offered
+/// protocols is not speaking MOQT, and nothing after this would make sense.
+fn negotiated(connection: &quinn::Connection) -> Result<Draft, Error> {
+    connection
+        .handshake_data()
+        .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+        .and_then(|data| data.protocol)
+        .and_then(|alpn| Draft::from_alpn(&alpn))
+        .filter(|draft| matches!(draft, Draft::D19 | Draft::D22))
+        .ok_or(Error::NoMoqt)
+}
+
+/// Open the control channel and exchange SETUP, in the ambient draft.
+///
+/// Draft-19 (MOQOM) uses one bidirectional stream the client opens; draft-22
+/// uses one unidirectional stream each way (§6.3), the client's opened here
+/// and the relay's being the first unidirectional stream it opens.
+async fn exchange_setup(
+    transport: &moqom_transport::Session,
+    quic: &quinn::Connection,
+    ours: &Setup,
+) -> Result<(SendStream, RecvStream), Error> {
+    let draft = Draft::current();
+    let (send, recv) = if draft.unidirectional_control() {
+        let mut send = transport.open_uni().await?;
+        write(&mut send, ours).await?;
+        // A relay refusing the SETUP closes rather than opening its stream.
+        let Ok(recv) = transport.accept_uni().await else {
+            return Err(rejection(quic).await);
+        };
+        (send, recv)
+    } else {
+        let (mut send, recv) = transport.open_bi().await?;
+        write(&mut send, ours).await?;
+        (send, recv)
+    };
+
+    let mut frames = Frames::new(recv);
+    // Nothing coming back is what a refusal looks like from here: the relay
+    // decides on the credentials in the SETUP it has just read and closes
+    // instead of answering. Asking the connection why turns "the peer closed
+    // the stream" into the sentence the relay actually wrote.
+    let Some(frame) = frames.next().await? else {
+        return Err(rejection(quic).await);
+    };
+    if frame.message_type != MessageType::Setup {
+        return Err(Error::Unexpected {
+            found: frame.message_type,
+            during: "SETUP",
+        });
+    }
+    let len = frame.body.len();
+    frame.parse_in(draft, |body| Setup::decode(body, len))?;
+    Ok((send, frames.into_inner()))
+}
+
 /// Why the relay closed, as an error worth showing somebody.
 ///
 /// Bounded, and the bound is the point rather than caution: a peer that closed only
 /// the stream will never close the connection, so waiting for a reason that is not
 /// coming would hang instead of reporting the little that is known.
-async fn rejection(connection: &quinn::Connection) -> Error {
+pub(crate) async fn rejection(connection: &quinn::Connection) -> Error {
     let waited = tokio::time::timeout(REJECTION_PATIENCE, connection.closed()).await;
     match waited {
         Ok(quinn::ConnectionError::ApplicationClosed(closed)) => Error::Rejected {
@@ -461,7 +717,7 @@ const REJECTION_PATIENCE: std::time::Duration = std::time::Duration::from_secs(2
 /// relay hashes its own configured certificate the same way, so anything else here
 /// -- an intermediate, the whole chain, the public key alone -- produces a proof it
 /// refuses while looking entirely well-formed.
-fn relay_identity(connection: &quinn::Connection) -> Option<String> {
+pub(crate) fn relay_identity(connection: &quinn::Connection) -> Option<String> {
     let identity = connection.peer_identity()?;
     let chain = identity
         .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
@@ -565,6 +821,22 @@ impl Announcement {
         let mut watch = self.subscribed.clone();
         let _ = watch.wait_for(|ready| *ready).await;
     }
+
+    /// Hand the relay a fresh credential on this announcement, so the session
+    /// outlives the token it opened with. See [`NamespaceWatch::renew`](crate::NamespaceWatch::renew).
+    ///
+    /// # Errors
+    /// Signing the proof, or writing the update.
+    pub async fn renew(&mut self, credentials: &Credentials<'_>) -> Result<(), Error> {
+        crate::watch::renew_on(
+            self.draft,
+            &self.transport,
+            &mut self.send,
+            self.request,
+            credentials,
+        )
+        .await
+    }
 }
 
 impl Subscription {
@@ -581,29 +853,67 @@ impl Subscription {
             None => Ok(None),
         }
     }
+
+    /// Hand the relay a fresh credential on this subscription, so the session
+    /// outlives the token it opened with. See [`NamespaceWatch::renew`](crate::NamespaceWatch::renew).
+    ///
+    /// # Errors
+    /// Signing the proof, or writing the update.
+    pub async fn renew(&mut self, credentials: &Credentials<'_>) -> Result<(), Error> {
+        crate::watch::renew_on(
+            self.draft,
+            &self.transport,
+            &mut self.send,
+            self.request,
+            credentials,
+        )
+        .await
+    }
+
+    /// Ask the publisher to stop sending this track (`false`) or to start
+    /// again (`true`), keeping the subscription: draft-19's `FORWARD` in a
+    /// `REQUEST_UPDATE`. A relay resumes at the next group.
+    ///
+    /// # Errors
+    /// Writing the update.
+    pub async fn set_forwarding(&mut self, forward: bool) -> Result<(), Error> {
+        let mut update = moqom_proto::control::RequestUpdate::new(self.request);
+        update.parameters.push(
+            moqom_proto::control::params::Parameter::varint(
+                moqom_proto::control::params::param_type::FORWARD,
+                VarInt::from(u32::from(forward)),
+            )
+            .map_err(Error::setup)?,
+        );
+        self.draft.bind(write(&mut self.send, &update)).await
+    }
 }
 
 fn spawn_publisher(
+    draft: Draft,
     transport: moqom_transport::Session,
     published: Arc<Mutex<HashMap<TrackNamespace, PublishSlot>>>,
+    tracks: Arc<Mutex<HashMap<FullTrackName, PublishSlot>>>,
 ) {
-    tokio::spawn(async move {
+    tokio::spawn(draft.bind(async move {
         loop {
             let Ok((send, recv)) = transport.accept_bi().await else {
                 return;
             };
             let published = Arc::clone(&published);
-            tokio::spawn(async move {
-                let _ = answer_subscribe(send, recv, &published).await;
-            });
+            let tracks = Arc::clone(&tracks);
+            tokio::spawn(draft.bind(async move {
+                let _ = answer_subscribe(send, recv, &published, &tracks).await;
+            }));
         }
-    });
+    }));
 }
 
 async fn answer_subscribe(
     mut send: SendStream,
     recv: RecvStream,
     published: &Mutex<HashMap<TrackNamespace, PublishSlot>>,
+    tracks: &Mutex<HashMap<FullTrackName, PublishSlot>>,
 ) -> Result<(), Error> {
     let mut frames = Frames::new(recv);
     let frame = frames.next().await?.ok_or(Error::Closed)?;
@@ -611,11 +921,18 @@ async fn answer_subscribe(
         return Ok(());
     }
     let request = Subscribe::decode(&mut frame.body.clone())?;
-    let slot = published
+    let track = tracks
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(request.track.namespace())
+        .get(&request.track)
         .cloned();
+    let slot = track.or_else(|| {
+        published
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(request.track.namespace())
+            .cloned()
+    });
     match slot {
         Some(slot) => {
             write(&mut send, &SubscribeOk::new(slot.alias)).await?;
@@ -639,22 +956,65 @@ async fn answer_subscribe(
     Ok(())
 }
 
-fn spawn_reader(transport: moqom_transport::Session, inbox: Arc<Mutex<Inbox>>) {
-    tokio::spawn(async move {
+fn spawn_reader(
+    draft: Draft,
+    transport: moqom_transport::Session,
+    inbox: Arc<Mutex<Inbox>>,
+    fetches: Arc<Mutex<fetch::Fetches>>,
+) {
+    tokio::spawn(draft.bind(async move {
         loop {
             let Ok(recv) = transport.accept_uni().await else {
+                // The session is over, so every subscription on it is too.
+                // Dropping the senders is what makes `next_object` say so,
+                // rather than waiting for objects that cannot arrive.
+                inbox
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clear();
+                fetches
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clear();
                 return;
             };
             let inbox = Arc::clone(&inbox);
-            tokio::spawn(async move {
-                let _ = read_subgroup(recv, &inbox).await;
-            });
+            let fetches = Arc::clone(&fetches);
+            tokio::spawn(draft.bind(async move {
+                let _ = read_stream(recv, &inbox, &fetches).await;
+            }));
         }
-    });
+    }));
 }
 
-async fn read_subgroup(mut recv: RecvStream, inbox: &Mutex<Inbox>) -> Result<(), Error> {
+/// A data stream is a subgroup or a fetch's answer, and its first varint says
+/// which.
+async fn read_stream(
+    mut recv: RecvStream,
+    inbox: &Mutex<Inbox>,
+    fetches: &Mutex<fetch::Fetches>,
+) -> Result<(), Error> {
     let mut buffer = BytesMut::new();
+    let is_fetch = loop {
+        if let Some(is_fetch) = fetch::is_fetch_stream(&buffer) {
+            break is_fetch;
+        }
+        if !fill(&mut recv, &mut buffer).await? {
+            return Ok(());
+        }
+    };
+    if is_fetch {
+        fetch::read_fetch(recv, buffer, fetches).await
+    } else {
+        read_subgroup(recv, buffer, inbox).await
+    }
+}
+
+async fn read_subgroup(
+    mut recv: RecvStream,
+    mut buffer: BytesMut,
+    inbox: &Mutex<Inbox>,
+) -> Result<(), Error> {
     let Some(header) = read_header(&mut recv, &mut buffer).await? else {
         return Ok(());
     };
@@ -754,31 +1114,34 @@ async fn fill(recv: &mut RecvStream, buffer: &mut BytesMut) -> Result<bool, Erro
     }
 }
 
-async fn write<M: MessageBody>(stream: &mut SendStream, message: &M) -> Result<(), Error> {
+pub(crate) async fn write<M: MessageBody>(
+    stream: &mut SendStream,
+    message: &M,
+) -> Result<(), Error> {
     let mut buf = BytesMut::new();
     write_message(&mut buf, message)?;
     stream.write_all(&buf).await.map_err(Error::write)
 }
 
 /// Reads length-delimited control messages.
-struct Frames {
+pub(crate) struct Frames {
     stream: RecvStream,
     buffer: BytesMut,
 }
 
 impl Frames {
-    fn new(stream: RecvStream) -> Self {
+    pub(crate) fn new(stream: RecvStream) -> Self {
         Self {
             stream,
             buffer: BytesMut::new(),
         }
     }
 
-    fn into_inner(self) -> RecvStream {
+    pub(crate) fn into_inner(self) -> RecvStream {
         self.stream
     }
 
-    async fn next(&mut self) -> Result<Option<ControlFrame>, Error> {
+    pub(crate) async fn next(&mut self) -> Result<Option<ControlFrame>, Error> {
         loop {
             let mut cursor = &self.buffer[..];
             match ControlFrame::decode(&mut cursor) {
@@ -797,7 +1160,7 @@ impl Frames {
     }
 }
 
-fn placeholder_url() -> url::Url {
+pub(crate) fn placeholder_url() -> url::Url {
     // A raw QUIC session has no CONNECT URL; the wrapper still wants one.
     "https://localhost/"
         .parse()

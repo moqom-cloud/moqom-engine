@@ -98,10 +98,14 @@
 #![deny(unsafe_code)]
 
 pub mod admin;
+pub mod admin_auth;
 pub mod cache;
 pub mod catalog;
 pub mod clock;
+pub mod direct;
+pub mod edge;
 pub mod fabric;
+pub mod geo;
 pub mod hops;
 pub mod identity;
 pub mod link;
@@ -113,7 +117,10 @@ pub mod quota;
 pub mod roster;
 pub mod scope;
 pub mod session;
+pub mod stun;
+pub mod ticket;
 pub mod upstream;
+pub mod usage;
 
 mod generated;
 
@@ -127,3 +134,4 @@ pub use quota::{Governor, Principal, Quotas, Refusal};
 pub use roster::{Presence, Roster};
 pub use scope::{Denial, Permission, Publish, Scope};
 pub use session::{Session, SessionError};
+pub use usage::Usage;

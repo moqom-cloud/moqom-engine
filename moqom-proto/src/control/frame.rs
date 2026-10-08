@@ -17,6 +17,7 @@
 use bytes::{Buf, BufMut, Bytes};
 
 use crate::control::message_type::MessageType;
+use crate::draft::Draft;
 use crate::error::DecodeError;
 use crate::varint::VarInt;
 
@@ -93,6 +94,19 @@ pub fn write_message<M: MessageBody, B: BufMut>(buf: &mut B, msg: &M) -> Result<
     Ok(())
 }
 
+/// [`write_message`] in `draft`, for session code that must never depend on
+/// the ambient draft.
+///
+/// # Errors
+/// As for [`write_message`].
+pub fn write_message_in<M: MessageBody, B: BufMut>(
+    draft: Draft,
+    buf: &mut B,
+    msg: &M,
+) -> Result<(), BodyTooLong> {
+    draft.scope(|| write_message(buf, msg))
+}
+
 /// A framed control message: a type and an opaque body.
 ///
 /// Framing is kept separate from body parsing so that reading a message off the
@@ -156,6 +170,11 @@ impl ControlFrame {
     ///   which draft-19 §10 requires closing the session over.
     pub fn decode<B: Buf>(buf: &mut B) -> Result<Self, DecodeError> {
         let message_type = MessageType::from_u64(VarInt::decode(buf)?.get())?;
+        if !message_type.defined_in(Draft::current()) {
+            return Err(DecodeError::Invalid(
+                "message type is not defined in this draft",
+            ));
+        }
 
         if buf.remaining() < 2 {
             return Err(DecodeError::Short {
@@ -172,6 +191,34 @@ impl ControlFrame {
         let body = buf.copy_to_bytes(len);
 
         Ok(Self { message_type, body })
+    }
+
+    /// [`Self::decode`] in `draft`.
+    ///
+    /// # Errors
+    /// As for [`Self::decode`].
+    pub fn decode_in<B: Buf>(draft: Draft, buf: &mut B) -> Result<Self, DecodeError> {
+        draft.scope(|| Self::decode(buf))
+    }
+
+    /// Parse the body as `M`, in `draft`, requiring it to fill the body
+    /// exactly — which every message must, since the envelope bounds it.
+    ///
+    /// # Errors
+    /// [`DecodeError::Invalid`] if the body is malformed, truncated, or has
+    /// bytes left over.
+    pub fn parse_in<M>(
+        &self,
+        draft: Draft,
+        decode: impl FnOnce(&mut Bytes) -> Result<M, DecodeError>,
+    ) -> Result<M, DecodeError> {
+        let mut body = self.body.clone();
+        let message =
+            draft.scope(|| decode(&mut body).map_err(DecodeError::in_complete_message))?;
+        if body.has_remaining() {
+            return Err(DecodeError::Invalid("bytes left over after message body"));
+        }
+        Ok(message)
     }
 }
 

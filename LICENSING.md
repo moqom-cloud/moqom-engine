@@ -4,17 +4,19 @@ This repository spans both of MOQOM's licence halves, and the line between them
 is the same one drawn in the [platform
 repository](https://github.com/moqom-cloud/moqom/blob/main/LICENSING.md): the
 pieces you build *against* are permissive, and the server that constitutes the
-product is source-available.
+product is proprietary and ships only as a binary.
 
 | Crate | License | Why |
 |---|---|---|
 | `moqom-proto` | Apache-2.0 | An implementation of an IETF draft. Nobody should need permission to speak a standard. |
 | `moqom-transport` | Apache-2.0 | QUIC and WebTransport session establishment — the other half of being able to speak it. |
 | `moqom-client` | Apache-2.0 | A MOQT subscriber and publisher. Receiving frames is this crate, not the admin SDK. |
+| `moqom-direct-ffi` | Apache-2.0 | A C ABI over `moqom-client`'s direct-path socket, linked into the Swift SDK. It ships as one library with `moqom-client`, so it carries the same licence. |
 | `moqom-media` | Apache-2.0 | Reading coded video into objects. Framing, not decoding, and shared by the binary that publishes a file and the harness that measures with one. |
 | `moqom-cli` | Apache-2.0 | The `moqom` binary. It uses only `moqom-client`'s public API. |
 | `moqom-loadgen` | Apache-2.0 | A load harness. It measures the relay from outside, over a socket, and links none of it — so it sits with `fuzz` rather than with the product, and a customer sizing their own deployment can use it. |
-| `moqom-relay` | BUSL-1.1 → Apache-2.0 | The server. This is the product. |
+| `moqom-relay` | Proprietary ([`LicenseRef-MOQOM-Proprietary`](LICENSES/LicenseRef-MOQOM-Proprietary.txt)) | The server. This is the product. Never published, and distributed to BYOC customers only as a signed binary. |
+| `moqom-recorder` | Proprietary | The hosted recorder, on the service side. |
 | `fuzz` | Apache-2.0 | Test harness for the Apache half. |
 | `vendor/quinn` | MIT OR Apache-2.0 | Upstream's, unmodified. See `vendor/quinn-rationale.md`. |
 
@@ -25,7 +27,7 @@ halves, so there is no safe default to fall back on and no workspace-level
 
 ## Why both halves share a workspace
 
-Keeping a BUSL crate beside Apache ones is a deliberate trade, made once and
+Keeping proprietary crates beside Apache ones is a deliberate trade, made once and
 worth restating because it looks like an oversight.
 
 `moqom-relay` depends on `moqom-proto` by path. While
@@ -48,7 +50,7 @@ expires and the Apache crates should be split out.
 
 `moqom-proto`, `moqom-transport`, and `moqom-client` carry no dependency on `moqom-relay` —
 the arrow points the other way. Depending on either of them pulls in no
-BUSL code, and `cargo tree` is the check rather than this sentence.
+proprietary code, and `cargo tree` is the check rather than this sentence.
 
 What they *do* pull in is the `[patch.crates-io]` at the workspace root, which
 redirects `quinn` to the vendored tree. That is a property of building inside

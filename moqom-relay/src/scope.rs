@@ -176,6 +176,89 @@ impl Publish {
     pub const fn has(self, other: Self) -> bool {
         self.0 & other.0 == other.0
     }
+
+    /// The kinds present in both.
+    #[must_use]
+    pub const fn intersect(self, other: Self) -> Self {
+        Self(self.0 & other.0)
+    }
+}
+
+/// The subject every hosted recorder token carries.
+///
+/// The control plane's `RecorderSubject`. It is reserved there: `MintClientToken`
+/// refuses it, so a signed token naming it was minted by the recording link and
+/// by nothing a customer can reach.
+pub const RECORDER_SUBJECT: &str = "moqom-recorder";
+
+/// Whether a verified session with these rights is the hosted recorder.
+///
+/// The subject alone would do, since only the control plane can sign it; the
+/// rights are checked as well so that a recorder token minted with anything
+/// beyond viewing -- which the control plane never does -- is held to the
+/// ceiling like anybody else rather than given a seat the room cannot see.
+/// `elevated` is owning the room, being backstage, or being a relay link.
+#[must_use]
+pub fn is_recorder(user: &str, publish: Publish, capabilities: u32, elevated: bool) -> bool {
+    user == RECORDER_SUBJECT && publish.is_none() && capabilities == 0 && !elevated
+}
+
+/// The most the control plane says somebody holds in a room right now.
+///
+/// A ceiling rather than a grant, and the difference is the rule this whole
+/// mechanism rests on: the relay only ever *narrows* with one. Widening is
+/// what a token is for, because a token is signed and bound to a device key,
+/// and a directive is a message on a link. A relay that widened on a
+/// directive would let anybody who could forge or replay one hand out powers;
+/// a relay that only narrows on one can at worst be told to take powers away,
+/// which a moderator could have done by ejecting the session anyway.
+///
+/// Ownership is not here because it cannot be granted or taken. The room's
+/// owner is a fact about the room, not a power somebody was handed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ceiling {
+    /// The media kinds they may publish, at most.
+    pub publish: Publish,
+    /// The moderation powers they may hold, at most.
+    pub capabilities: u32,
+}
+
+impl Ceiling {
+    /// The lower of two ceilings, for somebody named by more than one.
+    #[must_use]
+    pub const fn meet(self, other: Self) -> Self {
+        Self {
+            publish: self.publish.intersect(other.publish),
+            capabilities: self.capabilities & other.capabilities,
+        }
+    }
+}
+
+/// Which way a change of grants moved somebody.
+///
+/// For the counter and the log line, which are how an operator tells "the
+/// stage is being run" from "something is demoting everybody".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Regrade {
+    /// Gained something and lost nothing. Going on stage from backstage counts.
+    Promotion,
+    /// Lost something and gained nothing. Going backstage from the stage counts.
+    Demotion,
+    /// Gained one thing and lost another: a cohost who became a guest with a
+    /// screen share, say.
+    Lateral,
+}
+
+impl Regrade {
+    /// A stable, low-cardinality name for metrics and logs.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Promotion => "promotion",
+            Self::Demotion => "demotion",
+            Self::Lateral => "lateral",
+        }
+    }
 }
 
 /// What a token said its holder may do.
@@ -205,6 +288,15 @@ pub struct Scope {
     /// Whether this session is backstage — waiting to go live rather than on
     /// stage.
     pub backstage: bool,
+    /// Whether this is another relay's link to this one rather than a person.
+    ///
+    /// A signed grant like the rest, which the control plane mints only for
+    /// relay service accounts, and the only thing it changes is that the
+    /// session is not metered: the relay at the other end meters the people it
+    /// serves, and metering the link too would bill them twice. Read-only by
+    /// construction — [`identity`](crate::identity) refuses it beside any
+    /// publish right or power.
+    pub relay: bool,
 }
 
 impl Scope {
@@ -216,6 +308,20 @@ impl Scope {
     #[must_use]
     const fn runs_the_room(&self) -> bool {
         self.owner || self.capabilities & (capability::STAGE | capability::ROOM) != 0
+    }
+
+    /// Whether this is the hosted recorder rather than a person.
+    ///
+    /// See [`is_recorder`]. The recorder is a viewer the room is told about by
+    /// its watchdog, not a participant, so the room's ceiling does not count it.
+    #[must_use]
+    pub fn is_recorder(&self) -> bool {
+        is_recorder(
+            &self.user,
+            self.publish,
+            self.capabilities,
+            self.owner || self.backstage || self.relay,
+        )
     }
 
     /// Whether the tenant field of a namespace is this holder's tenant.
@@ -231,6 +337,59 @@ impl Scope {
 
     fn is_own_slot(&self, user: &[u8], device: &[u8]) -> bool {
         user == self.user.as_bytes() && device == self.device.as_bytes()
+    }
+
+    /// Whether `other` is the same person, on the same device, in the same
+    /// room — the parts of a scope a renewal may not change.
+    ///
+    /// Who they are is a quota key and the device is what a proof binds to, so
+    /// either changing would be a different session wearing this one's
+    /// connection. The room is here because a move between rooms changes
+    /// everything the session has already been admitted to: its roster entry,
+    /// the bans and the ceiling it was checked against, and every name its
+    /// open requests were authorised under. That is a new session's work.
+    /// Ownership is here because it is not a grant; see [`Ceiling`]. Being a
+    /// relay link is here because it decides whether the session is metered,
+    /// which is fixed when the session opens.
+    #[must_use]
+    pub fn same_seat(&self, other: &Self) -> bool {
+        self.tenant == other.tenant
+            && self.user == other.user
+            && self.device == other.device
+            && self.room == other.room
+            && self.owner == other.owner
+            && self.relay == other.relay
+    }
+
+    /// This scope with nothing above `ceiling`.
+    #[must_use]
+    pub fn capped(&self, ceiling: Ceiling) -> Self {
+        Self {
+            publish: self.publish.intersect(ceiling.publish),
+            capabilities: self.capabilities & ceiling.capabilities,
+            ..self.clone()
+        }
+    }
+
+    /// How going from this scope to `to` moved somebody, or `None` if it did
+    /// not move them at all.
+    ///
+    /// Only the parts a grant change can touch are compared. Callers have
+    /// already established [`Self::same_seat`].
+    #[must_use]
+    pub fn regrade(&self, to: &Self) -> Option<Regrade> {
+        let gained = to.publish.0 & !self.publish.0 != 0
+            || to.capabilities & !self.capabilities != 0
+            || (self.backstage && !to.backstage);
+        let lost = self.publish.0 & !to.publish.0 != 0
+            || self.capabilities & !to.capabilities != 0
+            || (!self.backstage && to.backstage);
+        match (gained, lost) {
+            (false, false) => None,
+            (true, false) => Some(Regrade::Promotion),
+            (false, true) => Some(Regrade::Demotion),
+            (true, true) => Some(Regrade::Lateral),
+        }
     }
 }
 
@@ -338,6 +497,11 @@ impl Permission {
             Self::Nothing => return Err(Denial::Unauthenticated),
             Self::Scoped(scope) => scope,
         };
+        // A relay link reads, and is not metered for it; publishing on one
+        // would be media nobody is billed for.
+        if scope.relay {
+            return Err(Denial::Publishing);
+        }
         let fields = namespace.fields();
         let [tenant, marker, rest @ ..] = fields else {
             return Err(Denial::Shape);
@@ -425,7 +589,9 @@ impl Permission {
             // Anyone in the tenant may follow a named person's own channel. It
             // is deliberately not a room, so there is no membership to check —
             // and the name has to be complete enough to name somebody, or this
-            // would be a way to list the customer's users.
+            // would be a way to list the customer's users. Not on a relay link,
+            // which is minted for one room and reads nothing outside it.
+            PERSONAL if scope.relay => Err(Denial::Room),
             PERSONAL => Ok(()),
             ROOM => {
                 if scope.is_own_room(area) {
@@ -487,6 +653,7 @@ mod tests {
             capabilities: capability::STAGE,
             owner: false,
             backstage: false,
+            relay: false,
         }
     }
 
@@ -501,6 +668,50 @@ mod tests {
 
     fn permission(scope: Scope) -> Permission {
         Permission::scoped(scope)
+    }
+
+    #[test]
+    fn a_renewal_cannot_turn_a_session_into_a_relay_link_or_back() {
+        let link = Scope {
+            relay: true,
+            ..viewer()
+        };
+        assert!(!viewer().same_seat(&link));
+        assert!(!link.same_seat(&viewer()));
+        assert!(link.same_seat(&link.clone()));
+    }
+
+    /// A link is minted for one room: it reads that room and nothing else, not
+    /// even the personal channels any viewer in the tenant may follow, and it
+    /// announces nothing, not even its own personal channel.
+    #[test]
+    fn a_relay_link_reads_its_room_and_nothing_else() {
+        let link = permission(Scope {
+            user: Arc::from("moqom-relay"),
+            relay: true,
+            ..viewer()
+        });
+        assert_eq!(
+            link.may_read(&namespace(&["acme", "r", "room-42", "ada", "device-1"])),
+            Ok(())
+        );
+        assert_eq!(
+            link.may_read(&namespace(&["acme", "r", "room-7"])),
+            Err(Denial::Room)
+        );
+        assert_eq!(
+            link.may_read(&namespace(&["acme", "u", "ada", "device-1"])),
+            Err(Denial::Room)
+        );
+        assert_eq!(
+            permission(viewer()).may_read(&namespace(&["acme", "u", "ada", "device-1"])),
+            Ok(()),
+            "a viewer still follows personal channels"
+        );
+        assert_eq!(
+            link.may_announce(&namespace(&["acme", "u", "moqom-relay", "device-1"])),
+            Err(Denial::Publishing)
+        );
     }
 
     #[test]
@@ -729,6 +940,98 @@ mod tests {
             ])),
             Ok(())
         );
+    }
+
+    /// What may change on a live session and what may not. A grant is the
+    /// first kind; the person, the device, the room and ownership are the
+    /// second, because each of them is part of what the session was admitted as.
+    #[test]
+    fn a_seat_is_who_where_and_whose_room_and_not_what_they_may_do() {
+        assert!(viewer().same_seat(&cohost()));
+        let waiting = Scope {
+            backstage: true,
+            ..viewer()
+        };
+        assert!(waiting.same_seat(&cohost()));
+
+        for moved in [
+            Scope {
+                user: Arc::from("bea"),
+                ..cohost()
+            },
+            Scope {
+                device: Arc::from("device-2"),
+                ..cohost()
+            },
+            Scope {
+                room: Some(Arc::from("room-7")),
+                ..cohost()
+            },
+            Scope {
+                room: None,
+                ..cohost()
+            },
+            Scope {
+                tenant: Arc::from("globex"),
+                ..cohost()
+            },
+            Scope {
+                owner: true,
+                ..cohost()
+            },
+        ] {
+            assert!(!viewer().same_seat(&moved), "{moved:?}");
+        }
+    }
+
+    #[test]
+    fn a_regrade_says_which_way_somebody_moved() {
+        assert_eq!(viewer().regrade(&cohost()), Some(Regrade::Promotion));
+        assert_eq!(cohost().regrade(&viewer()), Some(Regrade::Demotion));
+        assert_eq!(cohost().regrade(&cohost()), None);
+
+        // Leaving the queue for the stage is a promotion although no bit moved,
+        // and the reverse is a demotion: it is the difference between being
+        // seen by the audience and not.
+        let waiting = Scope {
+            backstage: true,
+            ..cohost()
+        };
+        assert_eq!(waiting.regrade(&cohost()), Some(Regrade::Promotion));
+        assert_eq!(cohost().regrade(&waiting), Some(Regrade::Demotion));
+
+        let screen_guest = Scope {
+            publish: Publish::SCREEN,
+            capabilities: 0,
+            ..cohost()
+        };
+        assert_eq!(cohost().regrade(&screen_guest), Some(Regrade::Lateral));
+    }
+
+    /// A ceiling only takes away. Applying the most generous one there is to a
+    /// viewer leaves a viewer.
+    #[test]
+    fn a_ceiling_narrows_and_never_widens() {
+        let demoted = cohost().capped(Ceiling {
+            publish: Publish::AUDIO,
+            capabilities: 0,
+        });
+        assert_eq!(demoted.publish, Publish::AUDIO);
+        assert_eq!(demoted.capabilities, 0);
+        assert!(demoted.same_seat(&cohost()));
+
+        let generous = Ceiling {
+            publish: Publish::from_bits(0xFF),
+            capabilities: capability::KNOWN,
+        };
+        assert_eq!(viewer().capped(generous), viewer());
+
+        let both = generous.meet(Ceiling {
+            publish: Publish::VIDEO,
+            capabilities: capability::CHAT,
+        });
+        assert_eq!(both.publish, Publish::VIDEO);
+        assert_eq!(both.capabilities, capability::CHAT);
     }
 
     #[test]

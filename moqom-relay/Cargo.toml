@@ -6,13 +6,18 @@ rust-version.workspace = true
 authors.workspace = true
 repository.workspace = true
 publish = false
-# BUSL-1.1: the relay is the service half of the licence split. See LICENSING.md.
-license = "BUSL-1.1"
+# Proprietary: the relay is the service half of the licence split. See LICENSING.md.
+license = "LicenseRef-MOQOM-Proprietary"
 description = "A MOQT relay: session state, subscription matching, and fan-out"
 
 [dependencies]
 moqom-proto = { path = "../moqom-proto" }
 moqom-transport = { path = "../moqom-transport" }
+# The device key and the proof it signs, for an edge's links to its parent: the
+# same proof a client makes, so a parent checks a link exactly as it checks one.
+moqom-client = { path = "../moqom-client" }
+# Checking proofs of possession: ML-DSA-65, and ES256 during the rollover.
+moqom-proof = { workspace = true }
 bytes = { workspace = true }
 quinn = { workspace = true }
 rustls = { workspace = true }
@@ -22,11 +27,18 @@ tracing = { workspace = true }
 web-transport-quinn = { workspace = true }
 url = { workspace = true }
 webpki-roots = "0.26"
+# The STUN responder's socket: dual-stack explicitly, and replies sent from the
+# address each request arrived at, which behind a passthrough load balancer is
+# not the machine's own. Both already in the tree beneath quinn, and quinn-udp
+# with the features quinn takes it with.
+socket2 = { workspace = true }
+quinn-udp = { version = "0.5", default-features = false, features = ["tracing"] }
 
-# Verifying the credential a session presents. aws-lc-rs supplies Ed25519 and is
+# Verifying the credential a session presents. aws-lc-rs supplies ML-DSA-65 and is
 # already here as the rustls provider, so the signature check costs no new
 # cryptography; serde reads the claims, which are JSON precisely so that the
 # media-path binary does not have to carry a CBOR/COSE stack.
+moqom-token = { workspace = true }
 aws-lc-rs = { workspace = true }
 base64 = { workspace = true }
 serde = { workspace = true }
@@ -49,6 +61,18 @@ tonic = { version = "0.14", default-features = false, features = ["channel", "co
 tonic-prost = "0.14"
 tokio-stream = "0.1"
 http = "1"
+
+# Usage reports to the billing endpoint, which is plain HTTPS rather than the
+# link's gRPC. Already in the tree beneath tonic, so this adds code rather than
+# libraries, and it is the client the recorder uses for its object store.
+hyper = { version = "1", default-features = false, features = ["client", "http1"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+http-body-util = "0.1"
+
+# TLS on the admin port, for client certificates from an operator authority.
+# Already in the tree beneath tonic; features off so it adds no second crypto
+# provider -- the configuration it is handed names aws-lc-rs explicitly.
+tokio-rustls = { version = "0.26", default-features = false }
 
 [build-dependencies]
 # Only used when MOQOM_REGENERATE_PROTO is set. The output is checked in so that

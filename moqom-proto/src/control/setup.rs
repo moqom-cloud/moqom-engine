@@ -28,10 +28,14 @@
 //! [`Parameters`] rather than aliasing it — passing one where the other is
 //! expected should not compile.
 
+use std::borrow::Cow;
+
 use bytes::{Buf, BufMut, Bytes};
 
 use crate::control::params::{ParamError, Parameter, Parameters};
 use crate::control::request_id::Role;
+use crate::control::typed::Token;
+use crate::draft::Draft;
 use crate::error::DecodeError;
 use crate::varint::VarInt;
 
@@ -65,6 +69,28 @@ pub mod option_type {
     /// value is a compact JWS the relay checks against the token's `cnf.jkt`;
     /// without it a token is a bearer credential and works for whoever holds it.
     pub const AUTHORIZATION_PROOF: u64 = PRIVATE_USE;
+
+    /// The sender understands MOQOM's private Message Parameters
+    /// ([`AUTHORIZATION_PROOF`](crate::control::params::param_type::AUTHORIZATION_PROOF)
+    /// and [`RELAY_HOPS`](crate::control::params::param_type::RELAY_HOPS)).
+    /// Value 1.
+    ///
+    /// Needed from draft-22 on, where an unknown Message Parameter closes the
+    /// session (§9.20): neither may be sent to a peer that has not sent this.
+    /// Draft-19 as MOQOM deployed it skips unknown parameters, so there both
+    /// are always safe to send. An unknown Setup Option is ignored in every
+    /// draft, so offering this costs nothing with a peer that does not know it.
+    /// Even, so it carries a varint: [`super::PRIVATE_USE_VARINT`].
+    pub const MOQOM_PARAMETERS: u64 = super::PRIVATE_USE_VARINT;
+
+    /// The sender reads and honours the
+    /// [`HOP_LIMIT`](crate::control::params::param_type::HOP_LIMIT) Message
+    /// Parameter, from draft-elliottwave-moq-hop-limit.
+    ///
+    /// Odd, with an empty value: presence alone declares support, and a
+    /// non-empty value or a second copy is a `PROTOCOL_VIOLATION`.
+    /// Provisional until IANA assigns one.
+    pub const HOP_LIMIT_SUPPORTED: u64 = 0x40C51;
 }
 
 /// Where this implementation numbers an extension of its own.
@@ -282,6 +308,12 @@ impl SetupOptions {
         self.bytes_of(option_type::AUTHORIZATION_PROOF)
     }
 
+    /// Whether the sender declared [`option_type::MOQOM_PARAMETERS`].
+    #[must_use]
+    pub fn moqom_parameters(&self) -> bool {
+        self.varint_or(option_type::MOQOM_PARAMETERS, 0) == 1
+    }
+
     /// Auth token cache budget in bytes.
     ///
     /// Defaults to zero, which prohibits token aliases entirely. Reading this
@@ -375,15 +407,48 @@ impl Setup {
         Ok(())
     }
 
+    /// The options as the ambient draft writes them.
+    ///
+    /// Draft-22 §9.1.4 makes the `AUTHORIZATION_TOKEN` option a Token
+    /// structure, where draft-19 as MOQOM deployed it carried the bare token.
+    /// [`SetupOptions`] holds the bare token either way, so callers do not
+    /// care which draft they are in; the structure is added here and removed
+    /// in [`Self::decode`].
+    fn wire(&self) -> Cow<'_, Parameters> {
+        if !Draft::current().typed_parameters() {
+            return Cow::Borrowed(&self.options.0);
+        }
+        Cow::Owned(
+            self.options
+                .0
+                .as_slice()
+                .iter()
+                .map(|p| match p.as_bytes() {
+                    Some(value) if p.type_value() == option_type::AUTHORIZATION_TOKEN => {
+                        let token = Token::UseValue {
+                            token_type: 0,
+                            value: value.clone(),
+                        };
+                        let mut out = Vec::with_capacity(token.encoded_len());
+                        token.encode(&mut out);
+                        Parameter::bytes(option_type::AUTHORIZATION_TOKEN, out)
+                            .unwrap_or_else(|_| p.clone())
+                    }
+                    _ => p.clone(),
+                })
+                .collect(),
+        )
+    }
+
     /// Encoded size of the message body, excluding the envelope.
     #[must_use]
     pub fn encoded_len(&self) -> usize {
-        self.options.0.encoded_len()
+        self.wire().encoded_len()
     }
 
     /// Append the message body to `buf`, excluding the envelope.
     pub fn encode<B: BufMut>(&self, buf: &mut B) {
-        self.options.0.encode(buf);
+        self.wire().encode(buf);
     }
 
     /// Decode a message body of exactly `byte_len` bytes.
@@ -391,12 +456,43 @@ impl Setup {
     /// The length comes from the envelope; options have no terminator, so the
     /// body cannot be parsed without it.
     ///
+    /// Under draft-22 each `AUTHORIZATION_TOKEN` is unwrapped from its Token
+    /// structure. A `REGISTER` is read as `USE_VALUE`, which is what
+    /// §9.1.4 requires of a server whose cache it would overflow, and MOQOM
+    /// advertises a cache of zero.
+    ///
     /// # Errors
-    /// Propagates [`DecodeError`] from the option sequence. Role and transport
-    /// rules are not applied here — see [`Self::validate`].
+    /// Propagates [`DecodeError`] from the option sequence, or for a Token
+    /// structure that does not parse. Role and transport rules are not applied
+    /// here — see [`Self::validate`].
     pub fn decode<B: Buf>(buf: &mut B, byte_len: usize) -> Result<Self, DecodeError> {
+        let options = Parameters::decode(buf, byte_len)?;
+        if !Draft::current().typed_parameters() {
+            return Ok(Self {
+                options: SetupOptions(options),
+            });
+        }
+        let mut unwrapped = Vec::with_capacity(options.len());
+        for p in options.as_slice() {
+            match p.as_bytes() {
+                Some(raw) if p.type_value() == option_type::AUTHORIZATION_TOKEN => {
+                    // §9.1.4: an alias cannot be referred to before the
+                    // session exists, so only the forms with a value belong.
+                    let Some(value) = Token::decode(raw)?.value().cloned() else {
+                        return Err(DecodeError::Invalid(
+                            "SETUP may not delete or use a token alias",
+                        ));
+                    };
+                    unwrapped.push(
+                        Parameter::bytes(option_type::AUTHORIZATION_TOKEN, value)
+                            .map_err(|_| DecodeError::Invalid("token value too long"))?,
+                    );
+                }
+                _ => unwrapped.push(p.clone()),
+            }
+        }
         Ok(Self {
-            options: SetupOptions(Parameters::decode(buf, byte_len)?),
+            options: SetupOptions(Parameters::from_vec(unwrapped)),
         })
     }
 }

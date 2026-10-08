@@ -153,12 +153,7 @@ impl Server {
         let port = first.local_addr()?;
         let mut servers = vec![first];
         for _ in 1..shards.get() {
-            servers.push(Self::new(Self::endpoint(
-                port,
-                config.clone(),
-                dscp,
-                true,
-            )?));
+            servers.push(Self::new(Self::endpoint(port, config.clone(), dscp, true)?));
         }
         Ok(servers)
     }
@@ -207,7 +202,7 @@ impl Server {
         dscp: Option<u8>,
         share_port: bool,
     ) -> io::Result<quinn::Endpoint> {
-        if dscp.is_none() && !share_port {
+        if dscp.is_none() && !share_port && addr.is_ipv4() {
             return quinn::Endpoint::server(config, addr);
         }
 
@@ -225,12 +220,20 @@ impl Server {
         if share_port {
             socket.set_reuse_port(true)?;
         }
+        if addr.is_ipv6() {
+            // A wildcard `[::]` serves IPv4 clients as mapped addresses only with this off, and
+            // the platform default is not something a deployment should depend on.
+            socket.set_only_v6(false)?;
+        }
         if let Some(dscp) = dscp {
             // Shifted into the top six bits: the value names a codepoint, and the two bits below
             // it are ECN's, which belong to the transport.
             let tos = u32::from(dscp) << 2;
             if addr.is_ipv6() {
-                socket.set_tclass_v6(tos)?;
+                set_tclass_v6(&socket, tos)?;
+                // IPv4 clients of a dual-stack socket are marked by IP_TOS, not the traffic
+                // class. Platforms that refuse it on an IPv6 socket still mark IPv6.
+                let _ = socket.set_tos_v4(tos);
             } else {
                 socket.set_tos_v4(tos)?;
             }
@@ -394,6 +397,23 @@ impl std::fmt::Display for Negotiated {
     }
 }
 
+/// Set the IPv6 traffic class, which carries the codepoint.
+#[cfg(not(all(target_vendor = "apple", not(target_os = "macos"))))]
+fn set_tclass_v6(socket: &socket2::Socket, tclass: u32) -> io::Result<()> {
+    socket.set_tclass_v6(tclass)
+}
+
+/// socket2 offers `IPV6_TCLASS` only on the platforms it lists, and iOS is not
+/// one. A codepoint is the relay's setting, never a phone's, so this crate
+/// still builds there for `moqom-client` and refuses the option at runtime.
+#[cfg(all(target_vendor = "apple", not(target_os = "macos")))]
+fn set_tclass_v6(_socket: &socket2::Socket, _tclass: u32) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "an IPv6 traffic class cannot be set on this platform",
+    ))
+}
+
 /// Stands in for the `CONNECT` URL a raw QUIC session never had.
 fn placeholder_url() -> web_transport_quinn::proto::ConnectRequest {
     let url = url::Url::parse("https://moqt.invalid/").expect("a constant, valid URL");
@@ -428,5 +448,25 @@ mod tests {
         let tls = with_moqt_alpn(tls);
         let offered: Vec<&[u8]> = tls.alpn_protocols.iter().map(Vec::as_slice).collect();
         assert_eq!(offered, alpn::OFFERED);
+    }
+
+    /// Every listener and client in the engine is built on this provider, so
+    /// this is the one place that has to hold for all of them to send the
+    /// hybrid share first. It fails if the workspace's `prefer-post-quantum`
+    /// feature on rustls is ever dropped.
+    #[test]
+    fn the_provider_listeners_are_built_on_prefers_the_hybrid() {
+        let provider = rustls::crypto::aws_lc_rs::default_provider();
+        let groups: Vec<rustls::NamedGroup> = provider
+            .kx_groups
+            .iter()
+            .map(|group| group.name())
+            .collect();
+        assert_eq!(
+            groups.first(),
+            Some(&rustls::NamedGroup::X25519MLKEM768),
+            "{groups:?}"
+        );
+        assert!(groups.contains(&rustls::NamedGroup::X25519), "{groups:?}");
     }
 }

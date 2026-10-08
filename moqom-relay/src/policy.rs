@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::media::Kinds;
-use crate::scope::Scope;
+use crate::scope::{Ceiling, Scope};
 
 /// A room, named the way everything upstream names one.
 pub type Where = (Arc<str>, Arc<str>);
@@ -212,6 +212,31 @@ impl Silence {
     }
 }
 
+/// The most one participant may hold, as a moderator last set it.
+///
+/// Kept per room, beside the mutes, rather than on the session it was aimed at,
+/// and for the reason a mute is: a demotion has to outlive the connection it
+/// was applied to. Somebody demoted who reconnects with the token they held
+/// before must come back demoted, or reconnecting would be the way to undo it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Override {
+    /// The account.
+    pub user: String,
+    /// Which device, or empty for every device — the `ParticipantRef`
+    /// convention again.
+    pub device: String,
+    /// What they may hold, at most.
+    pub ceiling: Ceiling,
+}
+
+impl Override {
+    /// Whether this names that person, and that device if it names one.
+    #[must_use]
+    pub fn catches(&self, user: &str, device: &str) -> bool {
+        self.user == user && (self.device.is_empty() || self.device == device)
+    }
+}
+
 /// Everything the relay must know to serve one room without asking again.
 #[derive(Debug, Clone, Default)]
 pub struct Rules {
@@ -223,6 +248,11 @@ pub struct Rules {
     pub ceiling: u32,
     /// Force-mutes in force.
     pub mutes: Vec<Mute>,
+    /// Grant ceilings in force. See [`Override`].
+    pub grants: Vec<Override>,
+    /// The room keeps every participant's media on the relay, so no direct
+    /// tickets are issued in it.
+    pub relay_only: bool,
 }
 
 /// Why a session was not let in.
@@ -241,6 +271,10 @@ pub enum Refusal {
     /// it is willing to admit people on stale policy.
     #[error("this relay is not currently supervised")]
     Unsupervised,
+    /// Billing has told this self-hosted relay that its tenant may not admit
+    /// new sessions. See [`crate::usage::Usage::admitting`].
+    #[error("this account is not admitting new sessions")]
+    NotAdmitting,
 }
 
 impl Refusal {
@@ -252,6 +286,7 @@ impl Refusal {
             Self::Closed => "closed",
             Self::Full => "full",
             Self::Unsupervised => "unsupervised",
+            Self::NotAdmitting => "billing",
         }
     }
 }
@@ -433,6 +468,55 @@ impl Policy {
         silence
     }
 
+    /// Whether the room's policy keeps media on the relay.
+    ///
+    /// `false` for a room this relay knows nothing about, which is the same
+    /// permissive answer [`Self::silenced`] gives: a peer still checks the
+    /// other's credentials, and `MoqomKit` opts out on its own policy too.
+    #[must_use]
+    pub fn relay_only(&self, room: &Where) -> bool {
+        self.lock()
+            .rooms
+            .get(room)
+            .is_some_and(|rules| rules.relay_only)
+    }
+
+    /// Set the most one participant may hold, replacing what was set before.
+    ///
+    /// One aimed at a whole person replaces the per-device ones for them as
+    /// well. Otherwise a cohost demoted on their phone and then promoted as a
+    /// person would stay demoted on the phone, because [`Self::ceiling`] takes
+    /// the lower of everything that names a device — which is the right answer
+    /// when two rules genuinely disagree, and the wrong one when the later rule
+    /// was meant to supersede the earlier.
+    pub fn regrant(&self, room: Where, grant: Override) {
+        let mut inner = self.lock();
+        let rules = inner.rooms.entry(room).or_default();
+        rules.grants.retain(|held| {
+            held.user != grant.user || !(grant.device.is_empty() || held.device == grant.device)
+        });
+        rules.grants.push(grant);
+    }
+
+    /// The most one participant may hold, or `None` when no moderator has said.
+    ///
+    /// `None` is not "nothing": it is the ordinary case, a token that governs on
+    /// its own. When more than one rule names the device — one for the person,
+    /// one for this device — the lower of them holds, because a policy store
+    /// that disagrees with itself should fail towards less.
+    #[must_use]
+    pub fn ceiling(&self, room: &Where, user: &str, device: &str) -> Option<Ceiling> {
+        let inner = self.lock();
+        inner
+            .rooms
+            .get(room)?
+            .grants
+            .iter()
+            .filter(|grant| grant.catches(user, device))
+            .map(|grant| grant.ceiling)
+            .reduce(Ceiling::meet)
+    }
+
     /// Note a ban that arrived in a form this relay could not read.
     pub fn unreadable(&self) {
         self.lock().unreadable += 1;
@@ -518,8 +602,14 @@ impl Policy {
         // The owner is never refused for capacity. A room whose host cannot
         // rejoin after a dropped connection is a room nobody can moderate, and
         // the ceiling exists to bound cost rather than to keep anybody out in
-        // particular.
-        if rules.ceiling > 0 && occupancy >= rules.ceiling as usize && !scope.owner {
+        // particular. Nor is the hosted recorder, which is not a participant:
+        // a room someone asked to record is recorded however full it is, and
+        // `occupancy` does not count it, so it never takes a person's place.
+        if rules.ceiling > 0
+            && occupancy >= rules.ceiling as usize
+            && !scope.owner
+            && !scope.is_recorder()
+        {
             return Err(Refusal::Full);
         }
         Ok(())
@@ -542,6 +632,7 @@ mod tests {
             capabilities: 0,
             owner: false,
             backstage: false,
+            relay: false,
         }
     }
 
@@ -668,6 +759,39 @@ mod tests {
         let mut host = scope("ada");
         host.owner = true;
         assert!(policy.admits(&host, address(4), 9).is_ok());
+    }
+
+    #[test]
+    fn a_full_room_still_admits_its_recorder_and_only_a_viewing_one() {
+        let policy = Policy::new();
+        policy.describe(
+            room(),
+            Rules {
+                ceiling: 2,
+                ..Rules::default()
+            },
+        );
+        let mut recorder = scope(crate::scope::RECORDER_SUBJECT);
+        recorder.publish = Publish::NONE;
+        assert!(recorder.is_recorder());
+        assert!(policy.admits(&recorder, address(4), 2).is_ok());
+        assert!(policy.admits(&recorder, address(4), 50).is_ok());
+
+        // The reserved name with anything beyond viewing is not the recorder
+        // the control plane mints, and gets no seat beyond the ceiling.
+        let publishing = scope(crate::scope::RECORDER_SUBJECT);
+        assert!(!publishing.is_recorder());
+        assert_eq!(
+            policy.admits(&publishing, address(4), 2),
+            Err(Refusal::Full)
+        );
+
+        // Nor does it get past anything else.
+        policy.close(room(), true);
+        assert_eq!(
+            policy.admits(&recorder, address(4), 0),
+            Err(Refusal::Closed)
+        );
     }
 
     #[test]
@@ -919,6 +1043,64 @@ mod tests {
         );
         policy.describe(room(), Rules::default());
         assert!(policy.silenced(&room(), "ada", "phone").is_empty());
+    }
+
+    fn ceiling(publish: Publish, capabilities: u32) -> Ceiling {
+        Ceiling {
+            publish,
+            capabilities,
+        }
+    }
+
+    #[test]
+    fn a_grant_ceiling_names_a_person_or_one_of_their_devices() {
+        let policy = Policy::new();
+        assert_eq!(policy.ceiling(&room(), "ada", "phone"), None);
+
+        policy.regrant(
+            room(),
+            Override {
+                user: "ada".into(),
+                device: "phone".into(),
+                ceiling: ceiling(Publish::NONE, 0),
+            },
+        );
+        assert_eq!(
+            policy.ceiling(&room(), "ada", "phone"),
+            Some(ceiling(Publish::NONE, 0))
+        );
+        assert_eq!(policy.ceiling(&room(), "ada", "laptop"), None);
+
+        // A rule for the person, alongside the one for the phone: the phone is
+        // held to the lower of the two until something supersedes them.
+        policy.regrant(
+            room(),
+            Override {
+                user: "ada".into(),
+                device: "laptop".into(),
+                ceiling: ceiling(Publish::AUDIO, 0x100),
+            },
+        );
+        assert_eq!(
+            policy.ceiling(&room(), "ada", "phone"),
+            Some(ceiling(Publish::NONE, 0))
+        );
+
+        // Promoting the person replaces both device rules, so the phone is not
+        // left behind on its old demotion.
+        policy.regrant(
+            room(),
+            Override {
+                user: "ada".into(),
+                device: String::new(),
+                ceiling: ceiling(Publish::AUDIO, 0x100),
+            },
+        );
+        assert_eq!(
+            policy.ceiling(&room(), "ada", "phone"),
+            Some(ceiling(Publish::AUDIO, 0x100))
+        );
+        assert_eq!(policy.ceiling(&room(), "bea", "phone"), None);
     }
 
     #[test]

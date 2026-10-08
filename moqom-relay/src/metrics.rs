@@ -203,6 +203,37 @@ impl Fetched {
     }
 }
 
+/// What became of a datagram on the STUN port. See [`crate::stun`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stun {
+    /// A Binding request, answered with the address it came from.
+    Answered,
+    /// A Binding request from a source over its allowance, dropped.
+    Limited,
+    /// Anything else, dropped unanswered.
+    Ignored,
+}
+
+impl Stun {
+    const ALL: [Self; 3] = [Self::Answered, Self::Limited, Self::Ignored];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Answered => "answered",
+            Self::Limited => "limited",
+            Self::Ignored => "ignored",
+        }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Answered => 0,
+            Self::Limited => 1,
+            Self::Ignored => 2,
+        }
+    }
+}
+
 /// A fixed-bucket cumulative histogram.
 ///
 /// Bucket bounds are chosen per metric rather than generically, because a
@@ -317,6 +348,7 @@ struct Inner {
     subscriptions: [AtomicU64; Subscribed::ALL.len()],
     fetches: [AtomicU64; Fetched::ALL.len()],
     fetch_records: AtomicU64,
+    stun: [AtomicU64; Stun::ALL.len()],
 
     admitted: [AtomicU64; Resource::ALL.len()],
     /// By resource, then by the tier whose allowance ran out.
@@ -356,6 +388,20 @@ struct Inner {
     /// counts too — it is the same directive with nothing left in it — which
     /// is why the series is not a gauge of how many people are muted.
     mutes: AtomicU64,
+    /// Live sessions whose grants changed without reconnecting, by
+    /// [`crate::scope::Regrade::name`].
+    regrades: Mutex<HashMap<&'static str, u64>>,
+    /// Renewals that verified and asked for different grants, and were not
+    /// given them, by a fixed set of reasons.
+    ///
+    /// Separate from `tokens_refused`, which counts credentials that are bad.
+    /// These are good credentials asking for something this relay will not do
+    /// on a live session, and a run of them is a client or a backend minting
+    /// promotions wrongly rather than anybody failing to authenticate.
+    regrades_refused: Mutex<HashMap<&'static str, u64>>,
+    /// Requests ended because a change of grants no longer covered them, by
+    /// what kind of request it was.
+    revocations: Mutex<HashMap<&'static str, u64>>,
 
     subgroups_forwarded: AtomicU64,
     subgroups_dropped: AtomicU64,
@@ -599,6 +645,7 @@ impl Metrics {
                 subscriptions: counters(),
                 fetches: counters(),
                 fetch_records: AtomicU64::new(0),
+                stun: counters(),
                 admitted: counters(),
                 refused: std::array::from_fn(|_| counters()),
                 refusal_reasons: counters(),
@@ -609,6 +656,9 @@ impl Metrics {
                 directives: Mutex::new(HashMap::new()),
                 ejections: AtomicU64::new(0),
                 mutes: AtomicU64::new(0),
+                regrades: Mutex::new(HashMap::new()),
+                regrades_refused: Mutex::new(HashMap::new()),
+                revocations: Mutex::new(HashMap::new()),
                 subgroups_forwarded: AtomicU64::new(0),
                 subgroups_dropped: AtomicU64::new(0),
                 subgroups_shed: AtomicU64::new(0),
@@ -807,6 +857,13 @@ impl Metrics {
         }
     }
 
+    /// A datagram arrived on the STUN port, and this became of it.
+    pub fn stun(&self, outcome: Stun) {
+        if let Some(inner) = self.inner() {
+            inner.stun[outcome.index()].fetch_add(1, ORDER);
+        }
+    }
+
     /// The rate limiter let a request through.
     pub fn admitted(&self, resource: Resource) {
         if let Some(inner) = self.inner() {
@@ -907,6 +964,29 @@ impl Metrics {
     pub fn muted(&self) {
         if let Some(inner) = self.inner() {
             inner.mutes.fetch_add(1, ORDER);
+        }
+    }
+
+    /// A live session's grants changed. `change` is a fixed set.
+    pub fn regraded(&self, change: &'static str) {
+        if let Some(inner) = self.inner() {
+            bump(&inner.regrades, change);
+        }
+    }
+
+    /// A verified renewal asked for different grants and was not given them.
+    /// `reason` is a fixed set.
+    pub fn regrade_refused(&self, reason: &'static str) {
+        if let Some(inner) = self.inner() {
+            bump(&inner.regrades_refused, reason);
+        }
+    }
+
+    /// A request was ended because the session's grants no longer cover it.
+    /// `request` is a fixed set.
+    pub fn revoked(&self, request: &'static str) {
+        if let Some(inner) = self.inner() {
+            bump(&inner.revocations, request);
         }
     }
 
@@ -1099,6 +1179,12 @@ impl Metrics {
             "Records delivered on fetch streams.",
             inner.fetch_records.load(ORDER),
         );
+        counter(
+            &mut out,
+            "moqom_relay_stun_requests_total",
+            "Datagrams on the STUN port, by what became of them.",
+            &Stun::ALL.map(|s| ("outcome", s.label(), inner.stun[s.index()].load(ORDER))),
+        );
 
         counter(
             &mut out,
@@ -1249,6 +1335,37 @@ impl Metrics {
             "Force-mutes applied to a session, including the ones that lifted a mute.",
             inner.mutes.load(ORDER),
         );
+        for (name, help, label, counts) in [
+            (
+                "moqom_relay_grants_changed_total",
+                "Live sessions whose grants changed without reconnecting, by direction.",
+                "change",
+                &inner.regrades,
+            ),
+            (
+                "moqom_relay_grant_changes_refused_total",
+                "Verified renewals asking for different grants that were not applied, by reason.",
+                "reason",
+                &inner.regrades_refused,
+            ),
+            (
+                "moqom_relay_grant_revocations_total",
+                "Requests ended because a change of grants no longer covered them, by request kind.",
+                "request",
+                &inner.revocations,
+            ),
+        ] {
+            let mut seen: Vec<(&'static str, u64)> = counts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .map(|(&key, &n)| (key, n))
+                .collect();
+            seen.sort_unstable();
+            let series: Vec<(&str, &str, u64)> =
+                seen.iter().map(|&(key, n)| (label, key, n)).collect();
+            counter(&mut out, name, help, &series);
+        }
         plain(
             &mut out,
             "gauge",
@@ -1542,6 +1659,15 @@ pub struct Gauges {
 /// `AtomicU64` is not `Copy`, so the array repeat syntax does not apply.
 fn counters<const N: usize>() -> [AtomicU64; N] {
     std::array::from_fn(|_| AtomicU64::new(0))
+}
+
+/// Count one more of `key` in a map keyed by a fixed set of names.
+fn bump(counts: &Mutex<HashMap<&'static str, u64>>, key: &'static str) {
+    *counts
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(key)
+        .or_insert(0) += 1;
 }
 
 /// A single unlabelled metric.

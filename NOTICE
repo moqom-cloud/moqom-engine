@@ -1,0 +1,24 @@
+MOQOM Engine
+Copyright 2026 Elliott Wave LLC. All rights reserved except as licensed below.
+
+Each crate carries its own licence, declared in its Cargo.toml `license` field
+and mapped in LICENSING.md: Apache-2.0 for the protocol, transport, client,
+media, CLI, load generator and fuzz harness; MIT for moqom-rans and
+moqom-rans-ffi; proprietary (LicenseRef-MOQOM-Proprietary) for moqom-relay and
+moqom-recorder, which are confidential. Full texts are in LICENSES/.
+
+"MOQOM" and the MOQOM logo are trademarks of Elliott Wave LLC.
+
+Elliott Wave LLC has patent applications pending. No patent license is granted
+except as stated in the licence of the crate concerned.
+
+-------------------------------------------------------------------------------
+Third-party components
+-------------------------------------------------------------------------------
+
+vendor/quinn — Copyright the quinn contributors, MIT OR Apache-2.0. Unmodified
+upstream source; see vendor/quinn-rationale.md.
+
+moqom-rans — derivative of packages/msrtc_rans in Microsoft's MLVC release
+(https://github.com/microsoft/mlvc). Copyright (c) Microsoft Corporation, MIT.
+See moqom-rans/LICENSE.

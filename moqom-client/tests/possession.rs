@@ -16,12 +16,12 @@
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
-use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use moqom_client::{Credentials, DeviceKey, Session};
 use moqom_relay::possession::{Enforcement, Possession};
-use moqom_relay::{Authenticator, Cache, Fabric, Limits, Session as RelaySession, VerificationKey};
+use moqom_relay::{Authenticator, Cache, Fabric, Limits, Session as RelaySession};
+use moqom_token::{Claims, Confirmation, Grant, Signer};
 use moqom_transport::{Server, server::with_moqt_alpn};
 
 const PATIENCE: Duration = Duration::from_secs(10);
@@ -63,13 +63,7 @@ impl Relay {
         );
 
         // An empty issuer accepts any, which is what the relay's own harness does.
-        let authenticator = Authenticator::new(
-            "",
-            vec![VerificationKey {
-                id: KEY_ID.to_owned(),
-                bytes: signer().public_key().as_ref().to_vec(),
-            }],
-        );
+        let authenticator = Authenticator::new("", vec![signer().public_key()]);
         let fabric = Fabric::with_cache(Cache::new(Limits::default()))
             .authenticated(authenticator)
             .proving(Possession::new(Enforcement::Required, Some(identity)));
@@ -105,38 +99,46 @@ impl Drop for Relay {
 
 /// The issuing key. A fixed seed, because what varies between these tests is the
 /// device key and not the issuer.
-fn signer() -> Ed25519KeyPair {
-    Ed25519KeyPair::from_seed_unchecked(&[7u8; 32]).expect("a valid Ed25519 seed")
+fn signer() -> Signer {
+    Signer::from_seed(&[7u8; 32])
+        .expect("a valid ML-DSA-65 seed")
+        .with_id(KEY_ID)
 }
 
 /// A token committed to `thumbprint`, shaped the way the control plane mints one.
 fn token_bound_to(thumbprint: &str) -> Vec<u8> {
+    token_bound_to_lasting(thumbprint, 600)
+}
+
+/// A token for `thumbprint` that expires `seconds` from now. A negative value
+/// mints one, issued two seconds before that, that is already inside the clock
+/// skew a relay forgives, which is how a test gets one that lapses within
+/// seconds.
+fn token_bound_to_lasting(thumbprint: &str, seconds: i64) -> Vec<u8> {
     let issued = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("after the epoch")
-        .as_secs();
-    let header = serde_json::json!({ "alg": "EdDSA", "typ": "MOQT", "kid": KEY_ID });
-    let claims = serde_json::json!({
-        "iss": "https://api.moqom.cloud",
-        "sub": "ada",
-        "aud": "acme",
-        "iat": issued,
-        "exp": issued + 600,
-        "cnf": { "jkt": thumbprint },
-        "moqt": { "room": "room-42", "pub": 3, "cap": 0, "own": false, "bs": false },
-    });
-
-    let signing_input = format!(
-        "{}.{}",
-        URL_SAFE_NO_PAD.encode(header.to_string()),
-        URL_SAFE_NO_PAD.encode(claims.to_string())
-    );
-    let signature = signer().sign(signing_input.as_bytes());
-    format!(
-        "{signing_input}.{}",
-        URL_SAFE_NO_PAD.encode(signature.as_ref())
-    )
-    .into_bytes()
+        .as_secs()
+        .cast_signed();
+    signer()
+        .sign(&Claims {
+            iss: "https://api.moqom.cloud".to_owned(),
+            sub: "ada".to_owned(),
+            tenant: "acme".to_owned(),
+            iat: if seconds > 0 { issued } else { issued + seconds - 2 },
+            exp: issued + seconds,
+            cnf: Confirmation {
+                jkt: thumbprint.to_owned(),
+            },
+            grant: Grant {
+                room: "room-42".to_owned(),
+                publish: 3,
+                ..Grant::default()
+            },
+            ..Claims::default()
+        })
+        .expect("a complete token")
+        .into_bytes()
 }
 
 async fn within<F: Future>(what: &str, future: F) -> F::Output {
@@ -272,4 +274,57 @@ async fn one_token_admits_two_sessions() {
     .expect("the second session is admitted with a fresh proof");
 
     drop((first, second));
+}
+
+/// A publisher renews on its announcement and its session outlives the token it
+/// opened with. A subscription renews the same way, through the same code.
+#[tokio::test]
+async fn a_renewal_on_an_announcement_outlives_the_first_token() {
+    let relay = Relay::requiring_proofs();
+    let tls = moqom_client::tls::pinned(relay.certificate.clone());
+    let (key, _) = DeviceKey::generate().expect("a device key");
+    let thumbprint = key.thumbprint();
+
+    let lapsing = token_bound_to_lasting(&thumbprint, -28);
+    let mut session = within(
+        "connect with a token about to lapse",
+        Session::connect(
+            relay.addr,
+            "localhost",
+            tls,
+            Some(&Credentials::proven(&lapsing, &key)),
+        ),
+    )
+    .await
+    .expect("admitted inside the clock skew");
+
+    let device = &thumbprint[..16];
+    let mut announcement = within(
+        "announce",
+        session.announce(
+            moqom_client::TrackNamespace::from_parts(["acme", "r", "room-42", "ada", device])
+                .expect("a valid namespace"),
+        ),
+    )
+    .await
+    .expect("the relay accepts the announcement");
+
+    let fresh = token_bound_to(&thumbprint);
+    within(
+        "renew",
+        announcement.renew(&Credentials::proven(&fresh, &key)),
+    )
+    .await
+    .expect("the renewal is written");
+
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    within(
+        "watch the room after the first token lapsed",
+        session.watch(
+            moqom_client::TrackNamespace::from_parts(["acme", "r", "room-42"])
+                .expect("a valid namespace"),
+        ),
+    )
+    .await
+    .expect("the session outlived the token it opened with");
 }

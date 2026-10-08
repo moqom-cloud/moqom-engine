@@ -26,11 +26,17 @@
 //! than a weakness to note quietly. Anyone reading this file can mint tokens the
 //! relay trusts, so `jwks` prints a warning beside the key set. The failure worth
 //! preventing is an operator pasting it into a relay that is not a test relay.
+//!
+//! The device keys the tokens are bound to are derived the same way, from each
+//! identity's name, and are just as public. Derived rather than generated because
+//! the publisher's namespace is its thumbprint, and the hosts of a run agree on
+//! it without talking to each other.
 
-use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair};
-use aws_lc_rs::{digest, error};
-use base64::Engine as _;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use std::sync::Arc;
+
+use aws_lc_rs::digest;
+use moqom_client::DeviceKey;
+use moqom_token::{Claims, Confirmation, Grant, Signer};
 
 /// The issuer the minted tokens name, and what a relay must be told to expect.
 pub const ISSUER: &str = "https://loadgen.moqom.invalid";
@@ -47,17 +53,17 @@ const DEVICE_ID_LENGTH: usize = 16;
 
 /// The signing half of a run's identities.
 pub struct Mint {
-    pair: Ed25519KeyPair,
+    signer: Signer,
 }
 
 impl Mint {
     /// Derive the signer from `seed`.
     ///
     /// # Errors
-    /// A seed the curve will not accept.
-    pub fn from_seed(seed: &[u8; 32]) -> Result<Self, error::KeyRejected> {
+    /// A seed ML-DSA-65 will not accept.
+    pub fn from_seed(seed: &[u8; 32]) -> Result<Self, moqom_token::KeyError> {
         Ok(Self {
-            pair: Ed25519KeyPair::from_seed_unchecked(seed)?,
+            signer: Signer::from_seed(seed)?.with_id(KEY_ID),
         })
     }
 
@@ -65,8 +71,7 @@ impl Mint {
     /// document `MOQOM_RELAY_JWKS` reads.
     #[must_use]
     pub fn jwks(&self) -> String {
-        let x = URL_SAFE_NO_PAD.encode(self.pair.public_key().as_ref());
-        format!(r#"{{"keys":[{{"kty":"OKP","crv":"Ed25519","kid":"{KEY_ID}","x":"{x}"}}]}}"#)
+        serde_json::json!({ "keys": [self.signer.public_key().jwk()] }).to_string()
     }
 
     /// A token for one identity, valid for `seconds`.
@@ -74,38 +79,37 @@ impl Mint {
     /// `publish` is the media-kind bitmask: non-empty for the publisher, zero for
     /// a viewer. That is the difference between a session that may announce its
     /// own slot and one that may only watch.
-    #[must_use]
-    pub fn token(&self, who: &Identity, publish: u8, seconds: u64) -> String {
+    ///
+    /// # Errors
+    /// [`moqom_token::Error::Lifetime`] for `seconds` beyond the fifteen minutes
+    /// a relay accepts, which is refused here rather than at the relay.
+    pub fn token(
+        &self,
+        who: &Identity,
+        publish: u8,
+        seconds: u64,
+    ) -> Result<String, moqom_token::Error> {
         let issued = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("a clock after the epoch")
             .as_secs();
-        let claims = serde_json::json!({
-            "iss": ISSUER,
-            "sub": who.user,
-            "aud": who.tenant,
-            "iat": issued,
-            "exp": issued + seconds,
-            "cnf": { "jkt": who.thumbprint },
-            "moqt": {
-                "room": who.room,
-                "pub": publish,
-                "cap": 0,
-                "own": false,
-                "bs": false,
+        let issued = i64::try_from(issued).expect("a representable clock");
+        self.signer.sign(&Claims {
+            iss: ISSUER.to_owned(),
+            sub: who.user.clone(),
+            tenant: who.tenant.clone(),
+            iat: issued,
+            exp: issued.saturating_add(i64::try_from(seconds).unwrap_or(i64::MAX)),
+            cnf: Confirmation {
+                jkt: who.thumbprint.clone(),
             },
-        });
-        let header = serde_json::json!({ "alg": "EdDSA", "typ": "MOQT", "kid": KEY_ID });
-        self.sign(&header, &claims)
-    }
-
-    /// Compact JWS over `header` and `claims`.
-    fn sign(&self, header: &serde_json::Value, claims: &serde_json::Value) -> String {
-        let header = URL_SAFE_NO_PAD.encode(header.to_string());
-        let claims = URL_SAFE_NO_PAD.encode(claims.to_string());
-        let signing = format!("{header}.{claims}");
-        let signature = URL_SAFE_NO_PAD.encode(self.pair.sign(signing.as_bytes()).as_ref());
-        format!("{signing}.{signature}")
+            grant: Grant {
+                room: who.room.clone(),
+                publish,
+                ..Grant::default()
+            },
+            ..Claims::default()
+        })
     }
 }
 
@@ -118,6 +122,7 @@ impl Mint {
 /// unauthenticated peer is charged by address instead, where the ceiling is four
 /// for the whole machine — which is why this harness presents tokens even to a
 /// relay that would admit it without one.
+#[derive(Clone)]
 pub struct Identity {
     /// The customer, which a token carries as `aud`.
     pub tenant: String,
@@ -125,13 +130,9 @@ pub struct Identity {
     pub user: String,
     /// The room they were admitted to.
     pub room: String,
-    /// Stands in for the RFC 7638 thumbprint of a device key.
-    ///
-    /// A real client's is the hash of a key it holds. Nothing here holds one,
-    /// because a relay only insists on that under
-    /// `MOQOM_RELAY_POSSESSION=required` and this measures fan-out rather than
-    /// admission. What matters is that it is distinct per session, and shaped
-    /// like the real thing so that truncating it produces a legal device field.
+    /// The device key the token is bound to, which every session proves.
+    pub key: Arc<DeviceKey>,
+    /// The RFC 7638 thumbprint of `key`, which the token commits to as `cnf`.
     pub thumbprint: String,
 }
 
@@ -160,16 +161,35 @@ impl Identity {
     }
 
     fn new(tenant: &str, room: &str, user: &str) -> Self {
-        // A hash, so it is the length and alphabet of a real thumbprint, and
-        // deterministic, so a name in a log points at the same session on a
-        // rerun.
-        let hash = digest::digest(&digest::SHA256, user.as_bytes());
+        let key = DeviceKey::from_pkcs8(&Self::pkcs8(user)).expect("a P-256 scalar");
         Self {
             tenant: tenant.to_owned(),
             user: user.to_owned(),
             room: room.to_owned(),
-            thumbprint: URL_SAFE_NO_PAD.encode(hash.as_ref()),
+            thumbprint: key.thumbprint(),
+            key: Arc::new(key),
         }
+    }
+
+    /// The PKCS#8 P-256 private key for `user`, its scalar a hash of the name.
+    ///
+    /// A hash falls outside the curve's order with probability about 2^-32, and
+    /// the names used here are fixed, so the tests would catch the one that did.
+    #[must_use]
+    pub fn pkcs8(user: &str) -> Vec<u8> {
+        // PrivateKeyInfo { v1, id-ecPublicKey/prime256v1, ECPrivateKey { v1, d } },
+        // up to the 32 bytes of d.
+        const PREFIX: [u8; 35] = [
+            0x30, 0x41, 0x02, 0x01, 0x00, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d,
+            0x02, 0x01, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x04, 0x27,
+            0x30, 0x25, 0x02, 0x01, 0x01, 0x04, 0x20,
+        ];
+        let mut seed = b"moqom-loadgen device key ".to_vec();
+        seed.extend_from_slice(user.as_bytes());
+        let scalar = digest::digest(&digest::SHA256, &seed);
+        let mut der = PREFIX.to_vec();
+        der.extend_from_slice(scalar.as_ref());
+        der
     }
 
     /// The device field a namespace of this identity's carries.
@@ -226,19 +246,31 @@ mod tests {
     #[test]
     fn a_token_is_three_base64_parts_a_relay_can_split() {
         let who = Identity::publisher("acme", "room-42");
-        let token = mint().token(&who, 0b11, 600);
-        let parts: Vec<&str> = token.split('.').collect();
-        assert_eq!(parts.len(), 3);
-        let claims = URL_SAFE_NO_PAD.decode(parts[1]).expect("base64url claims");
-        let claims: serde_json::Value =
-            serde_json::from_slice(&claims).expect("the claims are JSON");
-        assert_eq!(claims["aud"], "acme");
-        assert_eq!(claims["sub"], "publisher");
-        assert_eq!(claims["moqt"]["room"], "room-42");
-        assert_eq!(claims["moqt"]["pub"], 0b11);
+        let token = mint()
+            .token(&who, 0b11, 600)
+            .expect("ten minutes is allowed");
+        let keys = moqom_token::PublicKey::parse_set(&mint().jwks()).expect("a key set");
+        let claims = moqom_token::Verifier::new(ISSUER, keys)
+            .verify(token.as_bytes(), std::time::SystemTime::now())
+            .expect("the relay's verifier accepts it");
+        assert_eq!(claims.tenant, "acme");
+        assert_eq!(claims.sub, "publisher");
+        assert_eq!(claims.grant.room, "room-42");
+        assert_eq!(claims.grant.publish, 0b11);
         assert_eq!(
-            claims["cnf"]["jkt"], who.thumbprint,
+            claims.cnf.jkt, who.thumbprint,
             "the token has to commit to the device its namespace names"
+        );
+    }
+
+    /// Longer than a relay accepts is refused here, where the flag was given,
+    /// rather than as an authentication failure at the relay.
+    #[test]
+    fn a_token_longer_than_a_relay_accepts_is_refused() {
+        let who = Identity::publisher("acme", "room-42");
+        assert_eq!(
+            mint().token(&who, 0, 3600),
+            Err(moqom_token::Error::Lifetime)
         );
     }
 
@@ -250,10 +282,22 @@ mod tests {
         assert!(who.thumbprint.starts_with(who.device()));
     }
 
+    /// Every host derives the same key for the same name, which is what lets
+    /// them agree on the publisher's namespace.
+    #[test]
+    fn a_name_always_derives_the_same_device_key() {
+        let one = Identity::publisher("acme", "room-42");
+        let two = Identity::publisher("acme", "room-42");
+        assert_eq!(one.thumbprint, two.thumbprint);
+        assert_eq!(one.thumbprint, one.key.thumbprint());
+        assert_eq!(one.thumbprint.len(), 43, "base64url of a SHA-256");
+    }
+
     #[test]
     fn the_key_set_names_the_algorithm_the_relay_expects() {
         let jwks: serde_json::Value = serde_json::from_str(&mint().jwks()).expect("valid JSON");
-        assert_eq!(jwks["keys"][0]["crv"], "Ed25519");
+        assert_eq!(jwks["keys"][0]["kty"], "AKP");
+        assert_eq!(jwks["keys"][0]["alg"], "ML-DSA-65");
         assert_eq!(jwks["keys"][0]["kid"], KEY_ID);
     }
 }

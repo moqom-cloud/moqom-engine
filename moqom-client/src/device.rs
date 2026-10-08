@@ -3,7 +3,7 @@
 //! A token on its own is a bearer credential: whoever holds the bytes can use
 //! them, so one lifted off a device works from anywhere until it expires. Binding
 //! it to a key fixes that. The control plane mints a token committed to a
-//! particular public key — as `cnf.jkt`, the RFC 7638 thumbprint — and the relay
+//! particular public key — as `cnf.jkt`, its JWK thumbprint — and the relay
 //! admits the session only if it also arrives with a signature from the matching
 //! private key. A stolen token then buys nothing without the key, and the key does
 //! not travel.
@@ -16,41 +16,33 @@
 //!
 //! # What is signed
 //!
-//! A compact JWS, `ES256`, typed `MOQT-POP` so a JWS minted for anything else --
-//! including a token from the same deployment -- cannot be presented as one. Three
-//! claims, and each is load-bearing:
+//! A `moqom-proof` proof: a compact JWS typed `MOQT-POP`, `ML-DSA-65` for a key
+//! made here and `ES256` for a P-256 key loaded from before the move, with four
+//! claims:
 //!
 //! * `ath`, the hash of the token, which ties this proof to that token and no
 //!   other;
 //! * `rel`, the hash of the relay's own certificate, which stops a proof gathered
 //!   by one relay being replayed against another;
+//! * `iat`, when it was made, which a relay holds to a few minutes either way;
 //! * `jti`, a fresh identifier, which a relay accepts once.
 //!
 //! Together those are why no challenge from the relay is needed, which matters
 //! because the client speaks first: SETUP carries the proof, and there is nothing
 //! before it to carry a nonce.
-//!
-//! # On matching the verifier byte for byte
-//!
-//! The JSON here is assembled by hand rather than serialised. That looks like the
-//! wrong instinct and is not: the signature covers the exact bytes of the encoded
-//! segments, so a serialiser that reorders a map, adds a space, or pads its base64
-//! produces a proof that verifies against nothing. The relay's verifier and the
-//! Swift client both hand-assemble for the same reason, and
-//! `moqom-relay/tests/testdata/possession.json` is what keeps all three honest.
 
-use aws_lc_rs::digest::{SHA256, digest};
-use aws_lc_rs::rand::{SecureRandom, SystemRandom};
-use aws_lc_rs::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair};
+use std::time::SystemTime;
+
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use moqom_proof::{Algorithm, Prover};
 
 /// Why a device key could not be loaded, or a proof could not be made.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum DeviceKeyError {
-    /// The bytes are not a PKCS#8 P-256 private key.
-    #[error("not a PKCS#8 P-256 private key")]
+    /// The bytes are not a PKCS#8 ML-DSA-65 or P-256 private key.
+    #[error("not a PKCS#8 ML-DSA-65 or P-256 private key")]
     Malformed,
 
     /// A key could not be generated, or its private half could not be serialised.
@@ -60,23 +52,25 @@ pub enum DeviceKeyError {
     /// Signing failed, or the system random source did.
     #[error("signing the proof failed")]
     Signing,
+
+    /// The relay's certificate identity is not base64url.
+    #[error("the relay's certificate identity is not base64url")]
+    Relay,
 }
 
-/// A P-256 key pair identifying one device.
+/// A key pair identifying one device: ML-DSA-65 when made here, P-256 when
+/// loaded from a key made before proofs moved to ML-DSA.
 ///
 /// The thumbprint is what a token commits to, so this key is the device's name as
 /// far as authorisation is concerned: revoking it revokes the machine, which is
 /// the property that makes a stolen laptop something an operator can act on.
 pub struct DeviceKey {
-    pair: EcdsaKeyPair,
-    /// Base64url `x` and `y`, decoded once and kept, since every proof needs them
-    /// and they cannot change.
-    x: String,
-    y: String,
+    prover: Prover,
 }
 
 impl DeviceKey {
-    /// Generate a key, returning it with the PKCS#8 bytes to store it as.
+    /// Generate an ML-DSA-65 key, returning it with the PKCS#8 bytes to store it
+    /// as.
     ///
     /// The private bytes come back to the caller rather than being written here,
     /// because where a key belongs is a decision this module should not be making
@@ -85,57 +79,44 @@ impl DeviceKey {
     /// # Errors
     /// The platform's random source or key generation refusing.
     pub fn generate() -> Result<(Self, Vec<u8>), DeviceKeyError> {
-        let random = SystemRandom::new();
-        let document = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &random)
+        let prover = Prover::generate(Algorithm::MlDsa65)
             .map_err(|error| DeviceKeyError::Unavailable(error.to_string()))?;
-        let pkcs8 = document.as_ref().to_vec();
-        Ok((Self::from_pkcs8(&pkcs8)?, pkcs8))
+        let pkcs8 = prover
+            .to_pkcs8()
+            .map_err(|error| DeviceKeyError::Unavailable(error.to_string()))?;
+        Ok((Self { prover }, pkcs8))
     }
 
-    /// Load a key from PKCS#8 bytes.
+    /// Load a key from PKCS#8 bytes, ML-DSA-65 or P-256.
     ///
     /// # Errors
-    /// Bytes that are not a PKCS#8 P-256 private key.
+    /// Bytes that are neither.
     pub fn from_pkcs8(pkcs8: &[u8]) -> Result<Self, DeviceKeyError> {
-        let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8)
-            .map_err(|_| DeviceKeyError::Malformed)?;
-
-        // An uncompressed point: the 0x04 tag, then the two coordinates at the
-        // curve's field size. Split by length rather than searched, because both
-        // halves are fixed width and a coordinate read at the wrong offset is a
-        // different point that fails as a signature bug much later.
-        let point = pair.public_key().as_ref();
-        if point.len() != 65 || point[0] != 0x04 {
-            return Err(DeviceKeyError::Malformed);
-        }
-
         Ok(Self {
-            x: URL_SAFE_NO_PAD.encode(&point[1..33]),
-            y: URL_SAFE_NO_PAD.encode(&point[33..65]),
-            pair,
+            prover: Prover::from_pkcs8(pkcs8).map_err(|_| DeviceKeyError::Malformed)?,
         })
     }
 
-    /// The public key as a JWK, in the exact form a proof header carries.
+    /// The algorithm this key proves with.
     #[must_use]
-    pub fn public_key_jwk(&self) -> String {
-        format!(
-            r#"{{"crv":"P-256","kty":"EC","x":"{}","y":"{}"}}"#,
-            self.x, self.y
-        )
+    pub const fn algorithm(&self) -> Algorithm {
+        self.prover.algorithm()
     }
 
-    /// The RFC 7638 thumbprint, which is what a token's `cnf.jkt` names.
+    /// The public key as a JWK, in the canonical form a proof header carries
+    /// and `/join` receives.
+    #[must_use]
+    pub fn public_key_jwk(&self) -> String {
+        self.prover.jwk_json().to_owned()
+    }
+
+    /// The JWK thumbprint, which is what a token's `cnf.jkt` names.
     ///
     /// This is the value to hand whoever mints the token. Without it the token
     /// commits to nothing and the proof has nothing to match.
     #[must_use]
     pub fn thumbprint(&self) -> String {
-        // The specification is exact and every part of it matters: the required
-        // members and no others, ordered lexicographically, and no whitespace. The
-        // JWK above is already in that order, which is why it is written that way
-        // and not in the order the fields are declared.
-        sha256_base64url(self.public_key_jwk().as_bytes())
+        self.prover.thumbprint().to_owned()
     }
 
     /// Sign a proof that this key holds `token`, for the relay identified by
@@ -146,56 +127,34 @@ impl DeviceKey {
     /// made for one relay is refused by any other.
     ///
     /// # Errors
-    /// The system random source or the signature failing.
+    /// A `relay` that is not base64url, or the system random source or the
+    /// signature failing.
     pub fn prove(&self, token: &[u8], relay: &str) -> Result<Vec<u8>, DeviceKeyError> {
-        let header = format!(
-            r#"{{"alg":"ES256","typ":"MOQT-POP","jwk":{}}}"#,
-            self.public_key_jwk()
-        );
-        let claims = format!(
-            r#"{{"ath":"{}","jti":"{}","rel":"{relay}"}}"#,
-            sha256_base64url(token),
-            identifier()?
-        );
-
-        let signing_input = format!(
-            "{}.{}",
-            URL_SAFE_NO_PAD.encode(header),
-            URL_SAFE_NO_PAD.encode(claims)
-        );
-        let signature = self
-            .pair
-            .sign(&SystemRandom::new(), signing_input.as_bytes())
-            .map_err(|_| DeviceKeyError::Signing)?;
-
-        Ok(format!(
-            "{signing_input}.{}",
-            URL_SAFE_NO_PAD.encode(signature.as_ref())
-        )
-        .into_bytes())
+        let certificate = URL_SAFE_NO_PAD
+            .decode(relay)
+            .map_err(|_| DeviceKeyError::Relay)?;
+        let nonce = moqom_proof::nonce().map_err(|_| DeviceKeyError::Signing)?;
+        self.prover
+            .prove(token, &certificate, &nonce, SystemTime::now())
+            .map_err(|_| DeviceKeyError::Signing)
     }
 }
 
 impl std::fmt::Debug for DeviceKey {
-    /// Prints the thumbprint and nothing else.
-    ///
-    /// Derived would print the key pair. `EcdsaKeyPair`'s own `Debug` does not
-    /// expose the private scalar, so this is a precaution rather than a fix, and
-    /// the thumbprint is the useful half in a log anyway.
+    /// Prints the algorithm and thumbprint and nothing else.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DeviceKey")
-            .field("thumbprint", &self.thumbprint())
+            .field("algorithm", &self.algorithm())
+            .field("thumbprint", &self.prover.thumbprint())
             .finish_non_exhaustive()
     }
 }
 
 /// What a session presents to be admitted.
 ///
-/// The key is optional because a relay may be running as `bearer` or `observed`,
-/// and because a token that commits to no device cannot be proven for. Offering a
-/// key the token does not name is worse than offering none where the relay is
-/// checking: `observed` admits a session with no proof and refuses one whose proof
-/// does not verify.
+/// The key is optional because a token that commits to no device cannot be
+/// proven for. Offering a key the token does not name is worse than offering
+/// none: a relay refuses a proof that does not verify.
 #[derive(Debug)]
 pub struct Credentials<'a> {
     /// The token, exactly as it was issued. The hash in the proof covers these
@@ -222,24 +181,6 @@ impl<'a> Credentials<'a> {
     }
 }
 
-/// A fresh proof identifier, which the relay accepts once.
-///
-/// 128 bits from the system source. Not a counter and not a timestamp: a relay
-/// remembers these until the token expires, so two sessions started from one
-/// token in the same second must not collide, and the second would be refused as
-/// a replay if they did.
-fn identifier() -> Result<String, DeviceKeyError> {
-    let mut bytes = [0u8; 16];
-    SystemRandom::new()
-        .fill(&mut bytes)
-        .map_err(|_| DeviceKeyError::Signing)?;
-    Ok(URL_SAFE_NO_PAD.encode(bytes))
-}
-
-fn sha256_base64url(bytes: &[u8]) -> String {
-    URL_SAFE_NO_PAD.encode(digest(&SHA256, bytes).as_ref())
-}
-
 /// The relay's identity for the `rel` claim: base64url SHA-256 of its leaf
 /// certificate, as the DER the handshake presented.
 ///
@@ -248,26 +189,22 @@ fn sha256_base64url(bytes: &[u8]) -> String {
 /// two have to agree exactly.
 #[must_use]
 pub(crate) fn certificate_identity(der: &[u8]) -> String {
-    sha256_base64url(der)
+    URL_SAFE_NO_PAD.encode(aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, der).as_ref())
 }
 
 #[cfg(test)]
 mod tests {
+    use moqom_proof::{Checker, MemoryNonceStore};
+
     use super::*;
 
-    /// The vector from RFC 7517 §A.1, thumbprinted per RFC 7638. The same
-    /// assertion exists in the relay's verifier and in the Swift client, and it is
-    /// the cheapest way to catch a canonicalisation that has drifted -- a
-    /// reordered member or a padded coordinate changes the thumbprint and nothing
-    /// else, so the failure would otherwise surface as a token that names a device
-    /// nobody is.
+    const RELAY: &str = "cGludGhpc3JlbGF5c2NlcnRpZmljYXRlaGFzaA";
+
     #[test]
-    fn the_thumbprint_follows_rfc_7638() {
-        let jwk = r#"{"crv":"P-256","kty":"EC","x":"MKBCTNIcKUSDii11ySs3526iDZ8AiTo7Tu6KPAqv7D4","y":"4Etl6SRW2YiLUrN5vfvVHuhp7x8PxltmWWlbbM4IFyM"}"#;
-        assert_eq!(
-            sha256_base64url(jwk.as_bytes()),
-            "cn-I_WNMClehiVp51i_0VpOENW1upEerA8sEam5hn-s"
-        );
+    fn a_new_key_is_ml_dsa_65() {
+        let (key, _) = DeviceKey::generate().expect("a key");
+        assert_eq!(key.algorithm(), Algorithm::MlDsa65);
+        assert!(key.public_key_jwk().contains(r#""kty":"AKP""#));
     }
 
     #[test]
@@ -276,6 +213,21 @@ mod tests {
         let reloaded = DeviceKey::from_pkcs8(&pkcs8).expect("the same key back");
         assert_eq!(key.thumbprint(), reloaded.thumbprint());
         assert_eq!(key.public_key_jwk(), reloaded.public_key_jwk());
+    }
+
+    /// A machine that made its key before the move keeps its identity.
+    #[test]
+    fn a_p256_key_from_before_the_move_still_loads_and_proves() {
+        let rng = aws_lc_rs::rand::SystemRandom::new();
+        let pkcs8 = aws_lc_rs::signature::EcdsaKeyPair::generate_pkcs8(
+            &aws_lc_rs::signature::ECDSA_P256_SHA256_FIXED_SIGNING,
+            &rng,
+        )
+        .expect("a P-256 key");
+        let key = DeviceKey::from_pkcs8(pkcs8.as_ref()).expect("loads");
+        assert_eq!(key.algorithm(), Algorithm::Es256);
+        let proof = key.prove(b"token", RELAY).expect("a proof");
+        assert_eq!(checked(&key, &proof, b"token"), Ok(()));
     }
 
     #[test]
@@ -298,43 +250,37 @@ mod tests {
     #[test]
     fn every_proof_carries_a_fresh_identifier() {
         let (key, _) = DeviceKey::generate().expect("a key");
-        let first = key.prove(b"token", "relay").expect("a proof");
-        let second = key.prove(b"token", "relay").expect("another proof");
+        let first = key.prove(b"token", RELAY).expect("a proof");
+        let second = key.prove(b"token", RELAY).expect("another proof");
         assert_ne!(first, second);
+        assert_eq!(checked(&key, &first, b"token"), Ok(()));
+        assert_eq!(checked(&key, &second, b"token"), Ok(()));
     }
 
-    /// The proof is a compact JWS whose header and claims say what the relay
-    /// checks. Asserted structurally rather than against a fixed string, since the
-    /// signature over a fresh key is different every time.
     #[test]
-    fn a_proof_is_a_typed_jws_over_the_token_and_the_relay() {
+    fn a_proof_names_its_token_and_its_relay() {
         let (key, _) = DeviceKey::generate().expect("a key");
-        let proof = key.prove(b"token", "the-relay").expect("a proof");
-        let proof = String::from_utf8(proof).expect("a proof is ASCII");
-
-        let segments: Vec<&str> = proof.split('.').collect();
-        assert_eq!(segments.len(), 3, "header, claims, signature");
-
-        let decode = |segment: &str| {
-            String::from_utf8(URL_SAFE_NO_PAD.decode(segment).expect("base64url"))
-                .expect("json is utf-8")
-        };
-        let header = decode(segments[0]);
-        assert!(header.contains(r#""alg":"ES256""#), "{header}");
-        assert!(header.contains(r#""typ":"MOQT-POP""#), "{header}");
-        assert!(header.contains(&key.public_key_jwk()), "{header}");
-
-        let claims = decode(segments[1]);
-        assert!(
-            claims.contains(&format!(r#""ath":"{}""#, sha256_base64url(b"token"))),
-            "{claims}"
+        let proof = key.prove(b"token", RELAY).expect("a proof");
+        assert_eq!(checked(&key, &proof, b"token"), Ok(()));
+        assert_eq!(
+            checked(&key, &proof, b"another"),
+            Err(moqom_proof::Error::WrongToken)
         );
-        assert!(claims.contains(r#""rel":"the-relay""#), "{claims}");
+        assert!(matches!(
+            key.prove(b"token", "not base64url!"),
+            Err(DeviceKeyError::Relay)
+        ));
+    }
 
-        // Fixed width, r then s. A DER signature would be about seventy bytes and
-        // would fail verification rather than parsing, which is a hard failure to
-        // read.
-        let signature = URL_SAFE_NO_PAD.decode(segments[2]).expect("base64url");
-        assert_eq!(signature.len(), 64);
+    fn checked(key: &DeviceKey, proof: &[u8], token: &[u8]) -> Result<(), moqom_proof::Error> {
+        let now = SystemTime::now();
+        Checker::new(MemoryNonceStore::default()).check(
+            proof,
+            token,
+            Some(&URL_SAFE_NO_PAD.decode(RELAY).expect("base64url")),
+            &key.thumbprint(),
+            now,
+            now + std::time::Duration::from_mins(10),
+        )
     }
 }

@@ -4,12 +4,14 @@ members = [
     "moqom-proto",
     "moqom-rans",
     "moqom-rans-ffi",
+    "moqom-direct-ffi",
     "moqom-relay",
     "moqom-transport",
     "moqom-client",
     "moqom-media",
     "moqom-cli",
     "moqom-loadgen",
+    "moqom-recorder",
 ]
 # cargo-fuzz needs nightly and links libFuzzer, so it cannot build under the
 # pinned stable toolchain the rest of the workspace uses. Excluded rather than
@@ -21,12 +23,12 @@ exclude = ["fuzz"]
 [workspace.package]
 edition = "2024"
 rust-version = "1.97"
-authors = ["MOQOM"]
+authors = ["Elliott Wave LLC"]
 repository = "https://github.com/moqom-cloud/moqom-engine"
 # No workspace-level `license`: this workspace spans both licence halves.
 # Apache-2.0 for the protocol and transport crates, which are what anyone
-# building on MOQT links; BUSL-1.1 for the relay and moqom-cc, which are the
-# product. Each crate sets its own, and LICENSING.md is the authoritative map. A
+# building on MOQT links; proprietary (LicenseRef-MOQOM-Proprietary) for the
+# relay, recorder and moqom-cc, which are the product. Each crate sets its own, and LICENSING.md is the authoritative map. A
 # crate with no `license` field is a bug -- there is no safe default when a
 # single workspace spans both.
 publish = false
@@ -40,12 +42,22 @@ quinn-proto = { version = "0.11", default-features = false }
 # a differentiated services codepoint on it, which quinn offers no way to do through `Endpoint`.
 socket2 = "0.6"
 web-transport-quinn = { version = "0.11", default-features = false, features = ["aws-lc-rs"] }
-rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
+# `prefer-post-quantum` puts X25519MLKEM768 first in aws-lc-rs's default key exchange groups, so
+# every configuration built from the default provider sends a hybrid key share first and still
+# offers X25519 alongside it for a classical peer. Feature unification makes this hold for every
+# crate in the build, tonic's gRPC link included, and `moqom-transport` has a test that fails if
+# it ever stops.
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std", "prefer-post-quantum"] }
 url = "2"
 tokio = { version = "1", default-features = false }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "env-filter"] }
 aws-lc-rs = "1"
+# The security libraries, from a sibling checkout until they are published.
+moqom-token = { path = "../moqom-security/rust/moqom-token" }
+moqom-proof = { path = "../moqom-security/rust/moqom-proof" }
+moqom-sframe = { path = "../moqom-security/rust/moqom-sframe" }
+moqom-mls = { path = "../moqom-security/rust/moqom-mls" }
 base64 = "0.22"
 rcgen = "0.14"
 rustls-pemfile = "2"

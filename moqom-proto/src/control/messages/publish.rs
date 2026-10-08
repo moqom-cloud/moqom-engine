@@ -1,4 +1,5 @@
-//! PUBLISH and `PUBLISH_DONE`, per draft-19 §10.10 and §10.11.
+//! PUBLISH and `PUBLISH_DONE`, per draft-19 §10.10 and §10.11, and
+//! `PUBLISH_STATE_NOTIFY`, per draft-22 §9.10.
 
 use bytes::{Buf, BufMut};
 
@@ -8,6 +9,8 @@ use crate::control::params::Parameters;
 use crate::control::properties::Properties;
 use crate::control::reason::ReasonPhrase;
 use crate::control::request_id::RequestId;
+use crate::control::typed::Context;
+use crate::draft::Draft;
 use crate::error::DecodeError;
 use crate::model::{FullTrackName, TrackAlias};
 use crate::varint::VarInt;
@@ -80,13 +83,72 @@ impl Publish {
     /// [`DecodeError::Short`] if incomplete; [`DecodeError::Invalid`] if any
     /// field violates its constraints.
     pub fn decode<B: Buf>(buf: &mut B) -> Result<Self, DecodeError> {
+        let request_id = RequestId::decode(buf)?;
+        let track = FullTrackName::decode(buf)?;
+        let track_alias = TrackAlias::new(VarInt::decode(buf)?);
+        let parameters = Parameters::decode_counted(buf)?;
+        if Draft::current().typed_parameters() {
+            Context::Publish.check(&parameters)?;
+        }
         Ok(Self {
-            request_id: RequestId::decode(buf)?,
-            track: FullTrackName::decode(buf)?,
-            track_alias: TrackAlias::new(VarInt::decode(buf)?),
-            parameters: Parameters::decode_counted(buf)?,
+            request_id,
+            track,
+            track_alias,
+            parameters,
             properties: Properties::decode_to_end(buf)?,
         })
+    }
+}
+
+/// The publisher changed a subscription's state for a reason of its own —
+/// paused it, moved its filter, or wants to report a new Largest Object at
+/// the point the change took effect. Draft-22 §9.10.
+///
+/// Sent on the subscription's request stream by the publisher only, and
+/// answered by nothing: it is not a request and not subject to
+/// `MAX_REQUEST_UPDATES`. Carries only what changed; an absent parameter is
+/// unchanged. The only parameters allowed are `LARGEST_OBJECT`, `FORWARD` and
+/// `LOCATION_FILTER`, and the publisher must include `LARGEST_OBJECT` when it
+/// knows it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PublishStateNotify {
+    /// What changed.
+    pub parameters: Parameters,
+}
+
+impl PublishStateNotify {
+    /// Encoded size of the message body.
+    #[must_use]
+    pub fn encoded_len(&self) -> usize {
+        self.parameters.encoded_len_counted()
+    }
+
+    /// Append the message body to `buf`.
+    pub fn encode<B: BufMut>(&self, buf: &mut B) {
+        self.parameters.encode_counted(buf);
+    }
+
+    /// Read a message body.
+    ///
+    /// # Errors
+    /// [`DecodeError::Short`] if incomplete; [`DecodeError::Invalid`] for a
+    /// parameter the message does not allow.
+    pub fn decode<B: Buf>(buf: &mut B) -> Result<Self, DecodeError> {
+        let parameters = Parameters::decode_counted(buf)?;
+        Context::PublishStateNotify.check(&parameters)?;
+        Ok(Self { parameters })
+    }
+}
+
+impl MessageBody for PublishStateNotify {
+    const MESSAGE_TYPE: MessageType = MessageType::PublishStateNotify;
+
+    fn encoded_len(&self) -> usize {
+        Self::encoded_len(self)
+    }
+
+    fn encode<B: BufMut>(&self, buf: &mut B) {
+        Self::encode(self, buf);
     }
 }
 
@@ -119,6 +181,9 @@ impl PublishDoneStatus {
     /// The track is no longer being published.
     pub const TRACK_ENDED: Self = Self(VarInt::from_u32(0x2));
     /// The publisher reached the end of the subscription's location filter.
+    ///
+    /// Draft-19 only: draft-22 §12.4 removed it, leaving `0x3` unassigned.
+    /// [`Self::in_draft`] maps it to [`Self::TRACK_ENDED`] there.
     pub const SUBSCRIPTION_ENDED: Self = Self(VarInt::from_u32(0x3));
     /// Either side issued a `GOAWAY`.
     pub const GOING_AWAY: Self = Self(VarInt::from_u32(0x4));
@@ -153,6 +218,17 @@ impl PublishDoneStatus {
     #[must_use]
     pub const fn get(self) -> u64 {
         self.0.get()
+    }
+
+    /// The code to send under `draft`: draft-22 has no `SUBSCRIPTION_ENDED`,
+    /// and the end of a filter is, for that subscriber, the end of the track.
+    #[must_use]
+    pub fn in_draft(self, draft: Draft) -> Self {
+        if draft == Draft::D22 && self == Self::SUBSCRIPTION_ENDED {
+            Self::TRACK_ENDED
+        } else {
+            self
+        }
     }
 
     /// Whether this status reports a failure rather than an orderly end.
@@ -205,24 +281,32 @@ pub enum StreamCount {
 }
 
 impl StreamCount {
-    /// The reserved value meaning [`StreamCount::Unknown`].
-    const UNKNOWN_SENTINEL: u64 = crate::varint::MAX;
+    /// The reserved value meaning [`StreamCount::Unknown`] in the ambient
+    /// draft: the largest integer it can encode, which is `2^62 - 1` under
+    /// RFC 9000 varints and `2^64 - 1` under `vi64` (draft-22 §9.9).
+    fn unknown_sentinel() -> u64 {
+        if Draft::current().uses_vi64() {
+            u64::MAX
+        } else {
+            crate::varint::MAX
+        }
+    }
 
-    fn as_varint(self) -> VarInt {
+    fn wire(self) -> u64 {
         match self {
             // Saturating is right here and only here: an exact count at or
             // above the sentinel is indistinguishable from "I lost count", and
             // that is the meaning the draft assigns to the value anyway.
-            Self::Exact(n) => VarInt::new(n).unwrap_or(VarInt::MAX),
-            Self::Unknown => VarInt::MAX,
+            Self::Exact(n) => n.min(Self::unknown_sentinel()),
+            Self::Unknown => Self::unknown_sentinel(),
         }
     }
 
-    fn from_varint(v: VarInt) -> Self {
-        if v.get() == Self::UNKNOWN_SENTINEL {
+    fn from_wire(v: u64) -> Self {
+        if v == Self::unknown_sentinel() {
             Self::Unknown
         } else {
-            Self::Exact(v.get())
+            Self::Exact(v)
         }
     }
 }
@@ -259,13 +343,15 @@ impl PublishDone {
     /// Encoded size of the message body.
     #[must_use]
     pub fn encoded_len(&self) -> usize {
-        self.status.0.size() + self.stream_count.as_varint().size() + self.reason.encoded_len()
+        self.status.0.size()
+            + crate::varint::size_u64(self.stream_count.wire())
+            + self.reason.encoded_len()
     }
 
     /// Append the message body to `buf`.
     pub fn encode<B: BufMut>(&self, buf: &mut B) {
         self.status.0.encode(buf);
-        self.stream_count.as_varint().encode(buf);
+        crate::varint::encode_u64(self.stream_count.wire(), buf);
         self.reason.encode(buf);
     }
 
@@ -277,7 +363,7 @@ impl PublishDone {
     pub fn decode<B: Buf>(buf: &mut B) -> Result<Self, DecodeError> {
         Ok(Self {
             status: PublishDoneStatus(VarInt::decode(buf)?),
-            stream_count: StreamCount::from_varint(VarInt::decode(buf)?),
+            stream_count: StreamCount::from_wire(crate::varint::decode_u64(buf)?),
             reason: ReasonPhrase::decode(buf)?,
         })
     }
@@ -337,10 +423,20 @@ impl RequestUpdate {
     /// # Errors
     /// [`DecodeError::Short`] if incomplete; [`DecodeError::Invalid`] if any
     /// field violates its constraints.
+    ///
+    /// Under draft-22 this checks the parameters against the union of what
+    /// any update may carry; which subset applies depends on the request
+    /// being updated, which only the session knows, so it checks again with
+    /// the precise [`Context`].
     pub fn decode<B: Buf>(buf: &mut B) -> Result<Self, DecodeError> {
+        let request_id = RequestId::decode(buf)?;
+        let parameters = Parameters::decode_counted(buf)?;
+        if Draft::current().typed_parameters() {
+            Context::RequestUpdate.check(&parameters)?;
+        }
         Ok(Self {
-            request_id: RequestId::decode(buf)?,
-            parameters: Parameters::decode_counted(buf)?,
+            request_id,
+            parameters,
         })
     }
 }

@@ -62,8 +62,9 @@ openssl x509 -req -in "$work/origin.csr" -CA "$work/ca.pem" -CAkey "$work/ca.key
 
 "$load" jwks > "$work/jwks.json" 2>/dev/null
 # The edges need a credential of their own: the origin verifies tokens, and an
-# anonymous edge is refused the room exactly as an anonymous client would be.
-edge_token="$("$load" token)"
+# anonymous edge is refused the room exactly as an anonymous client would be. The
+# token is bound to a device key, which each edge proves on its link.
+edge_token="$("$load" token --key "$work/edge.key")"
 
 wanted="$(( viewers * 4 + 1024 ))"
 ulimit -n "$wanted" 2>/dev/null || true
@@ -101,7 +102,8 @@ for (( n = 0; n < edges; n++ )); do
   start_relay "edge-$n" "$(( 4500 + n ))" "$(( 9500 + n ))" \
     MOQOM_RELAY_UPSTREAM="localhost:4433" \
     MOQOM_RELAY_UPSTREAM_CA="$work/ca.pem" \
-    MOQOM_RELAY_UPSTREAM_TOKEN="$edge_token"
+    MOQOM_RELAY_UPSTREAM_TOKEN="$edge_token" \
+    MOQOM_RELAY_UPSTREAM_KEY="$work/edge.key"
   edge_pids+=("${pids[-1]}")
 done
 

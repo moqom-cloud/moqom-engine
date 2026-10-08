@@ -10,11 +10,33 @@
 //! | `10`   | 4      | 0 .. 1073741823     |
 //! | `11`   | 8      | 0 .. 2^62 - 1       |
 //!
-//! MOQT inherits this encoding wholesale, so nearly every field in every
-//! control message bottoms out here.
+//! MOQT inherited this encoding wholesale until draft-17, which replaced it
+//! with `vi64`: the number of leading one bits in the first byte gives the
+//! length, 1 to 9 bytes, and the nine-byte form carries a full 64-bit value.
+//!
+//! | Leading bits | Length | Value range         |
+//! |--------------|--------|---------------------|
+//! | `0`          | 1      | 0 .. 127            |
+//! | `10`         | 2      | 0 .. 16383          |
+//! | `110`        | 3      | 0 .. 2^21 - 1       |
+//! | ...          | ...    | ...                 |
+//! | `11111110`   | 8      | 0 .. 2^56 - 1       |
+//! | `11111111`   | 9      | 0 .. 2^64 - 1       |
+//!
+//! Which one [`VarInt`] reads and writes is the ambient [`Draft`]: `vi64`
+//! under [`Draft::D22`], RFC 9000 otherwise. Nearly every field in every
+//! message bottoms out here, which is why the choice is made here once
+//! rather than at each call site.
+//!
+//! A [`VarInt`] holds at most `2^62 - 1` under either encoding. `vi64` can
+//! carry more, and the only field this crate needs beyond that bound — a
+//! stream count meaning "unknown" — reads it with [`decode_u64`]. Any other
+//! field that arrives above `2^62 - 1` is rejected as malformed rather than
+//! silently truncated; no MOQOM component allocates IDs anywhere near it.
 
 use bytes::{Buf, BufMut};
 
+use crate::draft::Draft;
 use crate::error::{BoundsExceeded, DecodeError};
 
 /// Largest representable value: `2^62 - 1`.
@@ -58,9 +80,20 @@ impl VarInt {
         self.0
     }
 
-    /// Encoded length in bytes: 1, 2, 4, or 8.
+    /// Encoded length in bytes under the ambient draft: 1, 2, 4, or 8 for
+    /// RFC 9000; 1 to 9 for `vi64`.
     #[must_use]
-    pub const fn size(self) -> usize {
+    pub fn size(self) -> usize {
+        if Draft::current().uses_vi64() {
+            vi64_size(self.0)
+        } else {
+            self.quic_size()
+        }
+    }
+
+    /// Encoded length in bytes as an RFC 9000 varint, whatever the draft.
+    #[must_use]
+    pub const fn quic_size(self) -> usize {
         match self.0 {
             0..=63 => 1,
             64..=16_383 => 2,
@@ -69,12 +102,17 @@ impl VarInt {
         }
     }
 
-    /// Append the minimal encoding of this value to `buf`.
+    /// Append the minimal encoding of this value to `buf`, in the ambient
+    /// draft's integer encoding.
     ///
     /// # Panics
     /// Panics if `buf` cannot accommodate [`Self::size`] more bytes.
     pub fn encode<B: BufMut>(self, buf: &mut B) {
-        match self.size() {
+        if Draft::current().uses_vi64() {
+            vi64_encode(self.0, buf);
+            return;
+        }
+        match self.quic_size() {
             1 => buf.put_u8(self.0 as u8),
             2 => buf.put_u16(self.0 as u16 | (0b01 << 14)),
             4 => buf.put_u32(self.0 as u32 | (0b10 << 30)),
@@ -97,8 +135,17 @@ impl VarInt {
     ///
     /// # Errors
     /// Returns [`DecodeError::Short`] if fewer than the indicated number of
-    /// bytes are available.
+    /// bytes are available, or [`DecodeError::Invalid`] for a `vi64` above
+    /// `2^62 - 1`.
     pub fn decode<B: Buf>(buf: &mut B) -> Result<Self, DecodeError> {
+        if Draft::current().uses_vi64() {
+            let value = vi64_decode(buf)?;
+            return if value > MAX {
+                Err(DecodeError::Invalid("integer exceeds 2^62 - 1"))
+            } else {
+                Ok(Self(value))
+            };
+        }
         // `Buf::chunk` returns an empty slice only at end of buffer, so this
         // also covers the zero-remaining case.
         let Some(&first) = buf.chunk().first() else {
@@ -121,6 +168,92 @@ impl VarInt {
         };
 
         Ok(Self(value))
+    }
+}
+
+/// `vi64` length of `value`.
+const fn vi64_size(value: u64) -> usize {
+    // Each extra byte adds seven usable bits until the ninth, which adds a
+    // whole byte because the first is all prefix.
+    let bits = 64 - value.leading_zeros() as usize;
+    if bits <= 56 {
+        if bits <= 7 { 1 } else { bits.div_ceil(7) }
+    } else {
+        9
+    }
+}
+
+fn vi64_encode<B: BufMut>(value: u64, buf: &mut B) {
+    let len = vi64_size(value);
+    if len == 9 {
+        buf.put_u8(0xff);
+        buf.put_u64(value);
+        return;
+    }
+    // `len - 1` leading ones, then a zero, then the value in the remaining
+    // `7 * len` bits.
+    let prefix = u64::from((0xff00u16 >> (len - 1)) as u8);
+    let wire = (prefix << (8 * (len - 1))) | value;
+    buf.put_slice(&wire.to_be_bytes()[8 - len..]);
+}
+
+fn vi64_decode<B: Buf>(buf: &mut B) -> Result<u64, DecodeError> {
+    let Some(&first) = buf.chunk().first() else {
+        return Err(DecodeError::Short { needed: 1 });
+    };
+    let len = first.leading_ones() as usize + 1;
+    let remaining = buf.remaining();
+    if remaining < len {
+        return Err(DecodeError::Short {
+            needed: len - remaining,
+        });
+    }
+    if len == 9 {
+        buf.advance(1);
+        return Ok(buf.get_u64());
+    }
+    let mut bytes = [0u8; 8];
+    buf.copy_to_slice(&mut bytes[8 - len..]);
+    let value = u64::from_be_bytes(bytes);
+    // Strip the length prefix: the top `len` bits of the first byte.
+    Ok(value & (u64::MAX >> (64 - 7 * len)))
+}
+
+/// Encoded size of a full-range integer under the ambient draft.
+///
+/// Under RFC 9000 values above [`MAX`] are written as [`MAX`]; see
+/// [`encode_u64`].
+#[must_use]
+pub fn size_u64(value: u64) -> usize {
+    if Draft::current().uses_vi64() {
+        vi64_size(value)
+    } else {
+        VarInt(value.min(MAX)).quic_size()
+    }
+}
+
+/// Write a full-range integer under the ambient draft.
+///
+/// For the few fields whose largest value is a sentinel. Under `vi64` every
+/// `u64` is representable. Under RFC 9000 a value above [`MAX`] is written as
+/// [`MAX`], which is the sentinel those drafts define in its place.
+pub fn encode_u64<B: BufMut>(value: u64, buf: &mut B) {
+    if Draft::current().uses_vi64() {
+        vi64_encode(value, buf);
+    } else {
+        VarInt(value.min(MAX)).encode(buf);
+    }
+}
+
+/// Read a full-range integer under the ambient draft.
+///
+/// # Errors
+/// [`DecodeError::Short`] if incomplete, consuming nothing.
+pub fn decode_u64<B: Buf>(buf: &mut B) -> Result<u64, DecodeError> {
+    if Draft::current().uses_vi64() {
+        vi64_decode(buf)
+    } else {
+        VarInt::decode(buf).map(VarInt::get)
     }
 }
 
@@ -257,10 +390,96 @@ mod tests {
         assert!(cursor.is_empty());
     }
 
+    /// Draft-22 Table 4, every row, including the non-minimal one.
+    #[test]
+    fn vi64_vectors() {
+        let cases: &[(&[u8], u64, bool)] = &[
+            (&[0x25], 37, true),
+            (&[0x80, 0x25], 37, false),
+            (&[0xbb, 0xbd], 15_293, true),
+            (&[0xed, 0x7f, 0x3e, 0x7d], 226_442_877, true),
+            (
+                &[0xfa, 0xa1, 0xa0, 0xe4, 0x03, 0xd8],
+                2_893_212_287_960,
+                true,
+            ),
+            (
+                &[0xfc, 0x89, 0x98, 0xab, 0xc6, 0x6b, 0xc0],
+                151_288_809_941_952,
+                true,
+            ),
+            (
+                &[0xfe, 0xfa, 0x31, 0x8f, 0xa8, 0xe3, 0xca, 0x11],
+                70_423_237_261_249_041,
+                true,
+            ),
+            (&[0xff; 9], u64::MAX, true),
+        ];
+        Draft::D22.scope(|| {
+            for &(bytes, value, minimal) in cases {
+                let mut cursor = bytes;
+                assert_eq!(decode_u64(&mut cursor).unwrap(), value, "{bytes:x?}");
+                assert!(cursor.is_empty());
+                if minimal {
+                    let mut out = Vec::new();
+                    encode_u64(value, &mut out);
+                    assert_eq!(out, bytes, "encoding {value}");
+                    assert_eq!(size_u64(value), bytes.len());
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn vi64_boundaries() {
+        Draft::D22.scope(|| {
+            for len in 1..=8usize {
+                let top = (1u64 << (7 * len)) - 1;
+                for value in [top, top + 1] {
+                    let mut out = Vec::new();
+                    encode_u64(value, &mut out);
+                    let expect = if value == top { len } else { len + 1 };
+                    assert_eq!(out.len(), expect, "width of {value}");
+                    assert_eq!(decode_u64(&mut out.as_slice()).unwrap(), value);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn vi64_varint_rejects_above_62_bits_and_short_reads_consume_nothing() {
+        Draft::D22.scope(|| {
+            assert!(decoded(&[0xff; 9]).unwrap_err().is_fatal());
+            assert_eq!(
+                VarInt::decode(&mut [0xc0u8, 0].as_slice()),
+                Err(DecodeError::Short { needed: 1 })
+            );
+            let mut cursor: &[u8] = &[0xfe, 0, 0];
+            assert_eq!(
+                VarInt::decode(&mut cursor),
+                Err(DecodeError::Short { needed: 5 })
+            );
+            assert_eq!(cursor.len(), 3);
+            assert_eq!(VarInt::new(MAX).unwrap().size(), 9);
+        });
+    }
+
     mod properties {
         use proptest::prelude::*;
 
         use super::*;
+
+        proptest! {
+            #[test]
+            fn vi64_round_trips(value in any::<u64>()) {
+                Draft::D22.scope(|| {
+                    let mut out = Vec::new();
+                    encode_u64(value, &mut out);
+                    assert_eq!(out.len(), size_u64(value));
+                    assert_eq!(decode_u64(&mut out.as_slice()).unwrap(), value);
+                });
+            }
+        }
 
         proptest! {
             /// The direction that must always hold. The reverse does not,

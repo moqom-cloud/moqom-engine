@@ -42,10 +42,12 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::fabric::Fabric;
 use crate::generated::admin::v1 as admin;
 use crate::generated::relay::v1 as pb;
+use crate::geo;
 use crate::identity::VerificationKey;
 use crate::media;
 use crate::policy::{self, Banned, Rules};
 use crate::roster::{Departure, Note, Presence};
+use crate::scope::Ceiling;
 use crate::session::code;
 
 /// How often the relay says it is still here.
@@ -56,6 +58,14 @@ use crate::session::code;
 /// from timing out an idle HTTP/2 stream, which is the failure this actually
 /// prevents in a deployment behind a load balancer.
 const HEARTBEAT: Duration = Duration::from_secs(15);
+
+/// How often the relay counts its sessions by place for the live map.
+///
+/// A census is sent only when it differs from the last one sent, or when
+/// [`CENSUS_REFRESH`] has passed, so a quiet relay costs one message every
+/// thirty seconds. See [`crate::geo`] for what a census does and does not hold.
+const CENSUS: Duration = Duration::from_secs(2);
+const CENSUS_REFRESH: Duration = Duration::from_secs(30);
 
 /// How long to keep serving new sessions after losing the control plane, until
 /// a `Welcome` says otherwise.
@@ -131,7 +141,8 @@ impl Supervisor {
         if credential.is_empty() {
             tracing::warn!(
                 "MOQOM_CONTROL_ENDPOINT is set with no MOQOM_CONTROL_CREDENTIAL; \
-                 the control plane will refuse the stream"
+                 the control plane will refuse the stream unless it knows this relay \
+                 by its overlay identity"
             );
         }
         let tls = match control_tls() {
@@ -259,8 +270,9 @@ impl Link {
 async fn serve(supervisor: Supervisor, fabric: Fabric, mut notes: mpsc::UnboundedReceiver<Note>) {
     let mut grace = DEFAULT_GRACE;
     let mut wait = FIRST_RETRY;
+    let mut surveyor = geo::Surveyor::new();
     loop {
-        match attached(&supervisor, &fabric, &mut notes, &mut grace).await {
+        match attached(&supervisor, &fabric, &mut notes, &mut grace, &mut surveyor).await {
             Ok(()) => {
                 tracing::warn!("control plane closed the link");
                 wait = FIRST_RETRY;
@@ -314,6 +326,7 @@ async fn attached(
     fabric: &Fabric,
     notes: &mut mpsc::UnboundedReceiver<Note>,
     grace: &mut Duration,
+    surveyor: &mut geo::Surveyor,
 ) -> Result<(), tonic::Status> {
     let mut client = pb::relay_link_client::RelayLinkClient::new(dial(supervisor).await?);
 
@@ -364,6 +377,11 @@ async fn attached(
     let mut heartbeat = tokio::time::interval(HEARTBEAT);
     heartbeat.tick().await;
     let mut snapshots: Option<tokio::time::Interval> = None;
+    let mut census = tokio::time::interval(CENSUS);
+    census.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Reset on every attach, so a control plane that has just met this relay
+    // hears its census on the first tick rather than thirty seconds later.
+    let mut last_census: Option<(geo::Census, std::time::Instant)> = None;
 
     loop {
         let pull = async {
@@ -408,7 +426,49 @@ async fn attached(
                     })?;
                 }
             }
+            _ = census.tick() => {
+                let current = surveyor.survey(fabric, geo::Locator::shared());
+                let due = last_census.as_ref().is_none_or(|(previous, at)| {
+                    *previous != current || at.elapsed() >= CENSUS_REFRESH
+                });
+                if due {
+                    send(&outbound, census_message(&current))?;
+                    last_census = Some((current, std::time::Instant::now()));
+                }
+            }
         }
+    }
+}
+
+/// A census as the control plane receives it.
+fn census_message(census: &geo::Census) -> pb::RelayMessage {
+    let tenants = census
+        .tenants
+        .iter()
+        .map(|(tenant, tally)| pb::TenantCensus {
+            tenant: tenant.to_string(),
+            publishers: tally.publishers,
+            viewers: tally.viewers,
+            places: tally
+                .places
+                .iter()
+                .map(|(place, &sessions)| pb::CensusPlace {
+                    country: place.country.to_string(),
+                    region: place.region.to_string(),
+                    city: place.city.to_string(),
+                    latitude: i32::from(place.latitude),
+                    longitude: i32::from(place.longitude),
+                    sessions,
+                })
+                .collect(),
+            unlocated: tally.unlocated,
+        })
+        .collect();
+    pb::RelayMessage {
+        body: Some(pb::relay_message::Body::Census(pb::Census {
+            at: Some(SystemTime::now().into()),
+            tenants,
+        })),
     }
 }
 
@@ -447,6 +507,17 @@ fn report(note: Note) -> pb::RelayMessage {
                 backstage: false,
                 locale_changed: true,
                 locale,
+            })
+        }
+        Note::Moved { id, backstage } => {
+            pb::relay_message::Body::SessionChanged(pb::SessionChanged {
+                session_id: id.number().to_string(),
+                track: String::new(),
+                publishing: false,
+                backstage_changed: true,
+                backstage,
+                locale_changed: false,
+                locale: String::new(),
             })
         }
     };
@@ -571,17 +642,26 @@ fn apply(fabric: &Fabric, snapshot: &pb::RoomSnapshot) {
             None => fabric.policy().unreadable(),
         }
     }
-    if !snapshot.grant_overrides.is_empty() {
-        // Said once per snapshot rather than silently dropped. A room whose
-        // overrides are in every snapshot and enforced by nobody is worth a
-        // line in the log.
-        tracing::warn!(
-            tenant = %snapshot.tenant,
-            room = %snapshot.room,
-            overrides = snapshot.grant_overrides.len(),
-            "snapshot carries state this relay does not enforce"
-        );
-    }
+    // A demotion issued while this relay was not attached, or by a replica it
+    // is not attached to, arrives this way. Held exactly as a directive's is.
+    let grants: Vec<policy::Override> = snapshot
+        .grant_overrides
+        .iter()
+        .map(|grant| {
+            let identity = grant.identity.clone().unwrap_or_default();
+            policy::Override {
+                user: identity.username,
+                device: identity.device,
+                ceiling: grant.grants.as_ref().map_or(
+                    Ceiling {
+                        publish: crate::scope::Publish::NONE,
+                        capabilities: 0,
+                    },
+                    ceiling_of,
+                ),
+            }
+        })
+        .collect();
 
     let mutes = snapshot
         .mutes
@@ -605,6 +685,8 @@ fn apply(fabric: &Fabric, snapshot: &pb::RoomSnapshot) {
             bans,
             ceiling: snapshot.max_participants,
             mutes,
+            grants,
+            relay_only: snapshot.direct.as_ref().is_some_and(|direct| !direct.allowed),
         },
     );
 
@@ -619,6 +701,14 @@ fn apply(fabric: &Fabric, snapshot: &pb::RoomSnapshot) {
             .policy()
             .silenced(&room, &presence.user, &presence.device);
         presence.restrict(silence);
+        // Only for somebody a ceiling names. A session nobody has set one for
+        // is governed by its token, and has nothing to be narrowed to.
+        if let Some(ceiling) = fabric
+            .policy()
+            .ceiling(&room, &presence.user, &presence.device)
+        {
+            presence.regrant(ceiling);
+        }
     }
 
     // The same again for bans, except that a ban is a closed connection rather
@@ -688,6 +778,65 @@ fn enforce(fabric: &Fabric, room: &policy::Where, target: &admin::ParticipantRef
         }
     }
     reached
+}
+
+/// Hold every session `target` names in `room` to its current ceiling, and
+/// report how many were reached.
+///
+/// Read back from the policy rather than taken from the directive, for the
+/// reason [`enforce`] does: a device can be named by a rule for the person and
+/// another for the device, and it is held to both.
+fn regrant(fabric: &Fabric, room: &policy::Where, target: &admin::ParticipantRef) -> u32 {
+    let mut reached = 0;
+    for presence in fabric.roster().in_room(&room.0, &room.1) {
+        if !presence.is(&target.username, &target.device) {
+            continue;
+        }
+        let Some(ceiling) = fabric
+            .policy()
+            .ceiling(room, &presence.user, &presence.device)
+        else {
+            continue;
+        };
+        if presence.regrant(ceiling) {
+            reached += 1;
+        }
+    }
+    reached
+}
+
+/// The ceiling a control-plane grant describes.
+///
+/// The publish kinds and capability bits translated back into the token's
+/// bitmasks, so that a ceiling and a token are compared in one numbering.
+/// Anything this build does not recognise grants nothing, which for a ceiling
+/// is the cautious reading: an unknown power is one this relay will not leave
+/// in place on the strength of not understanding the instruction to remove it.
+fn ceiling_of(grants: &admin::Grants) -> Ceiling {
+    use crate::scope::Publish;
+    let mut publish = 0u8;
+    for kind in &grants.publish {
+        publish |= match admin::PublishScope::try_from(*kind) {
+            Ok(admin::PublishScope::Audio) => 1 << 0,
+            Ok(admin::PublishScope::Video) => 1 << 1,
+            Ok(admin::PublishScope::ScreenShare) => 1 << 2,
+            Ok(admin::PublishScope::Data) => 1 << 3,
+            _ => 0,
+        };
+    }
+    let mut capabilities = 0u32;
+    for power in &grants.moderation {
+        if let Some((bit, _)) = CAPABILITIES
+            .iter()
+            .find(|(_, capability)| *capability as i32 == *power)
+        {
+            capabilities |= bit;
+        }
+    }
+    Ceiling {
+        publish: Publish::from_bits(publish),
+        capabilities,
+    }
 }
 
 /// Close every session in `room` that the policy now refuses.
@@ -772,11 +921,33 @@ fn carry_out(fabric: &Fabric, directive: pb::Directive) -> pb::DirectiveResult {
             fabric.policy().mute(room.clone(), mute, apply.muted);
             ("mute", enforce(fabric, &room, &target), String::new())
         }
-        Some(pb::directive::Action::ApplyGrants(_)) => {
-            return refused(
-                id,
-                "this relay does not override token grants: a demotion takes effect on reissue",
+        // A demotion that waited for the client to present a narrower token
+        // would be a demotion the client could decline, by never renewing. So
+        // the control plane's word lands here at once — but only downwards.
+        //
+        // The directive is held as a ceiling, not adopted as grants. A session
+        // is narrowed to it now, and every later token for that seat is capped
+        // by it, on renewal and on reconnection alike; nothing here ever gives a
+        // session more than it had. A promotion directive therefore only lifts
+        // the ceiling, and the promotion itself arrives as a token, which is
+        // signed and bound to the device. That asymmetry is deliberate: the
+        // worst a forged or replayed directive can do is take powers away,
+        // which an ejection could have done anyway, whereas a relay that widened
+        // on one would be handing out the stage on the strength of a message.
+        Some(pb::directive::Action::ApplyGrants(apply)) => {
+            let target = apply.target.clone().unwrap_or_default();
+            let Some(ceiling) = apply.grants.as_ref().map(ceiling_of) else {
+                return refused(id, "directive named no grants");
+            };
+            fabric.policy().regrant(
+                room.clone(),
+                policy::Override {
+                    user: target.username.clone(),
+                    device: target.device.clone(),
+                    ceiling,
+                },
             );
+            ("grants", regrant(fabric, &room, &target), String::new())
         }
         None => return refused(id, "directive named no action"),
     };
@@ -1174,6 +1345,8 @@ mod tests {
         /// Accumulated rather than returned once, so that a test polling for a
         /// restriction to arrive does not consume the thing it is waiting for.
         restricted: Mutex<Vec<Silence>>,
+        /// Every grant ceiling taken off `orders` so far, for the same reason.
+        regranted: Mutex<Vec<Ceiling>>,
     }
 
     impl Hangup {
@@ -1196,22 +1369,45 @@ mod tests {
 
         /// Every restriction handed to this session so far.
         fn restrictions(&self) -> Vec<Silence> {
-            let mut restricted = self
-                .restricted
+            self.drain();
+            self.restricted
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+
+        /// Every grant ceiling handed to this session so far.
+        fn ceilings(&self) -> Vec<Ceiling> {
+            self.drain();
+            self.regranted
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+
+        fn drain(&self) {
             let mut orders = self
                 .orders
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(queue) = orders.as_mut() {
-                while let Ok(command) = queue.try_recv() {
-                    if let Command::Restrict { silence } = command {
-                        restricted.push(silence);
-                    }
+            let Some(queue) = orders.as_mut() else {
+                return;
+            };
+            while let Ok(command) = queue.try_recv() {
+                match command {
+                    Command::Restrict { silence } => self
+                        .restricted
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(silence),
+                    Command::Regrant { ceiling } => self
+                        .regranted
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(ceiling),
+                    _ => {}
                 }
             }
-            restricted.clone()
         }
     }
 
@@ -1234,6 +1430,7 @@ mod tests {
             capabilities: 1 << 16,
             owner: false,
             backstage: false,
+            relay: false,
         }
     }
 
@@ -1347,6 +1544,38 @@ mod tests {
 
         // And the relay now believes it is supervised.
         assert!(fabric.policy().supervised());
+    }
+
+    /// The live map's input: counts per tenant, and nothing that names or
+    /// addresses anybody.
+    #[tokio::test]
+    async fn a_census_carries_counts_and_no_names_or_addresses() {
+        let control = FakeControl::default();
+        let serving = control.start().await;
+        let fabric = Fabric::new();
+        join(&fabric, "ada");
+        join(&fabric, "grace");
+        let _link = Link::attach(supervisor(serving.endpoint()), fabric.clone());
+
+        let heard = control
+            .hears("a census", |m| {
+                matches!(&m.body, Some(pb::relay_message::Body::Census(c)) if !c.tenants.is_empty())
+            })
+            .await;
+        let Some(pb::relay_message::Body::Census(census)) = heard.body else {
+            unreachable!()
+        };
+        assert_eq!(census.tenants.len(), 1);
+        let acme = &census.tenants[0];
+        assert_eq!(acme.tenant, "acme");
+        assert_eq!((acme.publishers, acme.viewers), (0, 2));
+        // A documentation address is in no database.
+        assert_eq!(acme.unlocated, 2);
+
+        let printed = format!("{census:?}");
+        for leaked in ["203.0.113", "ada", "grace", "r1"] {
+            assert!(!printed.contains(leaked), "{leaked} in {printed}");
+        }
     }
 
     /// The control plane is told when a session will be closed for want of a
@@ -1506,6 +1735,7 @@ mod tests {
                 mutes: Vec::new(),
                 grant_overrides: Vec::new(),
                 max_participants: 0,
+                direct: None,
             })),
         });
         let serving = control.start().await;
@@ -1776,6 +2006,150 @@ mod tests {
                 .policy()
                 .silenced(&("acme".into(), "r1".into()), "bea", "phone")
                 .is_empty()
+        );
+    }
+
+    /// A demotion has to reach the session without waiting for its client,
+    /// and has to outlive it: the ceiling is held against the person, so the
+    /// token they already have cannot restore what was taken on reconnection.
+    #[tokio::test]
+    async fn a_grants_directive_caps_the_session_it_names_and_nobody_else() {
+        let control = FakeControl::default();
+        control.will_say(directive(pb::directive::Action::ApplyGrants(
+            pb::ApplyGrants {
+                target: Some(admin::ParticipantRef {
+                    username: "ada".to_owned(),
+                    device: String::new(),
+                }),
+                grants: Some(admin::Grants {
+                    publish: vec![admin::PublishScope::Audio as i32],
+                    moderation: Vec::new(),
+                    is_owner: false,
+                }),
+            },
+        )));
+        let serving = control.start().await;
+
+        let fabric = Fabric::new();
+        let ada = join(&fabric, "ada");
+        let bea = join(&fabric, "bea");
+        let _link = Link::attach(supervisor(serving.endpoint()), fabric.clone());
+
+        let result = control.hears("the directive result", is_result).await;
+        let result = result_of(&result);
+        assert_eq!(result.affected_sessions, 1);
+        assert!(result.error.is_empty(), "unexpected: {:?}", result.error);
+
+        let audio_only = Ceiling {
+            publish: Publish::AUDIO,
+            capabilities: 0,
+        };
+        assert_eq!(ada.ceilings(), vec![audio_only]);
+        assert!(bea.ceilings().is_empty());
+        // Narrowed, not thrown out.
+        assert!(!ada.was_closed());
+        let room = ("acme".into(), "r1".into());
+        assert_eq!(
+            fabric.policy().ceiling(&room, "ada", "phone"),
+            Some(audio_only)
+        );
+        assert_eq!(fabric.policy().ceiling(&room, "bea", "phone"), None);
+    }
+
+    /// A directive that names no grants cannot be read as "none", which would
+    /// demote somebody on the strength of a malformed message.
+    #[tokio::test]
+    async fn a_grants_directive_without_grants_is_refused() {
+        let control = FakeControl::default();
+        control.will_say(directive(pb::directive::Action::ApplyGrants(
+            pb::ApplyGrants {
+                target: Some(admin::ParticipantRef {
+                    username: "ada".to_owned(),
+                    device: String::new(),
+                }),
+                grants: None,
+            },
+        )));
+        let serving = control.start().await;
+
+        let fabric = Fabric::new();
+        let ada = join(&fabric, "ada");
+        let _link = Link::attach(supervisor(serving.endpoint()), fabric.clone());
+
+        let result = control.hears("the directive result", is_result).await;
+        assert!(!result_of(&result).error.is_empty());
+        assert!(ada.ceilings().is_empty());
+        assert_eq!(
+            fabric
+                .policy()
+                .ceiling(&("acme".into(), "r1".into()), "ada", "phone"),
+            None
+        );
+    }
+
+    /// A demotion issued while this relay was detached arrives in the snapshot,
+    /// and lands on whoever it names who is already here.
+    #[tokio::test]
+    async fn a_snapshot_applies_the_grant_ceilings_it_carries() {
+        let control = FakeControl::default();
+        control.will_say(pb::ControlMessage {
+            body: Some(pb::control_message::Body::RoomSnapshot(pb::RoomSnapshot {
+                tenant: "acme".to_owned(),
+                room: "r1".to_owned(),
+                grant_overrides: vec![pb::GrantOverride {
+                    identity: Some(admin::Identity {
+                        username: "ada".to_owned(),
+                        device: String::new(),
+                    }),
+                    grants: Some(admin::Grants::default()),
+                }],
+                ..pb::RoomSnapshot::default()
+            })),
+        });
+        let serving = control.start().await;
+
+        let fabric = Fabric::new();
+        let ada = join(&fabric, "ada");
+        let bea = join(&fabric, "bea");
+        let _link = Link::attach(supervisor(serving.endpoint()), fabric.clone());
+
+        until("the snapshot to be applied", || !ada.ceilings().is_empty()).await;
+        let nothing = Ceiling {
+            publish: Publish::NONE,
+            capabilities: 0,
+        };
+        assert_eq!(ada.ceilings(), vec![nothing]);
+        assert!(bea.ceilings().is_empty());
+        assert_eq!(
+            fabric
+                .policy()
+                .ceiling(&("acme".into(), "r1".into()), "ada", "phone"),
+            Some(nothing)
+        );
+    }
+
+    #[test]
+    fn grants_translate_to_the_bits_a_token_carries() {
+        let ceiling = ceiling_of(&admin::Grants {
+            publish: vec![
+                admin::PublishScope::Video as i32,
+                admin::PublishScope::ScreenShare as i32,
+            ],
+            moderation: vec![
+                admin::Capability::ForceMute as i32,
+                admin::Capability::DeleteMessage as i32,
+            ],
+            is_owner: true,
+        });
+        assert_eq!(ceiling.publish, Publish::from_bits(0b110));
+        assert_eq!(ceiling.capabilities, (1 << 11) | (1 << 0));
+        // Ownership is not a grant, so it is no part of a ceiling.
+        assert_eq!(
+            ceiling_of(&admin::Grants::default()),
+            Ceiling {
+                publish: Publish::NONE,
+                capabilities: 0
+            }
         );
     }
 

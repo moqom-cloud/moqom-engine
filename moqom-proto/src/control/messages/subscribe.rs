@@ -5,6 +5,7 @@ use bytes::{Buf, BufMut};
 use crate::control::params::Parameters;
 use crate::control::properties::Properties;
 use crate::control::request_id::RequestId;
+use crate::control::typed::{Context, check_typed};
 use crate::error::DecodeError;
 use crate::model::{FullTrackName, TrackAlias};
 use crate::varint::VarInt;
@@ -56,10 +57,14 @@ impl Subscribe {
     /// [`DecodeError::Short`] if incomplete; [`DecodeError::Invalid`] if any
     /// field violates its constraints.
     pub fn decode<B: Buf>(buf: &mut B) -> Result<Self, DecodeError> {
+        let request_id = RequestId::decode(buf)?;
+        let track = FullTrackName::decode(buf)?;
+        let parameters = Parameters::decode_counted(buf)?;
+        check_typed(Context::Subscribe, &parameters)?;
         Ok(Self {
-            request_id: RequestId::decode(buf)?,
-            track: FullTrackName::decode(buf)?,
-            parameters: Parameters::decode_counted(buf)?,
+            request_id,
+            track,
+            parameters,
         })
     }
 }
@@ -119,9 +124,12 @@ impl SubscribeOk {
     /// [`DecodeError::Short`] if incomplete; [`DecodeError::Invalid`] if any
     /// field violates its constraints.
     pub fn decode<B: Buf>(buf: &mut B) -> Result<Self, DecodeError> {
+        let track_alias = TrackAlias::new(VarInt::decode(buf)?);
+        let parameters = Parameters::decode_counted(buf)?;
+        check_typed(Context::SubscribeOk, &parameters)?;
         Ok(Self {
-            track_alias: TrackAlias::new(VarInt::decode(buf)?),
-            parameters: Parameters::decode_counted(buf)?,
+            track_alias,
+            parameters,
             properties: Properties::decode_to_end(buf)?,
         })
     }
@@ -206,10 +214,14 @@ impl TrackStatus {
     /// [`DecodeError::Short`] if incomplete; [`DecodeError::Invalid`] if any
     /// field violates its constraints.
     pub fn decode<B: Buf>(buf: &mut B) -> Result<Self, DecodeError> {
+        let request_id = RequestId::decode(buf)?;
+        let track = FullTrackName::decode(buf)?;
+        let parameters = Parameters::decode_counted(buf)?;
+        check_typed(Context::TrackStatus, &parameters)?;
         Ok(Self {
-            request_id: RequestId::decode(buf)?,
-            track: FullTrackName::decode(buf)?,
-            parameters: Parameters::decode_counted(buf)?,
+            request_id,
+            track,
+            parameters,
         })
     }
 }

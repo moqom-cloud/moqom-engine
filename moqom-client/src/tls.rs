@@ -1,9 +1,9 @@
 //! TLS helpers for talking to a MOQT relay.
 //!
 //! [`Session::connect`](crate::Session::connect) takes a `rustls::ClientConfig`
-//! so a caller can bring their own roots. These constructors set the `moqt-19`
-//! ALPN; `connect` sets it again, so a config built here cannot silently speak
-//! the wrong protocol.
+//! so a caller can bring their own roots. These constructors set the MOQT
+//! ALPNs; `connect` sets them again, so a config built here cannot silently
+//! speak the wrong protocol.
 
 use std::sync::{Arc, Once};
 
@@ -53,8 +53,15 @@ pub fn pinned(certificate: CertificateDer<'static>) -> rustls::ClientConfig {
     tls
 }
 
+/// Offer draft-22 first, then MOQOM's draft-19.
+///
+/// The order is the preference; the relay picks. Draft-16 is not offered: it
+/// is only spoken to a relay known to want it.
 pub(crate) fn apply_alpn(tls: &mut rustls::ClientConfig) {
-    tls.alpn_protocols = vec![moqom_transport::alpn::MOQT_DRAFT_19.to_vec()];
+    tls.alpn_protocols = vec![
+        moqom_transport::alpn::MOQT_DRAFT_22.to_vec(),
+        moqom_transport::alpn::MOQT_DRAFT_19.to_vec(),
+    ];
 }
 
 pub(crate) fn install_crypto_provider() {

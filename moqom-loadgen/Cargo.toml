@@ -26,8 +26,9 @@ moqom-media = { path = "../moqom-media", features = ["clap"] }
 bytes = { workspace = true }
 clap = { workspace = true }
 thiserror = { workspace = true }
-# Minting the tokens the subscribers present. Ed25519 because that is what the
-# control plane signs with and what the relay verifies.
+# Minting the tokens the subscribers present, with the library the control plane
+# mints with and the relay verifies with. aws-lc-rs derives the device keys.
+moqom-token = { workspace = true }
 aws-lc-rs = { workspace = true }
 base64 = { workspace = true }
 serde_json = { workspace = true }

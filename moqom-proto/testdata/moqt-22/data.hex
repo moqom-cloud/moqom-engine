@@ -1,0 +1,18 @@
+# draft-ietf-moq-transport-22 integers and data streams.
+# subgroup_stream: SUBGROUP_HEADER then three objects.
+# fetch_stream: FETCH_HEADER then objects and End of Range markers,
+# including End of Timed-Out Range (0x20C).
+# Integers are vi64 (leading ones give the length, 1-9 bytes).
+# Generated and checked by moqom-proto/tests/moqt22_vectors.rs.
+fetch_stream 05041c0500800161808c050300820c060900810c070000000162
+object_datagram 0c0780826467
+subgroup_stream 1c07812c024000036b657900000080c6056c61746572
+vi64_0 00
+vi64_127 7f
+vi64_128 8080
+vi64_15293 bbbd
+vi64_16384 c04000
+vi64_226442877 ed7f3e7d
+vi64_2_62_minus_1 ff3fffffffffffffff
+vi64_2_64_minus_1 ffffffffffffffffff
+vi64_37 25

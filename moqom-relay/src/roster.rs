@@ -42,7 +42,7 @@ use tokio::sync::{mpsc, watch};
 
 use crate::fabric::{Command, SessionId};
 use crate::policy::Silence;
-use crate::scope::{Publish, Scope, capability};
+use crate::scope::{Ceiling, Publish, Scope, capability};
 
 /// Something that can be hung up on.
 ///
@@ -57,8 +57,10 @@ pub trait Closes: Send + Sync {
 }
 
 impl Closes for moqom_transport::Session {
+    /// `code` is MOQOM's; a draft-22 session is closed with §12.2's number
+    /// for the same reason.
     fn close(&self, code: u32, reason: &[u8]) {
-        moqom_transport::Session::close(self, code, reason);
+        moqom_transport::Session::close(self, crate::session::close_code(self, code), reason);
     }
 }
 
@@ -118,7 +120,11 @@ pub struct Presence {
     /// task returning a transport error, and reporting an ejection as a network
     /// failure would have the control plane hold a place open for somebody it
     /// just threw out.
-    ejected: AtomicBool,
+    ///
+    /// Shared rather than owned, because a change of grants replaces the
+    /// presence and an ejection may land on the copy somebody was already
+    /// holding. Two flags would let teardown read the one nobody set.
+    ejected: Arc<AtomicBool>,
 }
 
 /// What a joining session brings with it, beyond the identity in its scope.
@@ -160,6 +166,17 @@ impl std::fmt::Debug for Presence {
 }
 
 impl Presence {
+    /// Whether this is the hosted recorder. See [`crate::scope::is_recorder`].
+    #[must_use]
+    pub fn is_recorder(&self) -> bool {
+        crate::scope::is_recorder(
+            &self.user,
+            self.publish,
+            self.capabilities,
+            self.owner || self.backstage,
+        )
+    }
+
     /// Whether this session was closed on instruction rather than by accident.
     #[must_use]
     pub fn was_ejected(&self) -> bool {
@@ -237,6 +254,31 @@ impl Presence {
             }
         }
     }
+
+    /// Tell this session the most it may now hold.
+    ///
+    /// The session narrows itself to it — it is the only thing that can
+    /// withdraw its own announcements and end its own subscriptions — and never
+    /// widens: see [`crate::scope::Ceiling`].
+    ///
+    /// A full queue is handled as it is for a mute, by saying so rather than
+    /// blocking the link. Unlike a mute, a dropped demotion would leave powers in
+    /// place, so the failure is at `error`, and the ceiling still waits in the
+    /// policy for the session's next renewal or reconnection.
+    pub fn regrant(&self, ceiling: Ceiling) -> bool {
+        match self.commands.try_send(Command::Regrant { ceiling }) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::error!(
+                    session = %self.id,
+                    user = %self.user,
+                    error = %e,
+                    "could not hand a demotion to its session"
+                );
+                false
+            }
+        }
+    }
 }
 
 /// Why a session is no longer here.
@@ -281,6 +323,13 @@ pub enum Note {
         id: SessionId,
         /// BCP 47 tag from their latest catalog, empty when they cleared it.
         locale: String,
+    },
+    /// Somebody went on stage from backstage, or back, without reconnecting.
+    Moved {
+        /// Which session.
+        id: SessionId,
+        /// Where they are now.
+        backstage: bool,
     },
 }
 
@@ -358,7 +407,7 @@ impl Roster {
             transport: arrival.transport,
             credential: arrival.credential,
             commands: arrival.commands,
-            ejected: AtomicBool::new(false),
+            ejected: Arc::new(AtomicBool::new(false)),
         });
 
         let mut inner = self.lock();
@@ -393,6 +442,54 @@ impl Roster {
                 why,
             });
         }
+    }
+
+    /// Record that a live session now holds different grants.
+    ///
+    /// The presence is replaced rather than edited, because it is shared: the
+    /// fan-out reads `privileged()` from it on other sessions' tasks, and a
+    /// record whose fields changed one at a time under them could be read half
+    /// promoted. Everything that is not a grant — who, where, since when, the
+    /// connection — is carried across unchanged, which is what makes this the
+    /// same participant rather than a departure and an arrival.
+    ///
+    /// Returns the new presence, or `None` for a session that is not enrolled.
+    // As with `admit`, the roster keeps its own copy; a session regrading
+    // itself has no use for the handle.
+    #[allow(clippy::must_use_candidate)]
+    pub fn regrade(&self, id: SessionId, scope: &Scope) -> Option<Arc<Presence>> {
+        let mut inner = self.lock();
+        let held = inner.sessions.get(&id)?;
+        let moved = held.backstage != scope.backstage;
+        let presence = Arc::new(Presence {
+            id,
+            tenant: Arc::clone(&held.tenant),
+            room: Arc::clone(&held.room),
+            user: Arc::clone(&held.user),
+            device: Arc::clone(&held.device),
+            publish: scope.publish,
+            capabilities: scope.capabilities,
+            owner: held.owner,
+            backstage: scope.backstage,
+            address: held.address,
+            opened: held.opened,
+            via: held.via.clone(),
+            transport: Arc::clone(&held.transport),
+            credential: held.credential.clone(),
+            commands: held.commands.clone(),
+            ejected: Arc::clone(&held.ejected),
+        });
+        inner.sessions.insert(id, Arc::clone(&presence));
+        // Only a move between backstage and the stage is news upstream: the
+        // control plane decided the grants, and it is the one place that
+        // already knows them. Where somebody is standing is the relay's to say.
+        if moved && let Some(reports) = &inner.reports {
+            let _ = reports.send(Note::Moved {
+                id,
+                backstage: scope.backstage,
+            });
+        }
+        Some(presence)
     }
 
     /// Report a mid-session change the control plane should store.
@@ -455,12 +552,15 @@ impl Roster {
     }
 
     /// How many sessions one room holds, for the participant ceiling.
+    ///
+    /// The hosted recorder is not counted: it is not a participant, and a
+    /// recorder in a room must not be the reason a person is turned away.
     #[must_use]
     pub fn occupancy(&self, tenant: &str, room: &str) -> usize {
         self.lock()
             .sessions
             .values()
-            .filter(|p| &*p.tenant == tenant && &*p.room == room)
+            .filter(|p| &*p.tenant == tenant && &*p.room == room && !p.is_recorder())
             .count()
     }
 }
@@ -496,6 +596,7 @@ mod tests {
             capabilities: 0,
             owner: false,
             backstage: false,
+            relay: false,
         }
     }
 
@@ -562,6 +663,22 @@ mod tests {
     }
 
     #[test]
+    fn the_recorder_is_on_the_roster_and_not_in_the_occupancy() {
+        let roster = Roster::new();
+        let ids = Fabric::new();
+        enrol(&roster, ids.next_session_id(), "ada", Some("r1"));
+        let mut recorder = scope(crate::scope::RECORDER_SUBJECT, Some("r1"));
+        recorder.publish = Publish::NONE;
+        let (commands, _queue) = mpsc::channel(4);
+        let presence = roster
+            .admit(ids.next_session_id(), &recorder, arrival(commands))
+            .expect("enrolled");
+        assert!(presence.is_recorder());
+        assert_eq!(roster.count(), 2);
+        assert_eq!(roster.occupancy("acme", "r1"), 1);
+    }
+
+    #[test]
     fn leaving_is_reported_once_and_only_for_somebody_who_was_here() {
         let roster = Roster::new();
         let mut notes = roster.listen();
@@ -596,6 +713,49 @@ mod tests {
         // The session's own task reports what it saw, which is a dead socket.
         roster.release(id, Departure::Lost);
 
+        assert!(matches!(
+            notes.try_recv(),
+            Ok(Note::Left {
+                why: Departure::Ejected,
+                ..
+            })
+        ));
+    }
+
+    /// Grants changing is not somebody leaving and somebody else arriving. The
+    /// room hears only what it can see — a move across the stage — and an
+    /// ejection already under way is not forgotten by the rebuilt entry.
+    #[test]
+    fn a_regrade_changes_the_entry_in_place() {
+        let roster = Roster::new();
+        let mut notes = roster.listen();
+        let id = Fabric::new().next_session_id();
+        let before = enrol(&roster, id, "ada", Some("r1")).expect("enrolled");
+        let _ = notes.try_recv();
+
+        let mut cohost = scope("ada", Some("r1"));
+        cohost.publish = Publish::from_bits(0b11);
+        cohost.capabilities = 1 << 11;
+        let after = roster.regrade(id, &cohost).expect("still here");
+        assert_eq!(after.id, before.id);
+        assert_eq!(after.publish, cohost.publish);
+        assert_eq!(after.capabilities, cohost.capabilities);
+        assert_eq!(roster.count(), 1);
+        assert!(notes.try_recv().is_err(), "nothing the room can see moved");
+
+        let mut queued = cohost.clone();
+        queued.backstage = true;
+        roster.regrade(id, &queued).expect("still here");
+        assert!(matches!(
+            notes.try_recv(),
+            Ok(Note::Moved {
+                backstage: true,
+                ..
+            })
+        ));
+
+        before.eject(0x03, "banned");
+        roster.release(id, Departure::Lost);
         assert!(matches!(
             notes.try_recv(),
             Ok(Note::Left {

@@ -59,6 +59,7 @@ mod mint;
 mod scrape;
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -68,8 +69,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
 use moqom_client::{
-    Bytes, Credentials, FullTrackName, Metadata, Object, ObjectProperties, OutgoingObject, Session,
-    TrackNamespace,
+    Announcement, Bytes, Credentials, DeviceKey, FullTrackName, Metadata, Object, ObjectProperties,
+    OutgoingObject, Session, TrackNamespace,
 };
 use moqom_media::annexb::{AccessUnit, Codec};
 use tokio::sync::{mpsc, watch};
@@ -85,13 +86,52 @@ use crate::scrape::Reading;
 /// rather than an oversight.
 const SEED: [u8; 32] = [0x6d; 32];
 
-/// How long a minted token lasts.
+/// How long a minted token lasts: the fifteen minutes a relay accepts at most.
 ///
-/// Comfortably longer than a run, because a session whose credential lapses is
-/// closed by the relay and would appear in the results as a subscriber that
-/// stopped receiving — which is a real behaviour, correctly implemented, and
-/// nothing to do with fan-out.
-const TOKEN_SECONDS: u64 = 3600;
+/// As long as allowed, because a session whose credential lapses is closed by
+/// the relay and would appear in the results as a subscriber that stopped
+/// receiving — which is a real behaviour, correctly implemented, and nothing to
+/// do with fan-out. Runs longer than this renew every [`RENEW_EVERY`].
+const TOKEN_SECONDS: u64 = moqom_token::MAX_LIFETIME.as_secs();
+
+/// How often every session presents a fresh token.
+///
+/// Two thirds of the way through a token's life, so a renewal the relay is slow
+/// to apply still lands before the old deadline.
+const RENEW_EVERY: Duration = Duration::from_secs(TOKEN_SECONDS * 2 / 3);
+
+/// Holds an announcement and renews its session's token until dropped.
+///
+/// Dropping withdraws the announcement, exactly as dropping the announcement
+/// itself would.
+struct Renewing(tokio::task::JoinHandle<()>);
+
+impl Drop for Renewing {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Keep the publisher's session alive past its first token.
+fn keep_renewed(mut announcement: Announcement, mint: Arc<Mint>, who: Identity) -> Renewing {
+    Renewing(tokio::spawn(async move {
+        let mut renew =
+            tokio::time::interval_at(tokio::time::Instant::now() + RENEW_EVERY, RENEW_EVERY);
+        loop {
+            renew.tick().await;
+            let renewed = match mint.token(&who, 0b11, TOKEN_SECONDS) {
+                Ok(token) => announcement
+                    .renew(&Credentials::proven(token.as_bytes(), &who.key))
+                    .await
+                    .map_err(|e| e.to_string()),
+                Err(e) => Err(e.to_string()),
+            };
+            if let Err(e) = renewed {
+                eprintln!("renewing the publisher's token: {e}");
+            }
+        }
+    }))
+}
 
 /// How long to wait for every subscriber to be watching before publishing.
 ///
@@ -160,11 +200,12 @@ enum Command {
     Watch(Box<WatchArgs>),
     /// Print the key set a relay must trust to admit this harness's tokens.
     Jwks,
-    /// Print one token, for a relay that needs a credential of its own.
+    /// Print one token, for a relay that needs a credential of its own, and write
+    /// the device key it is bound to.
     ///
     /// An edge relay authenticates to its parent like anything else, so a tier whose
     /// parent verifies credentials needs one of these in
-    /// `MOQOM_RELAY_UPSTREAM_TOKEN`. It is minted as a viewer in the room, which is
+    /// `MOQOM_RELAY_UPSTREAM_TOKEN` and the key in `MOQOM_RELAY_UPSTREAM_KEY`. It is minted as a viewer in the room, which is
     /// enough to read the tracks an edge is there to forward and no more. A real
     /// fleet would give its relays a service credential scoped to the tenant rather
     /// than to one room.
@@ -183,11 +224,16 @@ struct TokenArgs {
 
     /// How long it lasts, in seconds.
     ///
-    /// Generous by default, because an edge holds one for the life of the process
-    /// and a link that drops mid-run because a token expired looks exactly like the
-    /// tiering not working.
-    #[arg(long, default_value_t = 3600)]
+    /// The fifteen-minute maximum by default, because an edge holds one for the
+    /// life of the process and a link that drops mid-run because a token expired
+    /// looks exactly like the tiering not working. Longer is refused: no relay
+    /// accepts it.
+    #[arg(long, default_value_t = TOKEN_SECONDS)]
     seconds: u64,
+
+    /// Where to write the PKCS#8 device key the token is bound to.
+    #[arg(long)]
+    key: std::path::PathBuf,
 }
 
 /// Where the relay is and who the identities belong to.
@@ -433,7 +479,8 @@ async fn run() -> Fallible<bool> {
             // never announces there, and a credential that could publish would let a
             // compromised edge inject tracks into the fleet.
             let who = Identity::relay(&args.tenant, &args.room);
-            println!("{}", mint.token(&who, 0, args.seconds));
+            std::fs::write(&args.key, Identity::pkcs8(&who.user))?;
+            println!("{}", mint.token(&who, 0, args.seconds)?);
             Ok(true)
         }
         Command::Fanout(args) => fanout(&args).await,
@@ -457,7 +504,7 @@ fn track_of(common: &Common) -> Fallible<(Identity, FullTrackName)> {
 /// One publisher, many subscribers, and a report.
 async fn fanout(args: &FanoutArgs) -> Fallible<bool> {
     let (server_name, addr) = resolve(&args.common.relay)?;
-    let mint = Mint::from_seed(&SEED)?;
+    let mint = Arc::new(Mint::from_seed(&SEED)?);
     let (publisher, track) = track_of(&args.common)?;
     // Before connecting, so that an unreadable file fails the run immediately
     // rather than after a few hundred subscribers have been stood up.
@@ -469,8 +516,15 @@ async fn fanout(args: &FanoutArgs) -> Fallible<bool> {
     // fan-out deduplication as missing.
     let before = read_metrics(args.common.metrics.as_deref()).await;
 
-    let token = mint.token(&publisher, 0b11, TOKEN_SECONDS);
-    let mut session = connect(addr, &server_name, args.common.insecure, &token).await?;
+    let token = mint.token(&publisher, 0b11, TOKEN_SECONDS)?;
+    let mut session = connect(
+        addr,
+        &server_name,
+        args.common.insecure,
+        &token,
+        &publisher.key,
+    )
+    .await?;
     let announcement = session
         .announce(track.namespace().clone())
         .await
@@ -498,6 +552,8 @@ async fn fanout(args: &FanoutArgs) -> Fallible<bool> {
     tokio::time::timeout(READY_PATIENCE, announcement.subscribed())
         .await
         .map_err(|_| "the relay never asked for the track")?;
+    let alias = announcement.alias();
+    let _renewing = keep_renewed(announcement, Arc::clone(&mint), publisher.clone());
 
     let live = spawn_live(
         args.common.live,
@@ -505,7 +561,7 @@ async fn fanout(args: &FanoutArgs) -> Fallible<bool> {
         args.common.metrics.clone(),
         Some(Arc::clone(&crowd.progress)),
     );
-    let sent = publish(&session, announcement.alias(), &args.shape, film.as_ref()).await?;
+    let sent = publish(&session, alias, &args.shape, film.as_ref()).await?;
     live.abort();
     // Drop nothing yet: the publisher's session has to outlive the drain below,
     // or the relay withdraws the track and the tail of the last group is lost for
@@ -530,7 +586,7 @@ async fn fanout(args: &FanoutArgs) -> Fallible<bool> {
 /// Publish the track and hold it, for the one host that feeds a fleet.
 async fn publish_only(args: &PublishArgs) -> Fallible<bool> {
     let (server_name, addr) = resolve(&args.common.relay)?;
-    let mint = Mint::from_seed(&SEED)?;
+    let mint = Arc::new(Mint::from_seed(&SEED)?);
     let (publisher, track) = track_of(&args.common)?;
     let film = args.shape.film()?;
 
@@ -538,8 +594,15 @@ async fn publish_only(args: &PublishArgs) -> Fallible<bool> {
     // the growth is measured over.
     let before = read_metrics(args.common.metrics.as_deref()).await;
 
-    let token = mint.token(&publisher, 0b11, TOKEN_SECONDS);
-    let mut session = connect(addr, &server_name, args.common.insecure, &token).await?;
+    let token = mint.token(&publisher, 0b11, TOKEN_SECONDS)?;
+    let mut session = connect(
+        addr,
+        &server_name,
+        args.common.insecure,
+        &token,
+        &publisher.key,
+    )
+    .await?;
     let announcement = session
         .announce(track.namespace().clone())
         .await
@@ -552,6 +615,8 @@ async fn publish_only(args: &PublishArgs) -> Fallible<bool> {
     tokio::time::timeout(READY_PATIENCE, announcement.subscribed())
         .await
         .map_err(|_| "nobody subscribed, so there was nothing to publish to")?;
+    let alias = announcement.alias();
+    let _renewing = keep_renewed(announcement, Arc::clone(&mint), publisher.clone());
 
     let live = spawn_live(
         args.common.live,
@@ -559,7 +624,7 @@ async fn publish_only(args: &PublishArgs) -> Fallible<bool> {
         args.common.metrics.clone(),
         None,
     );
-    let sent = publish(&session, announcement.alias(), &args.shape, film.as_ref()).await?;
+    let sent = publish(&session, alias, &args.shape, film.as_ref()).await?;
     println!(
         "published     {} frames in {} group(s), {:.1} MiB at {:.1}/s",
         sent.frames,
@@ -600,7 +665,7 @@ async fn publish_only(args: &PublishArgs) -> Fallible<bool> {
 /// Watch a track somebody else is publishing, for the hosts that are the load.
 async fn watch_only(args: &WatchArgs) -> Fallible<bool> {
     let (server_name, addr) = resolve(&args.common.relay)?;
-    let mint = Mint::from_seed(&SEED)?;
+    let mint = Arc::new(Mint::from_seed(&SEED)?);
     let (_, track) = track_of(&args.common)?;
     // Read for its group lengths, not to publish it: this host has to know how
     // long a complete group is to say whether one arrived whole, and a clip is
@@ -662,7 +727,7 @@ struct Crowded {
 fn gather(
     common: &Common,
     crowd: &Crowd,
-    mint: &Mint,
+    mint: &Arc<Mint>,
     addr: SocketAddr,
     server_name: &str,
     track: &FullTrackName,
@@ -679,13 +744,17 @@ fn gather(
 
     for n in 0..crowd.subscribers {
         let who = Identity::viewer(&common.tenant, &common.room, crowd.first_viewer + n);
-        let token = mint.token(&who, 0, TOKEN_SECONDS);
+        let token = mint
+            .token(&who, 0, TOKEN_SECONDS)
+            .expect("TOKEN_SECONDS is within the lifetime a token may have");
         watchers.push(tokio::spawn(watch_track(
             Watching {
                 addr,
                 server_name: server_name.to_owned(),
                 insecure: common.insecure,
                 token,
+                mint: Arc::clone(mint),
+                who,
                 track: track.clone(),
                 progress: Arc::clone(&progress),
                 wait: Duration::from_secs(wait),
@@ -709,6 +778,9 @@ struct Watching {
     server_name: String,
     insecure: bool,
     token: String,
+    /// What renews `token`, for the identity it was minted for.
+    mint: Arc<Mint>,
+    who: Identity,
     track: FullTrackName,
     /// Objects received across every subscriber, so the drain can tell delivery
     /// still in flight from delivery that has stopped.
@@ -819,6 +891,7 @@ async fn watch_track(
         &watching.server_name,
         watching.insecure,
         &watching.token,
+        &watching.who.key,
     )
     .await;
     let mut session = match session {
@@ -843,9 +916,24 @@ async fn watch_track(
         return tally;
     }
 
+    let mut renew =
+        tokio::time::interval_at(tokio::time::Instant::now() + RENEW_EVERY, RENEW_EVERY);
     while !*listening.borrow() {
         tokio::select! {
             _ = listening.changed() => break,
+            _ = renew.tick() => {
+                let renewed = match watching.mint.token(&watching.who, 0, TOKEN_SECONDS) {
+                    Ok(token) => subscription
+                        .renew(&Credentials::proven(token.as_bytes(), &watching.who.key))
+                        .await
+                        .map_err(|e| e.to_string()),
+                    Err(e) => Err(e.to_string()),
+                };
+                if let Err(e) = renewed {
+                    tally.fault = Some(format!("renewing the token: {e}"));
+                    break;
+                }
+            }
                 next = subscription.next_object() => match next {
                 Ok(Some(object)) => {
                     tally.record(&object);
@@ -1120,10 +1208,7 @@ fn spawn_live(
             }
             let mut line = format!("live         t+{}s", began.elapsed().as_secs());
             if let Some(progress) = &progress {
-                line.push_str(&format!(
-                    "  objects={}",
-                    progress.load(Ordering::Relaxed)
-                ));
+                let _ = write!(line, "  objects={}", progress.load(Ordering::Relaxed));
             }
             if let Some(addr) = &metrics {
                 match Reading::take(addr).await {
@@ -1131,9 +1216,7 @@ fn spawn_live(
                         let sess = reading.get("moqom_relay_sessions");
                         let shed = previous.as_ref().map_or_else(
                             || reading.get("moqom_relay_subgroups_shed_total"),
-                            |before| {
-                                before.growth(&reading, "moqom_relay_subgroups_shed_total")
-                            },
+                            |before| before.growth(&reading, "moqom_relay_subgroups_shed_total"),
                         );
                         let dt = previous_at.elapsed().as_secs_f64().max(0.001);
                         let gbit = previous.as_ref().map_or(0.0, |before| {
@@ -1141,13 +1224,13 @@ fn spawn_live(
                                 / dt
                                 / 1_000_000_000.0
                         });
-                        line.push_str(&format!(
-                            "  sess={sess:.0}  shed={shed:.0}  {gbit:.2} Gbit/s"
-                        ));
+                        let _ = write!(line, "  sess={sess:.0}  shed={shed:.0}  {gbit:.2} Gbit/s");
                         previous = Some(reading);
                         previous_at = Instant::now();
                     }
-                    Err(error) => line.push_str(&format!("  relay=({error})")),
+                    Err(error) => {
+                        let _ = write!(line, "  relay=({error})");
+                    }
                 }
             }
             eprintln!("{line}");
@@ -1175,13 +1258,14 @@ async fn connect(
     server_name: &str,
     insecure: bool,
     token: &str,
+    key: &DeviceKey,
 ) -> Result<Session, moqom_client::Error> {
     let tls = if insecure {
         moqom_client::tls::insecure()
     } else {
         moqom_client::tls::native()
     };
-    let credentials = Credentials::bearer(token.as_bytes());
+    let credentials = Credentials::proven(token.as_bytes(), key);
     Session::connect(addr, server_name, tls, Some(&credentials)).await
 }
 
@@ -1437,6 +1521,14 @@ fn millis(duration: Duration) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sessions_renew_well_before_their_token_lapses() {
+        let margin = Duration::from_secs(TOKEN_SECONDS)
+            .checked_sub(RENEW_EVERY)
+            .expect("renewal comes before the token lapses");
+        assert!(margin >= READY_PATIENCE);
+    }
 
     const PER_GROUP: u64 = 30;
 

@@ -229,6 +229,70 @@ async fn objects_are_forwarded_with_a_rewritten_alias() {
     );
 }
 
+/// FORWARD=0 on a `REQUEST_UPDATE` stops the relay's copy without ending the
+/// subscription, and FORWARD=1 brings it back from the next subgroup.
+///
+/// What a client with a direct path to the publisher sends, so the relay copy
+/// it keeps as a fallback is not also relay egress it pays for.
+#[tokio::test]
+async fn a_paused_subscription_is_not_forwarded_until_resumed() {
+    let relay = Relay::start();
+    let mut publisher = Client::connect(&relay).await;
+    let mut subscriber = Client::connect(&relay).await;
+
+    let room = namespace(&["acme", "room-42"]);
+    let _announcement = publisher.announce(&room).await;
+    within("the announcement to register", async {
+        while relay.fabric.namespaces().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+
+    let upstream = moqom_proto::model::TrackAlias::from(7_u32);
+    let video = track(&["acme", "room-42"], "video");
+    let (_served, subscription) = tokio::join!(
+        publisher.answer_subscription(upstream),
+        subscriber.subscribe(&video),
+    );
+    let mut subscription = subscription.expect("the relay accepts the subscription");
+
+    publisher
+        .publish_group(upstream, GroupId::ZERO, &[b"before"])
+        .await;
+    let (_header, payloads) = subscriber.read_subgroup().await;
+    assert_eq!(payloads, vec![bytes::Bytes::from_static(b"before")]);
+
+    // There is no answer to wait for, so the update is given a moment to land.
+    subscription.forward(false).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    publisher
+        .publish_group(upstream, GroupId::from(1_u32), &[b"paused"])
+        .await;
+    let quiet = tokio::time::timeout(
+        std::time::Duration::from_millis(300),
+        subscriber.read_subgroup(),
+    )
+    .await;
+    assert!(
+        quiet.is_err(),
+        "a paused subscription must not be forwarded"
+    );
+
+    subscription.forward(true).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    publisher
+        .publish_group(upstream, GroupId::from(2_u32), &[b"resumed"])
+        .await;
+    let (header, payloads) = subscriber.read_subgroup().await;
+    assert_eq!(header.track_alias, subscription.alias);
+    assert_eq!(
+        payloads,
+        vec![bytes::Bytes::from_static(b"resumed")],
+        "resumed from the next subgroup, with the paused one not replayed"
+    );
+}
+
 /// Two subscribers get the same objects, each under its own alias.
 ///
 /// Fan-out is the reason a relay exists at all, and per-session aliases mean the

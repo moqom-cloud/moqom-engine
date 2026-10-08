@@ -17,7 +17,7 @@ path = "src/main.rs"
 moqom-client = { path = "../moqom-client" }
 moqom-media = { path = "../moqom-media", features = ["clap"] }
 bytes = { workspace = true }
-clap = { workspace = true }
+clap = { workspace = true, features = ["env"] }
 # `time` paces a file at its frame rate, and `signal` is what lets a subscriber
 # writing a file be stopped with C-c and still have a playable one.
 tokio = { workspace = true, features = [

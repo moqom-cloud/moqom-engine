@@ -5,15 +5,19 @@
 //! only what is published from now on. Every "start playback a few seconds
 //! behind live" feature is a fetch joined to a subscription.
 
+use std::borrow::Cow;
+
 use bytes::{Buf, BufMut};
 
 use crate::control::MessageType;
 use crate::control::frame::MessageBody;
-use crate::control::params::Parameters;
+use crate::control::params::{ParamValue, Parameter, Parameters, param_type};
 use crate::control::properties::Properties;
 use crate::control::request_id::RequestId;
+use crate::control::typed::{Context, LocationFilter};
+use crate::draft::Draft;
 use crate::error::DecodeError;
-use crate::model::{FullTrackName, Location};
+use crate::model::{FullTrackName, GroupId, Location, ObjectId};
 use crate::varint::VarInt;
 
 /// What a fetch is asking for.
@@ -56,6 +60,15 @@ pub enum FetchKind {
         /// The group to start from.
         start_group: VarInt,
     },
+
+    /// Draft-22's only form: a named track, with the range in the
+    /// `LOCATION_FILTER` parameter, or the whole track up to Largest Object
+    /// if there is none. Draft-22 has no Fetch Type field and no joining
+    /// fetch; a fill fetch stream on the subscription replaces it.
+    Filtered {
+        /// The track to read from.
+        track: FullTrackName,
+    },
 }
 
 impl FetchKind {
@@ -70,13 +83,23 @@ impl FetchKind {
         VarInt::from_u32(self.type_code() as u32)
     }
 
-    /// The Fetch Type code.
+    /// The Fetch Type code. [`Self::Filtered`] has none on the wire and is
+    /// sent as standalone under draft-19.
     #[must_use]
     pub const fn type_code(&self) -> u8 {
         match self {
-            Self::Standalone { .. } => Self::STANDALONE,
+            Self::Standalone { .. } | Self::Filtered { .. } => Self::STANDALONE,
             Self::RelativeJoining { .. } => Self::RELATIVE,
             Self::AbsoluteJoining { .. } => Self::ABSOLUTE,
+        }
+    }
+
+    /// The track, where the fetch names one.
+    #[must_use]
+    pub const fn track(&self) -> Option<&FullTrackName> {
+        match self {
+            Self::Standalone { track, .. } | Self::Filtered { track } => Some(track),
+            Self::RelativeJoining { .. } | Self::AbsoluteJoining { .. } => None,
         }
     }
 
@@ -86,6 +109,7 @@ impl FetchKind {
             Self::Standalone { track, start, end } => {
                 track.encoded_len() + start.encoded_len() + end.encoded_len()
             }
+            Self::Filtered { .. } => unreachable!("draft-19 encodes Filtered as Standalone"),
             Self::RelativeJoining {
                 request_id,
                 preceding_groups: value,
@@ -105,6 +129,7 @@ impl FetchKind {
                 start.encode(buf);
                 end.encode(buf);
             }
+            Self::Filtered { .. } => unreachable!("draft-19 encodes Filtered as Standalone"),
             Self::RelativeJoining {
                 request_id,
                 preceding_groups: value,
@@ -167,32 +192,171 @@ impl Fetch {
         }
     }
 
+    /// This fetch as the ambient draft can carry it.
+    ///
+    /// Under draft-22 a standalone range moves into `LOCATION_FILTER`, and a
+    /// joining fetch — which draft-22 cannot express — goes out naming an
+    /// empty track, which the peer refuses rather than misreads; nothing in
+    /// MOQOM builds one for a draft-22 session. Under draft-19 a filtered
+    /// fetch becomes standalone, its filter resolved to an explicit range.
+    fn wire(&self) -> Cow<'_, Self> {
+        let d22 = Draft::current() == Draft::D22;
+        match (&self.kind, d22) {
+            (FetchKind::Standalone { track, start, end }, true) => {
+                let mut parameters = self.parameters.clone();
+                if parameters.get(param_type::LOCATION_FILTER).is_none()
+                    && let Some(filter) = d19_range_as_filter(*start, *end)
+                    && let Ok(p) = Parameter::typed(
+                        param_type::LOCATION_FILTER,
+                        ParamValue::LocationFilter(filter),
+                    )
+                {
+                    parameters.push(p);
+                }
+                Cow::Owned(Self {
+                    request_id: self.request_id,
+                    kind: FetchKind::Filtered {
+                        track: track.clone(),
+                    },
+                    parameters,
+                })
+            }
+            (FetchKind::RelativeJoining { .. } | FetchKind::AbsoluteJoining { .. }, true) => {
+                debug_assert!(false, "joining fetch on a draft-22 session");
+                Cow::Owned(Self {
+                    request_id: self.request_id,
+                    kind: FetchKind::Filtered {
+                        track: FullTrackName::default(),
+                    },
+                    parameters: Parameters::new(),
+                })
+            }
+            (FetchKind::Filtered { track }, false) => {
+                let filter = self
+                    .parameters
+                    .get(param_type::LOCATION_FILTER)
+                    .and_then(Parameter::as_location_filter);
+                let (start, end) =
+                    filter.map_or((Location::default(), D19_OPEN_END), filter_as_d19_range);
+                Cow::Owned(Self {
+                    request_id: self.request_id,
+                    kind: FetchKind::Standalone {
+                        track: track.clone(),
+                        start,
+                        end,
+                    },
+                    parameters: self
+                        .parameters
+                        .as_slice()
+                        .iter()
+                        .filter(|p| p.type_value() != param_type::LOCATION_FILTER)
+                        .cloned()
+                        .collect(),
+                })
+            }
+            _ => Cow::Borrowed(self),
+        }
+    }
+
     /// Encoded size of the message body.
     #[must_use]
     pub fn encoded_len(&self) -> usize {
-        self.request_id.encoded_len()
-            + self.kind.encoded_len()
-            + self.parameters.encoded_len_counted()
+        let wire = self.wire();
+        let kind = match &wire.kind {
+            FetchKind::Filtered { track } => track.encoded_len(),
+            kind => kind.encoded_len(),
+        };
+        wire.request_id.encoded_len() + kind + wire.parameters.encoded_len_counted()
     }
 
     /// Append the message body to `buf`.
     pub fn encode<B: BufMut>(&self, buf: &mut B) {
-        self.request_id.encode(buf);
-        self.kind.encode(buf);
-        self.parameters.encode_counted(buf);
+        let wire = self.wire();
+        wire.request_id.encode(buf);
+        match &wire.kind {
+            FetchKind::Filtered { track } => track.encode(buf),
+            kind => kind.encode(buf),
+        }
+        wire.parameters.encode_counted(buf);
     }
 
     /// Read a message body.
+    ///
+    /// Under draft-22 the result is always [`FetchKind::Filtered`].
     ///
     /// # Errors
     /// [`DecodeError::Short`] if incomplete; [`DecodeError::Invalid`] for an
     /// unknown fetch type or any field that violates its constraints.
     pub fn decode<B: Buf>(buf: &mut B) -> Result<Self, DecodeError> {
+        let request_id = RequestId::decode(buf)?;
+        let kind = if Draft::current() == Draft::D22 {
+            FetchKind::Filtered {
+                track: FullTrackName::decode(buf)?,
+            }
+        } else {
+            FetchKind::decode(buf)?
+        };
+        let parameters = Parameters::decode_counted(buf)?;
+        if Draft::current().typed_parameters() {
+            Context::Fetch.check(&parameters)?;
+        }
         Ok(Self {
-            request_id: RequestId::decode(buf)?,
-            kind: FetchKind::decode(buf)?,
-            parameters: Parameters::decode_counted(buf)?,
+            request_id,
+            kind,
+            parameters,
         })
+    }
+}
+
+/// A draft-19 end with no limit: the last group there can be, whole.
+const D19_OPEN_END: Location =
+    Location::new(GroupId::new(VarInt::MAX), ObjectId::new(VarInt::ZERO));
+
+/// Draft-19's `[start, end)` with an Object of 0 meaning the whole end group,
+/// as a draft-22 inclusive filter.
+fn d19_range_as_filter(start: Location, end: Location) -> Option<LocationFilter> {
+    let delta = end.group.get().checked_sub(start.group.get())?;
+    Some(if end.object.get() == 0 {
+        LocationFilter::GroupEnd {
+            start,
+            end_group_delta: delta,
+        }
+    } else {
+        LocationFilter::Range {
+            start,
+            end_group_delta: delta,
+            end_object: end.object.get() - 1,
+        }
+    })
+}
+
+/// The reverse of [`d19_range_as_filter`]; filters relative to Largest Object
+/// have no draft-19 equivalent and become the whole track.
+fn filter_as_d19_range(filter: LocationFilter) -> (Location, Location) {
+    let group = |start: Location, delta: u64| {
+        GroupId::new(VarInt::new(start.group.get().saturating_add(delta)).unwrap_or(VarInt::MAX))
+    };
+    match filter {
+        LocationFilter::AbsoluteStart(start) => (start, D19_OPEN_END),
+        LocationFilter::GroupEnd {
+            start,
+            end_group_delta,
+        } => (
+            start,
+            Location::new(group(start, end_group_delta), ObjectId::new(VarInt::ZERO)),
+        ),
+        LocationFilter::Range {
+            start,
+            end_group_delta,
+            end_object,
+        } => (
+            start,
+            Location::new(
+                group(start, end_group_delta),
+                ObjectId::new(VarInt::new(end_object.saturating_add(1)).unwrap_or(VarInt::MAX)),
+            ),
+        ),
+        _ => (Location::default(), D19_OPEN_END),
     }
 }
 
@@ -219,7 +383,11 @@ pub struct FetchOk {
     /// Whether [`FetchOk::end`] is the final object in the track, meaning no
     /// later fetch will ever return more.
     pub end_of_track: bool,
-    /// Last location plus one, clipped to what has been published.
+    /// The end of the range, clipped to what has been published.
+    ///
+    /// The same field means different things by draft: under draft-19 it is
+    /// the last location plus one, an Object of 0 meaning the whole group;
+    /// under draft-22 it is the last location, inclusive (§9.12).
     pub end: Location,
     /// Response parameters.
     pub parameters: Parameters,
@@ -272,10 +440,16 @@ impl FetchOk {
         if !buf.has_remaining() {
             return Err(DecodeError::Short { needed: 1 });
         }
+        let end_of_track = buf.get_u8() != 0;
+        let end = Location::decode(buf)?;
+        let parameters = Parameters::decode_counted(buf)?;
+        if Draft::current().typed_parameters() {
+            Context::FetchOk.check(&parameters)?;
+        }
         Ok(Self {
-            end_of_track: buf.get_u8() != 0,
-            end: Location::decode(buf)?,
-            parameters: Parameters::decode_counted(buf)?,
+            end_of_track,
+            end,
+            parameters,
             properties: Properties::decode_to_end(buf)?,
         })
     }

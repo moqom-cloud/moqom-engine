@@ -1,0 +1,35 @@
+# draft-ietf-moq-transport-22 Message Parameters, each alone in a block:
+# Number of Parameters (vi64) = 1, Type Delta (vi64), Value.
+# Integers are vi64 (leading ones give the length, 1-9 bytes).
+# Generated and checked by moqom-proto/tests/moqt22_vectors.rs.
+authorization_token 0103050300746f6b
+authorization_token_delete 0103020001
+authorization_token_register 0103090101007469636b6574
+authorization_token_typed_value 0103050302746f6b
+authorization_token_use_alias 0103020201
+expires 0108c0ea60
+fill_parameters 012307020a81f4170101
+fill_parameters_empty 01230100
+fill_timeout 010a80fa
+forward_0 011000
+forward_1 011001
+group_order_descending 012202
+include_properties_0 013500
+largest_object 0109812c02
+location_filter_absolute_start 0121020a05
+location_filter_group_end 0121030a0003
+location_filter_next_object 012105
+location_filter_none 012100
+location_filter_range 0121040a050180c8
+location_filter_relative_start 01210102
+new_group_request 013229
+object_delivery_timeout 010287d0
+object_property_filter 01280401100101
+objectid_filter 0126040100050a
+priority_filter 01270301007f
+rendezvous_timeout 010400
+subgroup_delivery_timeout 0106c04000
+subgroup_filter 012503010000
+subscriber_priority 0120ff
+track_namespace_prefix 013402056d6f716f6d04726f6f6d
+track_property_filter 012900
