@@ -27,6 +27,12 @@ tracing = { workspace = true }
 web-transport-quinn = { workspace = true }
 url = { workspace = true }
 webpki-roots = "0.26"
+# The STUN responder's socket: dual-stack explicitly, and replies sent from the
+# address each request arrived at, which behind a passthrough load balancer is
+# not the machine's own. Both already in the tree beneath quinn, and quinn-udp
+# with the features quinn takes it with.
+socket2 = { workspace = true }
+quinn-udp = { version = "0.5", default-features = false, features = ["tracing"] }
 
 # Verifying the credential a session presents. aws-lc-rs supplies ML-DSA-65 and is
 # already here as the rustls provider, so the signature check costs no new

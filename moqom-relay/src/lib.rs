@@ -117,6 +117,7 @@ pub mod quota;
 pub mod roster;
 pub mod scope;
 pub mod session;
+pub mod stun;
 pub mod ticket;
 pub mod upstream;
 pub mod usage;

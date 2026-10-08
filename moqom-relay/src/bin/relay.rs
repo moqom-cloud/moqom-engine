@@ -128,6 +128,15 @@
 //!   including Ed25519 (`OKP`) keys, which only verify older tickets. Unset issues no
 //!   tickets, which keeps every participant on this relay off direct paths.
 //!   Not the token keys: see `moqom_relay::ticket`.
+//! - `MOQOM_RELAY_STUN_ADDR` — where to answer STUN Binding requests, so devices
+//!   behind NATs learn the public address a direct path needs. Default
+//!   `[::]:3478`, both families; `off` serves none. A default that cannot be
+//!   bound, such as a second relay on one machine, is logged and skipped; an
+//!   address given explicitly that cannot be bound stops the relay. See
+//!   [`crate::stun`](moqom_relay::stun).
+//! - `MOQOM_RELAY_STUN_RATE`, `MOQOM_RELAY_STUN_BURST` — answers per second
+//!   each source address (each IPv6 /64) earns, and the most it may have at
+//!   once. Default 20 and 40.
 //!
 //! # A caveat about the address tier
 //!
@@ -169,7 +178,7 @@ use moqom_relay::{
     Authenticator, Cache, Fabric, Governor, Limits, Link, Metrics, Quotas, Session, Supervisor,
     Usage, VerificationKey,
 };
-use moqom_relay::{edge, upstream};
+use moqom_relay::{edge, stun, upstream};
 use moqom_transport::{Server, server::with_moqt_alpn};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -281,6 +290,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("no MOQOM_RELAY_ADMIN_ADDR, so metrics are off");
         Metrics::disabled()
     };
+    serve_stun(&metrics)?;
 
     let (usage, reporter) = usage()?;
     let fabric = ticketing(
@@ -367,6 +377,52 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // After the listeners, so the sessions they ended are in the last report.
     stop_reporting(reporter).await;
     Ok(())
+}
+
+/// Start answering STUN, unless `MOQOM_RELAY_STUN_ADDR` is `off`.
+fn serve_stun(metrics: &Metrics) -> Result<(), Box<dyn std::error::Error>> {
+    let given = env("MOQOM_RELAY_STUN_ADDR");
+    if given.as_deref() == Some("off") {
+        tracing::info!("MOQOM_RELAY_STUN_ADDR is off, so STUN is not answered");
+        return Ok(());
+    }
+    let mut config = stun::Config::default();
+    if let Some(value) = &given {
+        config.listen = value
+            .parse()
+            .map_err(|e| format!("MOQOM_RELAY_STUN_ADDR is not an address or `off`: {e}"))?;
+    }
+    for (name, field) in [
+        ("MOQOM_RELAY_STUN_RATE", &mut config.limits.rate),
+        ("MOQOM_RELAY_STUN_BURST", &mut config.limits.burst),
+    ] {
+        if let Some(value) = env(name) {
+            let parsed: f64 = value
+                .parse()
+                .map_err(|e| format!("{name} is not a number: {e}"))?;
+            if !(parsed.is_finite() && parsed >= 1.0) {
+                return Err(format!("{name} must be at least 1").into());
+            }
+            *field = parsed;
+        }
+    }
+    match stun::Responder::bind(&config, metrics.clone()) {
+        Ok(responder) => {
+            let bound = responder.local_addr()?;
+            tracing::info!(%bound, "answering STUN");
+            tokio::spawn(async move {
+                if let Err(error) = responder.serve().await {
+                    tracing::error!(%bound, %error, "STUN responder stopped");
+                }
+            });
+            Ok(())
+        }
+        Err(error) if given.is_none() => {
+            tracing::warn!(listen = %config.listen, %error, "STUN not answered: the default port could not be bound");
+            Ok(())
+        }
+        Err(error) => Err(format!("MOQOM_RELAY_STUN_ADDR {}: {error}", config.listen).into()),
+    }
 }
 
 /// Deliver what usage is still held, within a bound: an orchestrator's grace

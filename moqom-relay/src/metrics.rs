@@ -203,6 +203,37 @@ impl Fetched {
     }
 }
 
+/// What became of a datagram on the STUN port. See [`crate::stun`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stun {
+    /// A Binding request, answered with the address it came from.
+    Answered,
+    /// A Binding request from a source over its allowance, dropped.
+    Limited,
+    /// Anything else, dropped unanswered.
+    Ignored,
+}
+
+impl Stun {
+    const ALL: [Self; 3] = [Self::Answered, Self::Limited, Self::Ignored];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Answered => "answered",
+            Self::Limited => "limited",
+            Self::Ignored => "ignored",
+        }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Answered => 0,
+            Self::Limited => 1,
+            Self::Ignored => 2,
+        }
+    }
+}
+
 /// A fixed-bucket cumulative histogram.
 ///
 /// Bucket bounds are chosen per metric rather than generically, because a
@@ -317,6 +348,7 @@ struct Inner {
     subscriptions: [AtomicU64; Subscribed::ALL.len()],
     fetches: [AtomicU64; Fetched::ALL.len()],
     fetch_records: AtomicU64,
+    stun: [AtomicU64; Stun::ALL.len()],
 
     admitted: [AtomicU64; Resource::ALL.len()],
     /// By resource, then by the tier whose allowance ran out.
@@ -613,6 +645,7 @@ impl Metrics {
                 subscriptions: counters(),
                 fetches: counters(),
                 fetch_records: AtomicU64::new(0),
+                stun: counters(),
                 admitted: counters(),
                 refused: std::array::from_fn(|_| counters()),
                 refusal_reasons: counters(),
@@ -821,6 +854,13 @@ impl Metrics {
         if let Some(inner) = self.inner() {
             inner.fetches[outcome.index()].fetch_add(1, ORDER);
             inner.fetch_records.fetch_add(records as u64, ORDER);
+        }
+    }
+
+    /// A datagram arrived on the STUN port, and this became of it.
+    pub fn stun(&self, outcome: Stun) {
+        if let Some(inner) = self.inner() {
+            inner.stun[outcome.index()].fetch_add(1, ORDER);
         }
     }
 
@@ -1138,6 +1178,12 @@ impl Metrics {
             "moqom_relay_fetch_records_total",
             "Records delivered on fetch streams.",
             inner.fetch_records.load(ORDER),
+        );
+        counter(
+            &mut out,
+            "moqom_relay_stun_requests_total",
+            "Datagrams on the STUN port, by what became of them.",
+            &Stun::ALL.map(|s| ("outcome", s.label(), inner.stun[s.index()].load(ORDER))),
         );
 
         counter(
