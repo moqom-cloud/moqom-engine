@@ -9,7 +9,7 @@ product is proprietary and ships only as a binary.
 | Crate | License | Why |
 |---|---|---|
 | `moqom-proto` | Apache-2.0 | An implementation of an IETF draft. Nobody should need permission to speak a standard. |
-| `moqom-transport` | Apache-2.0 | QUIC and WebTransport session establishment — the other half of being able to speak it. |
+| `moqom-transport` | Apache-2.0 | [QUIC](https://www.rfc-editor.org/rfc/rfc9000) and [WebTransport](https://datatracker.ietf.org/doc/draft-ietf-webtrans-http3/) session establishment — the other half of being able to speak it. |
 | `moqom-client` | Apache-2.0 | A MOQT subscriber and publisher. Receiving frames is this crate, not the admin SDK. |
 | `moqom-direct-ffi` | Apache-2.0 | A C ABI over `moqom-client`'s direct-path socket, linked into the Swift SDK. It ships as one library with `moqom-client`, so it carries the same licence. |
 | `moqom-media` | Apache-2.0 | Reading coded video into objects. Framing, not decoding, and shared by the binary that publishes a file and the harness that measures with one. |
@@ -57,5 +57,5 @@ redirects `quinn` to the vendored tree. That is a property of building inside
 this workspace, not of the crates themselves, but it is the reason the backend
 SDKs live in [`moqom-rust`](https://github.com/moqom-cloud/moqom-rust) and
 [`moqom-go`](https://github.com/moqom-cloud/moqom-go) instead of here: a
-customer's backend should not acquire a QUIC stack for the sake of kicking
+customer's backend should not acquire a [QUIC](https://www.rfc-editor.org/rfc/rfc9000) stack for the sake of kicking
 somebody out of a room.

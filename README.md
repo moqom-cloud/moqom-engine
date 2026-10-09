@@ -1,6 +1,6 @@
 # MOQOM Engine
 
-The media path of the **Media Over QUIC Orchestration Mesh**: the protocol
+The media path of the **Media Over [QUIC](https://www.rfc-editor.org/rfc/rfc9000) Orchestration Mesh**: the protocol
 codec, the transport, and the relay. Pure Rust, and everything here sits between
 a publisher and a subscriber.
 
@@ -8,7 +8,7 @@ Targets [`draft-ietf-moq-transport`](https://datatracker.ietf.org/doc/draft-ietf
 drafts 22 and 19, chosen per session by ALPN. The relay accepts `moqt-22` and
 `moqt-19` and prefers 22. The client offers both, and also speaks a draft-16
 subset (`moqom_client::cloudflare`, `moqom cloudflare sub`) for subscribing
-through Cloudflare's relay. Direct links and WebTransport sessions are draft-19.
+through Cloudflare's relay. Direct links and [WebTransport](https://datatracker.ietf.org/doc/draft-ietf-webtrans-http3/) sessions are draft-19.
 The implementation is our own rather than a fork, because owning the wire format
 is what makes the congestion controller, the object-to-transport mapping, and
 end-to-end encryption our decisions instead of someone else's.
@@ -18,7 +18,7 @@ end-to-end encryption our decisions instead of someone else's.
 | `moqom-proto` | Apache-2.0 | The object model, control messages, and data plane, per draft (`Draft::{D16, D19, D22}`) |
 | `moqom-transport` | Apache-2.0 | QUIC and WebTransport sessions on one UDP port |
 | `moqom-client` | Apache-2.0 | A MOQT subscriber and publisher for recorders, classifiers, and the CLI; direct (peer-to-peer) sessions in `direct` |
-| `moqom-direct-ffi` | Apache-2.0 | C ABI for the direct path's socket (STUN, NAT probes, pinned QUIC on one port), built into `MoqomDirectFFI.xcframework` for the Swift SDK |
+| `moqom-direct-ffi` | Apache-2.0 | C ABI for the direct path's socket ([STUN](https://www.rfc-editor.org/rfc/rfc8489), NAT probes, pinned QUIC on one port), built into `MoqomDirectFFI.xcframework` for the Swift SDK |
 | `moqom-cli` | Apache-2.0 | The `moqom` binary: `subscribe`, `publish` and `cloudflare sub`, using only `moqom-client` |
 | `moqom-media` | Apache-2.0 | Framing coded video into MOQOM objects, shared by the CLI and the load generator |
 | `moqom-loadgen` | Apache-2.0 | Load generation and relay measurement |
@@ -35,7 +35,7 @@ and while the draft is still moving they change in the same commit.
 Media moves. `moqom-proto` covers the object model, every control message in
 draft-19, and the whole data plane: object datagrams, subgroup streams, and
 fetch streams with the gap markers a partial cache needs. `moqom-transport`
-accepts sessions over both QUIC and WebTransport on one UDP port, and
+accepts sessions over both [QUIC](https://www.rfc-editor.org/rfc/rfc9000) and [WebTransport](https://datatracker.ietf.org/doc/draft-ietf-webtrans-http3/) on one UDP port, and
 `moqom-relay` speaks MOQT over them: setup, namespace announcement and
 withdrawal, prefix watching, subscription, and subgroup fan-out with alias
 rewriting.
@@ -152,7 +152,7 @@ The design, including the two-modified-apps limitation, is in
 
 Key exchange prefers post-quantum. The workspace enables rustls's
 `prefer-post-quantum`, so every TLS configuration here offers the hybrid
-X25519MLKEM768 first and plain X25519 second. That covers the relay listener,
+[X25519MLKEM768](https://datatracker.ietf.org/doc/draft-ietf-tls-ecdhe-mlkem/) first and plain X25519 second. That covers the relay listener,
 the client, relay links, direct paths, and gRPC. `moqom-client/tests/post_quantum.rs`
 completes real handshakes and asserts the negotiated group, for both the
 listener and both ends of a direct path. A classical peer still connects:
@@ -161,7 +161,7 @@ HelloRetryRequest. Certificates are still classical.
 
 Direct paths are dual-stack. The socket binds `[::]` with IPv4 mapped onto it,
 or IPv4 alone where the host has no IPv6. It gathers a host candidate and a
-STUN reflexive address for each family it can reach, and probes and dials
+[STUN](https://www.rfc-editor.org/rfc/rfc8489) reflexive address for each family it can reach, and probes and dials
 either. `moqom-client/tests/ipv6.rs` runs on `::1`.
 
 The relay answers STUN Binding requests on its own UDP socket, 3478 by default
@@ -305,7 +305,7 @@ Two documents are worth reading before changing protocol code:
 | [`moqom-rust`](https://github.com/moqom-cloud/moqom-rust) | Apache-2.0 | Server-side SDK for backends |
 
 The backend SDKs are deliberately not here. Neither speaks MOQT: administering a
-room and carrying media are different jobs, and making every backend link a QUIC
+room and carrying media are different jobs, and making every backend link a [QUIC](https://www.rfc-editor.org/rfc/rfc9000)
 stack to change somebody's grants would be a poor trade. Since the
 `[patch.crates-io]` at this workspace root applies to everything inside it,
 "not in this workspace" is what enforces that rather than good intentions.

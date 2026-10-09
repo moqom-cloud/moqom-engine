@@ -7,10 +7,10 @@ Swift SDK's `MoqomDirectRust` backend. The contract is
 
 ## Why it exists
 
-Network.framework cannot share one UDP port between a QUIC listener and plain
+Network.framework cannot share one UDP port between a [QUIC](https://www.rfc-editor.org/rfc/rfc9000) listener and plain
 UDP flows: a flow to the peer's address takes the listener's packets. The
 Swift SDK's own backend can therefore probe a NAT only in a short burst before
-it starts listening. This library does STUN, NAT probes and QUIC on one std
+it starts listening. This library does [STUN](https://www.rfc-editor.org/rfc/rfc8489), NAT probes and QUIC on one std
 socket, the way `moqom-client` does, and probes for as long as an
 establishment takes.
 
@@ -48,14 +48,14 @@ The crate documentation (`src/lib.rs`) lists these, in short:
   with code 0; freeing one with nothing pending finishes it.
 - Writes and reads on one stream complete in the order they were issued.
 - A dial may return a connection that closes at once if the peer refuses this
-  side's certificate, because TLS 1.3 clients finish before servers judge them.
+  side's certificate, because [TLS 1.3](https://www.rfc-editor.org/rfc/rfc8446) clients finish before servers judge them.
 - With datagrams off, none are sent or received, and the maximum datagram size
   reads zero.
 - An endpoint binds `[::]` on the requested port, dual-stack, or falls back to
   IPv4 alone on a host without IPv6. Probe targets and dial addresses can be
-  either family. The reflexive address reported is the IPv4 one when STUN
+  either family. The reflexive address reported is the IPv4 one when [STUN](https://www.rfc-editor.org/rfc/rfc8489)
   returned both.
-- TLS prefers the hybrid X25519MLKEM768 key exchange, with X25519 as the
+- TLS prefers the hybrid [X25519MLKEM768](https://datatracker.ietf.org/doc/draft-ietf-tls-ecdhe-mlkem/) key exchange, with X25519 as the
   fallback.
 
 ## Testing
@@ -65,5 +65,5 @@ cargo test -p moqom-direct-ffi
 ```
 
 The tests drive the library only through its `extern "C"` functions, with two
-endpoints on loopback, a local STUN responder, and a plain UDP socket watching
+endpoints on loopback, a local [STUN](https://www.rfc-editor.org/rfc/rfc8489) responder, and a plain UDP socket watching
 for probes.
