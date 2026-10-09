@@ -613,9 +613,8 @@ pub struct ListVerificationKeysRequest {
 pub struct VerificationKey {
     #[prost(string, tag = "1")]
     pub key_id: ::prost::alloc::string::String,
-    /// The algorithm, as a JOSE identifier. `EdDSA` over Ed25519 today: small
-    /// signatures, fast verification on a relay's hot path, and no curve
-    /// parameters to get wrong.
+    /// The algorithm, as a JOSE identifier: `ML-DSA-87`, the only one tokens
+    /// are signed or verified with.
     #[prost(string, tag = "2")]
     pub algorithm: ::prost::alloc::string::String,
     /// The public key as a JWK.

@@ -86,7 +86,7 @@
 //!   Being a relay is not a way past a parent's door, so against a parent that
 //!   verifies credentials an edge without this is anonymous and will not be able to
 //!   read the tracks it exists to serve.
-//! - `MOQOM_RELAY_UPSTREAM_KEY` — a PKCS#8 ML-DSA-65 file holding the device key
+//! - `MOQOM_RELAY_UPSTREAM_KEY` — a PKCS#8 ML-DSA-87 file holding the device key
 //!   that token is bound to. Required with the token: every parent requires proof of
 //!   possession, so this relay proves the token on each link, against the
 //!   certificate the parent presented.
@@ -137,9 +137,9 @@
 //!   Usage records carry `MOQOM_RELAY_ID` in their ids, so two relays reporting
 //!   to one account must not share one.
 //! - `MOQOM_RELAY_TICKET_KEYS` — a file holding the fleet's direct-ticket keys,
-//!   a JWK set where the first ML-DSA-65 key (`AKP`) with a private seed
-//!   (`priv`) signs and every public half is published to participants,
-//!   including Ed25519 (`OKP`) keys, which only verify older tickets. Unset issues no
+//!   a JWK set of ML-DSA-87 keys (`AKP`) where the first with a private seed
+//!   (`priv`) signs and every public half is published to participants; any
+//!   other kind of key is refused. Unset issues no
 //!   tickets, which keeps every participant on this relay off direct paths.
 //!   Not the token keys: see `moqom_relay::ticket`.
 //! - `MOQOM_RELAY_STUN_ADDR` — where to answer STUN Binding requests, so devices

@@ -33,7 +33,7 @@ sets:
 | `MOQOM_RELAY` | The relay to record through, as `host:port`. |
 | `MOQOM_RELAY_NAME` | The relay's name. Defaults to the host part of `MOQOM_RELAY`. |
 | `MOQOM_RELAY_CERT` | Pin the relay to this certificate instead of the system roots. |
-| `MOQOM_RECORDER_KEY` | The ML-DSA-65 PKCS#8 key that the tokens are bound to. |
+| `MOQOM_RECORDER_KEY` | The ML-DSA-87 PKCS#8 key that the tokens are bound to. |
 | `MOQOM_RECORDER_SPOOL` | Local directory where files are written before upload. |
 | `MOQOM_RECORDER_SEGMENT_MIB` | Start a new file at the next group boundary past this size. |
 | `MOQOM_WORKER_ID` | The worker's lease name: the pod's name. |

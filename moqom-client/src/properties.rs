@@ -59,7 +59,7 @@ pub const SILENCE: u64 = 0x7C;
 /// it with the ciphertext, so it can be read on the way through and not changed.
 pub const CATALOG_DISCLOSURE: u64 = 0x7D;
 
-/// The room authority's ML-DSA-65 signature over a `.control` entry.
+/// The room authority's ML-DSA-87 signature over a `.control` entry.
 ///
 /// One byte of key ID length, the key ID, then the signature over
 /// `"moqom room log v1" ‖ 0 ‖ tenant ‖ 0 ‖ room ‖ 0 ‖ entry`. Clients apply

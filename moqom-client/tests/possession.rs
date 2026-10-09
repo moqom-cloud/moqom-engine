@@ -101,7 +101,7 @@ impl Drop for Relay {
 /// device key and not the issuer.
 fn signer() -> Signer {
     Signer::from_seed(&[7u8; 32])
-        .expect("a valid ML-DSA-65 seed")
+        .expect("a valid ML-DSA-87 seed")
         .with_id(KEY_ID)
 }
 
@@ -125,7 +125,11 @@ fn token_bound_to_lasting(thumbprint: &str, seconds: i64) -> Vec<u8> {
             iss: "https://api.moqom.cloud".to_owned(),
             sub: "ada".to_owned(),
             tenant: "acme".to_owned(),
-            iat: if seconds > 0 { issued } else { issued + seconds - 2 },
+            iat: if seconds > 0 {
+                issued
+            } else {
+                issued + seconds - 2
+            },
             exp: issued + seconds,
             cnf: Confirmation {
                 jkt: thumbprint.to_owned(),

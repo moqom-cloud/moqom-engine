@@ -1625,7 +1625,7 @@ fn fresh_proof_id() -> String {
 }
 
 pub mod tokens {
-    use aws_lc_rs::signature::{KeyPair, ML_DSA_65_SIGNING, PqdsaKeyPair};
+    use aws_lc_rs::signature::{KeyPair, ML_DSA_87_SIGNING, PqdsaKeyPair};
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use moqom_relay::{Authenticator, VerificationKey};
@@ -1637,8 +1637,8 @@ pub mod tokens {
     /// the device field a client announces under. The relay derives one from
     /// the other, so these two constants are one fact and have to be written as
     /// one; `device::thumbprint` is checked against it.
-    const THUMBPRINT: &str = "F5YJgp0Tsbu7o3PW0b5SNJL9NamEIMTLf33yDRpA1y4";
-    pub const DEVICE: &str = "F5YJgp0Tsbu7o3PW";
+    const THUMBPRINT: &str = "S7U2biVpFGM3sBc9GJAb0dWNuR2jSPCivtcMarP5lAw";
+    pub const DEVICE: &str = "S7U2biVpFGM3sBc9";
 
     pub(crate) fn thumbprint_constant() -> &'static str {
         THUMBPRINT
@@ -1646,7 +1646,7 @@ pub mod tokens {
 
     /// A deterministic key, so a failing test fails the same way twice.
     fn signer() -> PqdsaKeyPair {
-        PqdsaKeyPair::from_seed(&ML_DSA_65_SIGNING, &[7u8; 32]).expect("a valid ML-DSA-65 seed")
+        PqdsaKeyPair::from_seed(&ML_DSA_87_SIGNING, &[7u8; 32]).expect("a valid ML-DSA-87 seed")
     }
 
     /// The direct-ticket keys a ticketing relay here signs with.
@@ -1659,8 +1659,8 @@ pub mod tokens {
         Authenticator::new(
             ISSUER,
             vec![
-                VerificationKey::ml_dsa_65(KID, signer().public_key().as_ref().to_vec())
-                    .expect("an ML-DSA-65 key"),
+                VerificationKey::ml_dsa_87(KID, signer().public_key().as_ref().to_vec())
+                    .expect("an ML-DSA-87 key"),
             ],
         )
     }
@@ -1720,8 +1720,8 @@ pub mod tokens {
         /// identifier of one it does: what somebody without the control plane's
         /// key can make.
         pub fn token_forged(&self) -> String {
-            let stranger = PqdsaKeyPair::from_seed(&ML_DSA_65_SIGNING, &[9u8; 32])
-                .expect("a valid ML-DSA-65 seed");
+            let stranger = PqdsaKeyPair::from_seed(&ML_DSA_87_SIGNING, &[9u8; 32])
+                .expect("a valid ML-DSA-87 seed");
             let claims = self.claims(THUMBPRINT, 0, 600);
             sign(&stranger, &header(), &claims)
         }
@@ -1830,7 +1830,7 @@ pub mod tokens {
     }
 
     fn header() -> serde_json::Value {
-        serde_json::json!({ "alg": "ML-DSA-65", "typ": "MOQT", "kid": KID })
+        serde_json::json!({ "alg": "ML-DSA-87", "typ": "MOQT", "kid": KID })
     }
 
     /// The client's half of proof of possession: a device key, and proofs made
@@ -1841,7 +1841,7 @@ pub mod tokens {
     /// other. This builds one the way a client must — a compact JWS carrying its
     /// own public key — so what is being tested is the format.
     pub mod device {
-        use aws_lc_rs::signature::{KeyPair as _, ML_DSA_65_SIGNING, PqdsaKeyPair};
+        use aws_lc_rs::signature::{KeyPair as _, ML_DSA_87_SIGNING, PqdsaKeyPair};
         use base64::Engine as _;
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
@@ -1850,8 +1850,8 @@ pub mod tokens {
         /// test asks for — is bound to a key the harness holds, and a client
         /// can prove it on a relay that requires that of everybody.
         fn pair() -> PqdsaKeyPair {
-            PqdsaKeyPair::from_seed(&ML_DSA_65_SIGNING, &[23u8; 32])
-                .expect("a valid ML-DSA-65 seed")
+            PqdsaKeyPair::from_seed(&ML_DSA_87_SIGNING, &[23u8; 32])
+                .expect("a valid ML-DSA-87 seed")
         }
 
         /// The public key as the JWK `pub` a proof carries.
@@ -1861,7 +1861,7 @@ pub mod tokens {
 
         /// The thumbprint of the device key, which a token commits to.
         pub fn thumbprint() -> String {
-            let canonical = format!(r#"{{"alg":"ML-DSA-65","kty":"AKP","pub":"{}"}}"#, public());
+            let canonical = format!(r#"{{"alg":"ML-DSA-87","kty":"AKP","pub":"{}"}}"#, public());
             sha256(canonical.as_bytes())
         }
 
@@ -1886,7 +1886,7 @@ pub mod tokens {
         /// twice, and every other test uses a fresh one.
         pub fn prove(token: &str, relay: &str, id: &str) -> String {
             let header = format!(
-                r#"{{"alg":"ML-DSA-65","typ":"MOQT-POP","jwk":{{"kty":"AKP","alg":"ML-DSA-65","pub":"{}"}}}}"#,
+                r#"{{"alg":"ML-DSA-87","typ":"MOQT-POP","jwk":{{"kty":"AKP","alg":"ML-DSA-87","pub":"{}"}}}}"#,
                 public()
             );
             let iat = std::time::SystemTime::now()
@@ -1903,7 +1903,7 @@ pub mod tokens {
                 URL_SAFE_NO_PAD.encode(claims)
             );
 
-            let mut signature = vec![0u8; ML_DSA_65_SIGNING.signature_len()];
+            let mut signature = vec![0u8; ML_DSA_87_SIGNING.signature_len()];
             let written = pair()
                 .sign(signing.as_bytes(), &mut signature)
                 .expect("signing a proof");
@@ -1926,10 +1926,10 @@ pub mod tokens {
             URL_SAFE_NO_PAD.encode(serde_json::to_vec(value).expect("serialisable"))
         };
         let signing = format!("{}.{}", segment(header), segment(claims));
-        let mut signature = vec![0u8; ML_DSA_65_SIGNING.signature_len()];
+        let mut signature = vec![0u8; ML_DSA_87_SIGNING.signature_len()];
         let written = key
             .sign(signing.as_bytes(), &mut signature)
-            .expect("ML-DSA-65 signs");
+            .expect("ML-DSA-87 signs");
         signature.truncate(written);
         format!("{signing}.{}", URL_SAFE_NO_PAD.encode(&signature))
     }

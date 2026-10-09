@@ -50,7 +50,7 @@ fn install_provider() {
 
 fn signer() -> Signer {
     Signer::from_seed(&[7u8; 32])
-        .expect("a valid ML-DSA-65 seed")
+        .expect("a valid ML-DSA-87 seed")
         .with_id("test-key")
 }
 

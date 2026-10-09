@@ -28,11 +28,11 @@
 //!
 //! # The format
 //!
-//! ML-DSA-65 (FIPS 204) over JSON claims in the compact JWS serialisation,
+//! ML-DSA-87 (FIPS 204) over JSON claims in the compact JWS serialisation,
 //! verified by `moqom-token`, the same library the Go control plane mints with
-//! and `MoqomKit` verifies with, all three held to one set of vectors. Ed25519
-//! keys are still read, so tokens signed before the move to ML-DSA verify until
-//! they expire. What is here is the relay's half: which capability bits exist,
+//! and `MoqomKit` verifies with, all three held to one set of vectors. No other
+//! algorithm is read: an Ed25519, ES256 or ML-DSA-65 key or token is refused.
+//! What is here is the relay's half: which capability bits exist,
 //! what a relay link may carry, and what a verified token becomes.
 //!
 //! The `cnf.jkt` thumbprint names the device the token was issued to, and
@@ -899,7 +899,6 @@ fn unix(seconds: i64) -> SystemTime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair};
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use moqom_token::MAX_TOKEN_BYTES;
@@ -912,17 +911,22 @@ mod tests {
     }
 
     /// A deterministic key, so a failing test fails the same way twice.
-    fn signer() -> Ed25519KeyPair {
-        Ed25519KeyPair::from_seed_unchecked(&[7u8; 32]).expect("seed is a valid Ed25519 key")
+    fn signer() -> moqom_token::Signer {
+        moqom_token::Signer::from_seed(&[7u8; 32]).expect("a valid ML-DSA-87 seed")
+    }
+
+    /// The public half of the ML-DSA-87 key `seed` makes.
+    fn public_key(seed: u8) -> Vec<u8> {
+        moqom_token::Signer::from_seed(&[seed; 32])
+            .expect("a valid ML-DSA-87 seed")
+            .public_key()
+            .bytes
     }
 
     fn authenticator() -> Authenticator {
         Authenticator::new(
             "https://api.moqom.cloud",
-            vec![
-                VerificationKey::ed25519(KID.to_owned(), signer().public_key().as_ref().to_vec())
-                    .expect("an Ed25519 key"),
-            ],
+            vec![VerificationKey::ml_dsa_87(KID, public_key(7)).expect("an ML-DSA-87 key")],
         )
     }
 
@@ -933,12 +937,12 @@ mod tests {
     /// Mint a token the way the Go control plane does.
     fn mint(header: &serde_json::Value, claims: &serde_json::Value) -> String {
         let signing = format!("{}.{}", segment(header), segment(claims));
-        let signature = signer().sign(signing.as_bytes());
-        format!("{signing}.{}", URL_SAFE_NO_PAD.encode(signature.as_ref()))
+        let signature = signer().sign_message(signing.as_bytes());
+        format!("{signing}.{}", URL_SAFE_NO_PAD.encode(signature))
     }
 
     fn header() -> serde_json::Value {
-        serde_json::json!({ "alg": "EdDSA", "typ": "MOQT", "kid": KID })
+        serde_json::json!({ "alg": "ML-DSA-87", "typ": "MOQT", "kid": KID })
     }
 
     fn claims(now: SystemTime) -> serde_json::Value {
@@ -1147,7 +1151,7 @@ mod tests {
         // a symmetric algorithm in the hope the verifier will use the public
         // key as an HMAC secret. Neither reaches a signature check, because the
         // algorithm is pinned rather than read.
-        for alg in ["none", "HS256", "EdDSA "] {
+        for alg in ["none", "HS256", "EdDSA", "ES256", "ML-DSA-65", "ML-DSA-87 "] {
             let header = serde_json::json!({ "alg": alg, "typ": "MOQT", "kid": KID });
             let signing = format!("{}.{}", segment(&header), segment(&claims(now)));
             let token = format!("{signing}.");
@@ -1162,7 +1166,7 @@ mod tests {
     #[test]
     fn a_token_for_something_else_is_not_replayable_here() {
         let now = at(0);
-        let header = serde_json::json!({ "alg": "EdDSA", "typ": "JWT", "kid": KID });
+        let header = serde_json::json!({ "alg": "ML-DSA-87", "typ": "JWT", "kid": KID });
         let token = mint(&header, &claims(now));
         assert_eq!(
             authenticator().identify([token.as_bytes()], peer(), now),
@@ -1213,10 +1217,7 @@ mod tests {
         Authenticator::for_tenant(
             "https://api.moqom.cloud",
             tenant,
-            vec![
-                VerificationKey::ed25519(KID.to_owned(), signer().public_key().as_ref().to_vec())
-                    .expect("an Ed25519 key"),
-            ],
+            vec![VerificationKey::ml_dsa_87(KID, public_key(7)).expect("an ML-DSA-87 key")],
         )
     }
 
@@ -1251,8 +1252,7 @@ mod tests {
         let now = at(0);
         let authenticator = pinned("acme");
         let count = authenticator.accept(vec![
-            VerificationKey::ed25519(KID.to_owned(), signer().public_key().as_ref().to_vec())
-                .expect("an Ed25519 key"),
+            VerificationKey::ml_dsa_87(KID, public_key(7)).expect("an ML-DSA-87 key"),
         ]);
         assert_eq!(count, 1);
         let mut theirs = claims(now);
@@ -1276,7 +1276,8 @@ mod tests {
     #[test]
     fn a_key_we_do_not_hold_is_refused_before_the_signature_is_checked() {
         let now = at(0);
-        let header = serde_json::json!({ "alg": "EdDSA", "typ": "MOQT", "kid": "rotated-away" });
+        let header =
+            serde_json::json!({ "alg": "ML-DSA-87", "typ": "MOQT", "kid": "rotated-away" });
         let token = mint(&header, &claims(now));
         assert_eq!(
             authenticator().identify([token.as_bytes()], peer(), now),
@@ -1421,8 +1422,7 @@ mod tests {
         );
 
         let pushed = authenticator.accept(vec![
-            VerificationKey::ed25519(KID.to_owned(), signer().public_key().as_ref().to_vec())
-                .expect("an Ed25519 key"),
+            VerificationKey::ml_dsa_87(KID, public_key(7)).expect("an ML-DSA-87 key"),
         ]);
 
         assert_eq!(pushed, 1);
@@ -1445,8 +1445,7 @@ mod tests {
         let authenticator = authenticator();
 
         let _ = authenticator.accept(vec![
-            VerificationKey::ed25519("some-other-key".to_owned(), vec![7u8; 32])
-                .expect("an Ed25519 key"),
+            VerificationKey::ml_dsa_87("some-other-key", public_key(7)).expect("an ML-DSA-87 key"),
         ]);
 
         assert_eq!(
@@ -1462,9 +1461,7 @@ mod tests {
         // is the one guarantee a retirement is supposed to make.
         let now = at(0);
         let token = mint(&header(), &claims(now));
-        let real =
-            VerificationKey::ed25519(KID.to_owned(), signer().public_key().as_ref().to_vec())
-                .expect("an Ed25519 key");
+        let real = VerificationKey::ml_dsa_87(KID, public_key(7)).expect("an ML-DSA-87 key");
 
         let authenticator = Authenticator::new("https://api.moqom.cloud", Vec::new());
         let _ = authenticator.accept(vec![real]);
@@ -1475,8 +1472,8 @@ mod tests {
         );
 
         let _ = authenticator.accept(vec![
-            VerificationKey::ed25519("the-only-key-now".to_owned(), vec![9u8; 32])
-                .expect("an Ed25519 key"),
+            VerificationKey::ml_dsa_87("the-only-key-now", public_key(9))
+                .expect("an ML-DSA-87 key"),
         ]);
 
         assert!(
@@ -1489,16 +1486,17 @@ mod tests {
 
     #[test]
     fn a_jwk_set_is_read_in_either_shape() {
-        let x = URL_SAFE_NO_PAD.encode(signer().public_key().as_ref());
-        let bare = format!(r#"[{{"kty":"OKP","crv":"Ed25519","kid":"k1","x":"{x}"}}]"#);
-        let wrapped =
-            format!(r#"{{"keys":[{{"kty":"OKP","crv":"Ed25519","kid":"k1","x":"{x}"}}]}}"#);
+        let public = URL_SAFE_NO_PAD.encode(public_key(7));
+        let bare = format!(r#"[{{"kty":"AKP","alg":"ML-DSA-87","kid":"k1","pub":"{public}"}}]"#);
+        let wrapped = format!(
+            r#"{{"keys":[{{"kty":"AKP","alg":"ML-DSA-87","kid":"k1","pub":"{public}"}}]}}"#
+        );
 
         for document in [&bare, &wrapped] {
             let keys = VerificationKey::parse_set(document).expect("parses");
             assert_eq!(keys.len(), 1);
             assert_eq!(keys[0].id, "k1");
-            assert_eq!(keys[0].bytes.len(), 32);
+            assert_eq!(keys[0].bytes.len(), 2592);
         }
     }
 
@@ -1509,10 +1507,12 @@ mod tests {
         // discovers it under load is a relay that authenticates nobody during
         // an incident.
         let short = URL_SAFE_NO_PAD.encode([1u8; 16]);
+        let ed25519 = URL_SAFE_NO_PAD.encode([1u8; 32]);
         for document in [
             format!(r#"[{{"kty":"RSA","crv":"Ed25519","kid":"k","x":"{short}"}}]"#),
             format!(r#"[{{"kty":"OKP","crv":"P-256","kid":"k","x":"{short}"}}]"#),
-            format!(r#"[{{"kty":"OKP","crv":"Ed25519","kid":"k","x":"{short}"}}]"#),
+            format!(r#"[{{"kty":"OKP","crv":"Ed25519","kid":"k","x":"{ed25519}"}}]"#),
+            format!(r#"[{{"kty":"AKP","alg":"ML-DSA-87","kid":"k","pub":"{short}"}}]"#),
             r#"["not an object"]"#.to_owned(),
         ] {
             assert!(
@@ -1532,91 +1532,49 @@ mod tests {
         assert_eq!(AuthError::BadSignature.code(), Code::UNAUTHORIZED);
     }
 
-    fn ml_dsa_signer() -> aws_lc_rs::signature::PqdsaKeyPair {
-        aws_lc_rs::signature::PqdsaKeyPair::from_seed(
-            &aws_lc_rs::signature::ML_DSA_65_SIGNING,
-            &[8u8; 32],
-        )
-        .expect("a valid ML-DSA-65 seed")
-    }
-
-    fn ml_dsa_mint(alg: &str, kid: &str, claims: &serde_json::Value) -> String {
-        let header = serde_json::json!({ "alg": alg, "typ": "MOQT", "kid": kid });
-        let signing = format!("{}.{}", segment(&header), segment(claims));
-        let mut signature = vec![0u8; aws_lc_rs::signature::ML_DSA_65_SIGNING.signature_len()];
-        let written = ml_dsa_signer()
-            .sign(signing.as_bytes(), &mut signature)
-            .expect("signs");
-        signature.truncate(written);
-        format!("{signing}.{}", URL_SAFE_NO_PAD.encode(&signature))
-    }
-
-    /// Both kinds of key at once, as during the move from Ed25519.
-    fn rollover() -> Authenticator {
-        Authenticator::new(
-            "https://api.moqom.cloud",
-            vec![
-                VerificationKey::ml_dsa_65("pq", ml_dsa_signer().public_key().as_ref().to_vec())
-                    .expect("an ML-DSA-65 key"),
-                VerificationKey::ed25519(KID, signer().public_key().as_ref().to_vec())
-                    .expect("an Ed25519 key"),
-            ],
-        )
-    }
-
     #[test]
-    fn an_ml_dsa_token_verifies_beside_a_legacy_ed25519_one() {
+    fn an_ml_dsa_87_token_fits_under_the_limit() {
         let now = SystemTime::now();
-        let authenticator = rollover();
-        let pq = ml_dsa_mint("ML-DSA-65", "pq", &claims(now));
-        assert!(pq.len() > 4096 && pq.len() < MAX_TOKEN_BYTES);
-        assert!(authenticator.identify([pq.as_bytes()], peer(), now).is_ok());
-        let legacy = mint(&header(), &claims(now));
+        let token = mint(&header(), &claims(now));
+        assert!(token.len() > 6144 && token.len() < MAX_TOKEN_BYTES);
         assert!(
-            authenticator
-                .identify([legacy.as_bytes()], peer(), now)
+            authenticator()
+                .identify([token.as_bytes()], peer(), now)
                 .is_ok()
         );
     }
 
-    /// The algorithm belongs to the key, so neither kind of key can be made
-    /// to verify with the other's algorithm by what a token's header says.
+    /// The algorithm belongs to the key, so a token signed by it that names
+    /// any other algorithm in its header is refused.
     #[test]
     fn a_token_naming_another_algorithm_than_its_keys_is_refused() {
         let now = SystemTime::now();
-        let authenticator = rollover();
-        let claims = claims(now);
-
-        let pq_as_eddsa = ml_dsa_mint("EdDSA", "pq", &claims);
-        assert_eq!(
-            authenticator
-                .identify([pq_as_eddsa.as_bytes()], peer(), now)
-                .err(),
-            Some(AuthError::Unsupported)
-        );
-        let legacy_as_pq = mint(
-            &serde_json::json!({ "alg": "ML-DSA-65", "typ": "MOQT", "kid": KID }),
-            &claims,
-        );
-        assert_eq!(
-            authenticator
-                .identify([legacy_as_pq.as_bytes()], peer(), now)
-                .err(),
-            Some(AuthError::Unsupported)
-        );
+        for alg in ["EdDSA", "ES256", "ML-DSA-65", "ML-DSA-44"] {
+            let token = mint(
+                &serde_json::json!({ "alg": alg, "typ": "MOQT", "kid": KID }),
+                &claims(now),
+            );
+            assert_eq!(
+                authenticator()
+                    .identify([token.as_bytes()], peer(), now)
+                    .err(),
+                Some(AuthError::Unsupported),
+                "alg {alg}"
+            );
+        }
     }
 
     #[test]
     fn an_akp_key_is_read_from_a_set() {
-        let key = VerificationKey::ml_dsa_65("pq", ml_dsa_signer().public_key().as_ref().to_vec())
-            .expect("an ML-DSA-65 key");
+        let key = VerificationKey::ml_dsa_87("pq", public_key(8)).expect("an ML-DSA-87 key");
         let document = serde_json::json!({ "keys": [key.jwk()] }).to_string();
         assert_eq!(VerificationKey::parse_set(&document), Ok(vec![key]));
 
-        let short = r#"[{"kty":"AKP","alg":"ML-DSA-65","kid":"k","pub":"AAAA"}]"#;
-        assert!(VerificationKey::parse_set(short).is_err());
-        let other = r#"[{"kty":"AKP","alg":"ML-DSA-44","kid":"k","pub":"AAAA"}]"#;
-        assert!(VerificationKey::parse_set(other).is_err());
+        let public = URL_SAFE_NO_PAD.encode(public_key(8));
+        for alg in ["ML-DSA-65", "ML-DSA-44"] {
+            let other = format!(r#"[{{"kty":"AKP","alg":"{alg}","kid":"k","pub":"{public}"}}]"#);
+            assert!(VerificationKey::parse_set(&other).is_err(), "{alg}");
+        }
     }
 
     fn seal_key(id: u8) -> SealKey {
@@ -1662,10 +1620,7 @@ mod tests {
         let configured = authenticator().with_seal_keys(vec![seal_key(1)]);
         assert!(configured.identify([plain.as_bytes()], peer(), now).is_ok());
 
-        let keys = vec![
-            VerificationKey::ed25519(KID.to_owned(), signer().public_key().as_ref().to_vec())
-                .expect("an Ed25519 key"),
-        ];
+        let keys = vec![VerificationKey::ml_dsa_87(KID, public_key(7)).expect("an ML-DSA-87 key")];
         assert_eq!(
             configured.accept_pushed(keys.clone(), vec![seal_key(2)], true),
             (1, 2)
@@ -1701,10 +1656,7 @@ mod tests {
         let now = at(0);
         let authenticator = Authenticator::new("https://api.moqom.cloud", Vec::new());
         let _ = authenticator.accept_pushed(
-            vec![
-                VerificationKey::ed25519(KID.to_owned(), signer().public_key().as_ref().to_vec())
-                    .expect("an Ed25519 key"),
-            ],
+            vec![VerificationKey::ml_dsa_87(KID, public_key(7)).expect("an ML-DSA-87 key")],
             Vec::new(),
             true,
         );
@@ -1720,7 +1672,7 @@ mod tests {
     #[test]
     fn a_proof_is_over_the_token_as_presented_not_as_opened() {
         let now = SystemTime::now();
-        let device = moqom_proof::Prover::generate(moqom_proof::Algorithm::MlDsa65).expect("a key");
+        let device = moqom_proof::Prover::generate(moqom_proof::Algorithm::MlDsa87).expect("a key");
         let mut bound = claims(now);
         bound["cnf"]["jkt"] = serde_json::json!(device.thumbprint());
         let key = seal_key(1);

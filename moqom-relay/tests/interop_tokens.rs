@@ -114,8 +114,12 @@ fn a_token_from_the_fixture_does_not_verify_under_a_different_key() {
     let fixture = fixture();
     // Same shape, different key material: the check has to be the signature and
     // not the fact that the token parses.
-    let other = r#"[{"kty":"OKP","crv":"Ed25519","kid":"_oEsEvOrTOY","x":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}]"#;
-    let keys = VerificationKey::parse_set(other).expect("valid JWK set");
+    let other = moqom_token::Signer::from_seed(&[0u8; 32])
+        .expect("a valid ML-DSA-87 seed")
+        .with_id("_oEsEvOrTOY")
+        .public_key()
+        .jwk();
+    let keys = VerificationKey::parse_set(&format!("[{other}]")).expect("valid JWK set");
     let authenticator = Authenticator::new(&fixture.issuer, keys);
     let now = UNIX_EPOCH + Duration::from_secs(fixture.now);
 

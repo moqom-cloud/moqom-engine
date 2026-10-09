@@ -86,7 +86,7 @@ is refused, and the session carries on under the credential it had.
 
 A token also names the device it was issued to, in `cnf.jkt`, and the relay
 makes that name mean something. By default (`MOQOM_RELAY_POSSESSION=required`) every
-place a token is checked — SETUP and each renewal — also demands an ES256
+place a token is checked — SETUP and each renewal — also demands an ML-DSA-87
 signature from the key the thumbprint identifies, over the token it accompanies
 and over this relay's certificate, usable once. So a token read off a log or out
 of a capture is worth nothing to anybody without the Secure Enclave it was bound
@@ -140,7 +140,7 @@ and stops admitting new sessions when that account says it is not admitting.
 
 Direct calls are metered by ticket (`src/ticket.rs`), because their media never
 reaches a relay. A participant on a direct path subscribes to its own
-`.direct/{peerUser}/{peerDevice}` track; the relay answers with an ML-DSA-65-signed
+`.direct/{peerUser}/{peerDevice}` track; the relay answers with an ML-DSA-87-signed
 ticket about once a minute and counts those seconds as `direct_seconds`. Each
 peer holds the other to its tickets (`moqom-client`'s `direct` module, and the
 Swift SDK), so an app that drops the relay session loses the direct path. Keys

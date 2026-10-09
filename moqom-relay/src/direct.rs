@@ -189,7 +189,7 @@ mod tests {
     }
 
     fn device() -> Prover {
-        Prover::generate(Algorithm::MlDsa65).expect("a key")
+        Prover::generate(Algorithm::MlDsa87).expect("a key")
     }
 
     fn presented<'a>(

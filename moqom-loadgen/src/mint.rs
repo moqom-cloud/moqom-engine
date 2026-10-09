@@ -60,7 +60,7 @@ impl Mint {
     /// Derive the signer from `seed`.
     ///
     /// # Errors
-    /// A seed ML-DSA-65 will not accept.
+    /// A seed ML-DSA-87 will not accept.
     pub fn from_seed(seed: &[u8; 32]) -> Result<Self, moqom_token::KeyError> {
         Ok(Self {
             signer: Signer::from_seed(seed)?.with_id(KEY_ID),
@@ -171,7 +171,7 @@ impl Identity {
         }
     }
 
-    /// The ML-DSA-65 key for `user`, its seed a hash of the name, so a run and
+    /// The ML-DSA-87 key for `user`, its seed a hash of the name, so a run and
     /// the relay it targets agree on every device without exchanging keys.
     fn key(user: &str) -> DeviceKey {
         let mut seed = b"moqom-loadgen device key ".to_vec();
@@ -180,12 +180,12 @@ impl Identity {
             .expect("a SHA-256 digest is a 32-byte seed")
     }
 
-    /// The PKCS#8 ML-DSA-65 private key for `user`, the one [`Self::key`] makes.
+    /// The PKCS#8 ML-DSA-87 private key for `user`, the one [`Self::key`] makes.
     #[must_use]
     pub fn pkcs8(user: &str) -> Vec<u8> {
         Self::key(user)
             .to_pkcs8()
-            .expect("an ML-DSA-65 key serialises")
+            .expect("an ML-DSA-87 key serialises")
     }
 
     /// The device field a namespace of this identity's carries.
@@ -293,7 +293,7 @@ mod tests {
     fn the_key_set_names_the_algorithm_the_relay_expects() {
         let jwks: serde_json::Value = serde_json::from_str(&mint().jwks()).expect("valid JSON");
         assert_eq!(jwks["keys"][0]["kty"], "AKP");
-        assert_eq!(jwks["keys"][0]["alg"], "ML-DSA-65");
+        assert_eq!(jwks["keys"][0]["alg"], "ML-DSA-87");
         assert_eq!(jwks["keys"][0]["kid"], KEY_ID);
     }
 }

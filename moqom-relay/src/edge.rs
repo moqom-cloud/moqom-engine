@@ -7,7 +7,7 @@
 //! instead each room an edge is asked for gets a link of its own:
 //!
 //! 1. The edge asks the control plane ([`Minter`]) for a link credential for the
-//!    room, bound to an ML-DSA-65 key the edge generated at startup and holds
+//!    room, bound to an ML-DSA-87 key the edge generated at startup and holds
 //!    only in memory. The credential carries `moqt.rly` and the room, nothing
 //!    else, and `cnf.jkt` names the key.
 //! 2. It dials the parent, reads the parent's leaf certificate off the handshake,

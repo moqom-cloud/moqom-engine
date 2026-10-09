@@ -16,7 +16,7 @@ moqom-transport = { path = "../moqom-transport" }
 # The device key and the proof it signs, for an edge's links to its parent: the
 # same proof a client makes, so a parent checks a link exactly as it checks one.
 moqom-client = { path = "../moqom-client" }
-# Checking proofs of possession, ML-DSA-65 only.
+# Checking proofs of possession, ML-DSA-87 only.
 moqom-proof = { workspace = true }
 bytes = { workspace = true }
 quinn = { workspace = true }
@@ -34,7 +34,7 @@ webpki-roots = "0.26"
 socket2 = { workspace = true }
 quinn-udp = { version = "0.5", default-features = false, features = ["tracing"] }
 
-# Verifying the credential a session presents. aws-lc-rs supplies ML-DSA-65 and is
+# Verifying the credential a session presents. aws-lc-rs supplies ML-DSA-87 and is
 # already here as the rustls provider, so the signature check costs no new
 # cryptography; serde reads the claims, which are JSON precisely so that the
 # media-path binary does not have to carry a CBOR/COSE stack.

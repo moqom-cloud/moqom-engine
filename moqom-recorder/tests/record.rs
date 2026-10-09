@@ -63,7 +63,7 @@ async fn within<F: Future>(what: &str, future: F) -> F::Output {
 
 fn signer() -> Signer {
     Signer::from_seed(&[9u8; 32])
-        .expect("a valid ML-DSA-65 seed")
+        .expect("a valid ML-DSA-87 seed")
         .with_id(KEY_ID)
 }
 

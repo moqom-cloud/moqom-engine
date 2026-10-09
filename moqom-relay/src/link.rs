@@ -1831,9 +1831,8 @@ mod tests {
                 pb::VerificationKeys {
                     keys: vec![admin::VerificationKey {
                         key_id: "k1".to_owned(),
-                        algorithm: "EdDSA".to_owned(),
-                        jwk: r#"{"kty":"OKP","crv":"Ed25519","kid":"k1","x":"11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"}"#
-                            .to_owned(),
+                        algorithm: "ML-DSA-87".to_owned(),
+                        jwk: pushed_jwk(),
                         not_before: None,
                         retires_at: None,
                     }],
@@ -1905,15 +1904,25 @@ mod tests {
         );
     }
 
+    /// An ML-DSA-87 verification key named `k1`, as the control plane
+    /// publishes one: a JWK document sent as a string.
+    fn pushed_jwk() -> String {
+        moqom_token::Signer::from_seed(&[1u8; 32])
+            .expect("a valid ML-DSA-87 seed")
+            .with_id("k1")
+            .public_key()
+            .jwk()
+            .to_string()
+    }
+
     fn pushed_keys(seal_keys: Vec<pb::SealKey>, require_sealed: bool) -> pb::ControlMessage {
         pb::ControlMessage {
             body: Some(pb::control_message::Body::VerificationKeys(
                 pb::VerificationKeys {
                     keys: vec![admin::VerificationKey {
                         key_id: "k1".to_owned(),
-                        algorithm: "EdDSA".to_owned(),
-                        jwk: r#"{"kty":"OKP","crv":"Ed25519","kid":"k1","x":"11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"}"#
-                            .to_owned(),
+                        algorithm: "ML-DSA-87".to_owned(),
+                        jwk: pushed_jwk(),
                         not_before: None,
                         retires_at: None,
                     }],

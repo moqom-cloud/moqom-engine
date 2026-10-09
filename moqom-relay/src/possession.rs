@@ -57,11 +57,12 @@
 //!
 //! # The algorithms
 //!
-//! `ML-DSA-65` and nothing else, because the point of this module is a key that
-//! cannot be extracted and the Secure Enclave holds ML-DSA-65 keys from iOS 26
-//! and macOS 26. `ES256`, which the enclave held before, is refused: a P-256
-//! device key is a signature a quantum adversary could forge later, against a
-//! credential that names the key forever. Ed25519 is not accepted either:
+//! `ML-DSA-87` and nothing else, because the point of this module is a key that
+//! cannot be extracted and the Secure Enclave holds ML-DSA-87 keys from iOS 26
+//! and macOS 26. `ML-DSA-65` is refused too: MOQOM signs with ML-DSA-87
+//! everywhere, MLS included. `ES256`, which the enclave held before, is
+//! refused: a P-256 device key is a signature a quantum adversary could forge
+//! later, against a credential that names the key forever. Ed25519 is not accepted either:
 //! `CryptoKit` offers it only in software, with the private key in ordinary
 //! memory — where it can be dumped alongside the token by exactly the attacker
 //! this exists to stop.
@@ -80,7 +81,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use moqom_proof::{Algorithm, Checker, MemoryNonceStore};
 
 /// What a device key may be. See the module docs.
-const ALGORITHMS: &[Algorithm] = &[Algorithm::MlDsa65];
+const ALGORITHMS: &[Algorithm] = &[Algorithm::MlDsa87];
 
 /// Why a proof of possession was not accepted.
 ///
@@ -339,7 +340,7 @@ mod tests {
     impl Device {
         fn new() -> Self {
             Self {
-                prover: Prover::generate(Algorithm::MlDsa65).expect("a key"),
+                prover: Prover::generate(Algorithm::MlDsa87).expect("a key"),
             }
         }
 
@@ -695,7 +696,7 @@ mod tests {
         }
 
         /// Every proof the client produced is one this relay accepts, and every
-        /// one is ML-DSA-65: a fixture still carrying another algorithm is a
+        /// one is ML-DSA-87: a fixture still carrying another algorithm is a
         /// client still making it.
         ///
         /// A fresh checker per case, because a shared one would spend the
@@ -727,8 +728,8 @@ mod tests {
             }
             assert_eq!(
                 algorithms,
-                ["ML-DSA-65".to_owned()].into(),
-                "the client makes ML-DSA-65 proofs and nothing else"
+                ["ML-DSA-87".to_owned()].into(),
+                "the client makes ML-DSA-87 proofs and nothing else"
             );
         }
 

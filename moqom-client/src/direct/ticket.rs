@@ -418,14 +418,14 @@ mod tests {
             verify_ticket(b"not a jws", &[], &peer(), "bob/dev", now, skew),
             Err(TicketRefusal::Malformed)
         );
-        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"ML-DSA-65","typ":"JWT","kid":"k"}"#);
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"ML-DSA-87","typ":"JWT","kid":"k"}"#);
         let token = format!("{header}.e30.c2ln");
         assert_eq!(
             verify_ticket(token.as_bytes(), &[], &peer(), "bob/dev", now, skew),
             Err(TicketRefusal::Unsupported)
         );
         let header =
-            URL_SAFE_NO_PAD.encode(br#"{"alg":"ML-DSA-65","typ":"moqom-direct-ticket","kid":"k"}"#);
+            URL_SAFE_NO_PAD.encode(br#"{"alg":"ML-DSA-87","typ":"moqom-direct-ticket","kid":"k"}"#);
         let unknown = format!("{header}.e30.c2ln");
         assert_eq!(
             verify_ticket(unknown.as_bytes(), &[], &peer(), "bob/dev", now, skew),

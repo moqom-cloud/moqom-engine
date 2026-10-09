@@ -16,7 +16,7 @@
 //!
 //! # What is signed
 //!
-//! A `moqom-proof` proof: a compact JWS typed `MOQT-POP`, signed `ML-DSA-65`,
+//! A `moqom-proof` proof: a compact JWS typed `MOQT-POP`, signed `ML-DSA-87`,
 //! with four claims:
 //!
 //! * `ath`, the hash of the token, which ties this proof to that token and no
@@ -34,12 +34,12 @@
 //! case its claims are not this client's to read, and the relay checks `ath`
 //! against the same sealed bytes.
 //!
-//! # Only ML-DSA-65
+//! # Only ML-DSA-87
 //!
-//! A P-256 key from before the move to ML-DSA is refused at load, rather than
-//! loaded and then refused by every relay: relays accept ML-DSA-65 proofs and
-//! nothing else, and a key that cannot be admitted anywhere is better reported
-//! where it is read. Such a machine makes a new key and is enrolled again.
+//! A P-256 or ML-DSA-65 key from before the move to ML-DSA-87 is refused at
+//! load, rather than loaded and then refused by every relay: relays accept
+//! ML-DSA-87 proofs and nothing else, and a key that cannot be admitted
+//! anywhere is better reported where it is read. Such a machine makes a new key and is enrolled again.
 
 use std::time::SystemTime;
 
@@ -51,8 +51,8 @@ use moqom_proof::{Algorithm, Prover};
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum DeviceKeyError {
-    /// The bytes are not a PKCS#8 ML-DSA-65 private key.
-    #[error("not a PKCS#8 ML-DSA-65 private key")]
+    /// The bytes are not a PKCS#8 ML-DSA-87 private key.
+    #[error("not a PKCS#8 ML-DSA-87 private key")]
     Malformed,
 
     /// A key could not be generated, or its private half could not be serialised.
@@ -68,7 +68,7 @@ pub enum DeviceKeyError {
     Relay,
 }
 
-/// An ML-DSA-65 key pair identifying one device.
+/// An ML-DSA-87 key pair identifying one device.
 ///
 /// The thumbprint is what a token commits to, so this key is the device's name as
 /// far as authorisation is concerned: revoking it revokes the machine, which is
@@ -78,7 +78,7 @@ pub struct DeviceKey {
 }
 
 impl DeviceKey {
-    /// Generate an ML-DSA-65 key, returning it with the PKCS#8 bytes to store it
+    /// Generate an ML-DSA-87 key, returning it with the PKCS#8 bytes to store it
     /// as.
     ///
     /// The private bytes come back to the caller rather than being written here,
@@ -88,7 +88,7 @@ impl DeviceKey {
     /// # Errors
     /// The platform's random source or key generation refusing.
     pub fn generate() -> Result<(Self, Vec<u8>), DeviceKeyError> {
-        let prover = Prover::generate(Algorithm::MlDsa65)
+        let prover = Prover::generate(Algorithm::MlDsa87)
             .map_err(|error| DeviceKeyError::Unavailable(error.to_string()))?;
         let pkcs8 = prover
             .to_pkcs8()
@@ -96,19 +96,20 @@ impl DeviceKey {
         Ok((Self { prover }, pkcs8))
     }
 
-    /// Load an ML-DSA-65 key from PKCS#8 bytes.
+    /// Load an ML-DSA-87 key from PKCS#8 bytes.
     ///
     /// # Errors
-    /// Bytes that are not one, a P-256 key from before the move included.
+    /// Bytes that are not one, a P-256 or ML-DSA-65 key from before the move
+    /// included.
     pub fn from_pkcs8(pkcs8: &[u8]) -> Result<Self, DeviceKeyError> {
         let prover = Prover::from_pkcs8(pkcs8).map_err(|_| DeviceKeyError::Malformed)?;
-        if prover.algorithm() != Algorithm::MlDsa65 {
+        if prover.algorithm() != Algorithm::MlDsa87 {
             return Err(DeviceKeyError::Malformed);
         }
         Ok(Self { prover })
     }
 
-    /// The ML-DSA-65 key `seed` determines, for a caller that must make the same
+    /// The ML-DSA-87 key `seed` determines, for a caller that must make the same
     /// key twice: a load generator naming its synthetic devices, a test.
     ///
     /// A device's own key comes from [`Self::generate`]; a seed anybody can
@@ -118,7 +119,7 @@ impl DeviceKey {
     /// A seed that is not 32 bytes.
     pub fn from_seed(seed: &[u8]) -> Result<Self, DeviceKeyError> {
         Ok(Self {
-            prover: Prover::ml_dsa_65_from_seed(seed).map_err(|_| DeviceKeyError::Malformed)?,
+            prover: Prover::ml_dsa_87_from_seed(seed).map_err(|_| DeviceKeyError::Malformed)?,
         })
     }
 
@@ -236,9 +237,9 @@ mod tests {
     const RELAY: &str = "cGludGhpc3JlbGF5c2NlcnRpZmljYXRlaGFzaA";
 
     #[test]
-    fn a_new_key_is_ml_dsa_65() {
+    fn a_new_key_is_ml_dsa_87() {
         let (key, _) = DeviceKey::generate().expect("a key");
-        assert_eq!(key.algorithm(), Algorithm::MlDsa65);
+        assert_eq!(key.algorithm(), Algorithm::MlDsa87);
         assert!(key.public_key_jwk().contains(r#""kty":"AKP""#));
     }
 
@@ -266,10 +267,23 @@ mod tests {
     }
 
     #[test]
+    fn an_ml_dsa_65_key_from_before_the_move_is_refused() {
+        let pkcs8 =
+            aws_lc_rs::signature::PqdsaKeyPair::generate(&aws_lc_rs::signature::ML_DSA_65_SIGNING)
+                .expect("an ML-DSA-65 key")
+                .to_pkcs8v1()
+                .expect("serialises");
+        assert!(matches!(
+            DeviceKey::from_pkcs8(pkcs8.as_ref()),
+            Err(DeviceKeyError::Malformed)
+        ));
+    }
+
+    #[test]
     fn a_seed_is_one_key_every_time() {
         let first = DeviceKey::from_seed(&[7; 32]).expect("a key");
         let again = DeviceKey::from_seed(&[7; 32]).expect("the same key");
-        assert_eq!(first.algorithm(), Algorithm::MlDsa65);
+        assert_eq!(first.algorithm(), Algorithm::MlDsa87);
         assert_eq!(first.thumbprint(), again.thumbprint());
         assert_ne!(
             first.thumbprint(),
