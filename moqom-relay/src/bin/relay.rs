@@ -38,6 +38,14 @@
 //! - `MOQOM_RELAY_TENANT` — serve this one tenant: every token issued for
 //!   another is refused (`wrong_tenant`). For a relay a customer runs and
 //!   enrolled for their tenant. Unset serves every tenant the keys verify.
+//! - `MOQOM_RELAY_POOL` — the relay pool this relay belongs to. Only tokens
+//!   naming it are admitted; any other, a token naming no pool included, is
+//!   refused (`wrong_pool`). Unset follows the control plane's `Welcome`, and
+//!   serves the shared fleet, refusing every token that names a pool, until one
+//!   arrives. Set, a `Welcome` naming another pool is logged as an error and
+//!   every session refused (`pool_conflict`) until the two agree. A pool
+//!   relay's `MOQOM_RELAY_UPSTREAM` must be a relay in the same pool: a pool is
+//!   a promise that the tenant's media touches no machine outside it.
 //! - `MOQOM_RELAY_LIMITS` — `off` disables per-user and per-device limits
 //!   entirely. On otherwise, which is the default.
 //! - `MOQOM_RELAY_LIMIT_SCALE` — multiply every allowance by this. Default 1.
@@ -49,6 +57,12 @@
 //!   the relay that has no control plane to be sent them by. Until either
 //!   happens no session is authenticated and every one is charged to its
 //!   address, which is a much smaller allowance.
+//! - `MOQOM_RELAY_SEAL_KEYS` — path to a JWK set of `oct` keys (an 8-byte
+//!   base64url `kid`, a 32-byte `k`) to open sealed tokens with. Kept through
+//!   every push, as `MOQOM_RELAY_JWKS` is; the control plane sends its own
+//!   seal keys beside its verification keys and replaces those on every push.
+//!   Tokens that are not sealed are accepted unless the control plane says the
+//!   rollover is over. Unset opens only what the control plane sends keys for.
 //! - `MOQOM_RELAY_ISSUER` — the issuer tokens must name. Required whenever the
 //!   relay can verify tokens (`MOQOM_RELAY_JWKS` or `MOQOM_CONTROL_ENDPOINT` is
 //!   set): the relay will not start without it unless
@@ -72,8 +86,8 @@
 //!   Being a relay is not a way past a parent's door, so against a parent that
 //!   verifies credentials an edge without this is anonymous and will not be able to
 //!   read the tracks it exists to serve.
-//! - `MOQOM_RELAY_UPSTREAM_KEY` — a PKCS#8 P-256 file holding the device key that
-//!   token is bound to. Required with the token: every parent requires proof of
+//! - `MOQOM_RELAY_UPSTREAM_KEY` — a PKCS#8 ML-DSA-65 file holding the device key
+//!   that token is bound to. Required with the token: every parent requires proof of
 //!   possession, so this relay proves the token on each link, against the
 //!   certificate the parent presented.
 //! - `MOQOM_RELAY_LINK_URL` — the control plane's `/relay/link`, on its join
@@ -175,8 +189,8 @@ use moqom_relay::ticket::TicketKeys;
 use moqom_relay::usage::report::{Credential, Endpoint, Reporter};
 use moqom_relay::usage::{Config as UsageConfig, Hosting};
 use moqom_relay::{
-    Authenticator, Cache, Fabric, Governor, Limits, Link, Metrics, Quotas, Session, Supervisor,
-    Usage, VerificationKey,
+    Authenticator, Cache, Fabric, Governor, Limits, Link, Metrics, Quotas, SealKey, Session,
+    Supervisor, Usage, VerificationKey,
 };
 use moqom_relay::{edge, stun, upstream};
 use moqom_transport::{Server, server::with_moqt_alpn};
@@ -201,7 +215,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Installed once, before any TLS configuration is built. `rustls` will
     // otherwise refuse to pick a provider when more than one is compiled in.
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    // The link provider, ML-KEM-1024 only: tonic builds the control link's
+    // client configuration from the process default and takes no other, so
+    // this is what holds that link to it. Every configuration the relay builds
+    // itself names its provider.
+    let _ = moqom_transport::key_exchange::link_provider().install_default();
 
     let addr: SocketAddr = env("MOQOM_RELAY_ADDR")
         .unwrap_or_else(|| "[::]:4443".to_owned())
@@ -815,7 +833,7 @@ fn authenticator() -> Result<Authenticator, Box<dyn std::error::Error>> {
             "no MOQOM_RELAY_JWKS; until the control plane sends keys, no session is \
              authenticated and every one is limited by address"
         );
-        return Ok(pinned(issuer, Vec::new()));
+        return pinned(issuer, Vec::new());
     };
 
     let document = std::fs::read_to_string(&path)
@@ -827,19 +845,39 @@ fn authenticator() -> Result<Authenticator, Box<dyn std::error::Error>> {
     }
 
     tracing::info!(keys = keys.len(), %issuer, "verifying session credentials");
-    Ok(pinned(issuer, keys))
+    pinned(issuer, keys)
 }
 
 /// An authenticator for `issuer`, pinned to `MOQOM_RELAY_TENANT` when that is
 /// set: a customer's own relay, which serves their tenant and nobody else's.
-fn pinned(issuer: String, keys: Vec<VerificationKey>) -> Authenticator {
-    match env("MOQOM_RELAY_TENANT").filter(|tenant| !tenant.is_empty()) {
+/// With the operator's seal keys, and pinned to `MOQOM_RELAY_POOL` when that is.
+fn pinned(
+    issuer: String,
+    keys: Vec<VerificationKey>,
+) -> Result<Authenticator, Box<dyn std::error::Error>> {
+    let mut authenticator = match env("MOQOM_RELAY_TENANT").filter(|tenant| !tenant.is_empty()) {
         Some(tenant) => {
             tracing::info!(%tenant, "serving one tenant only");
             Authenticator::for_tenant(issuer, tenant, keys)
         }
         None => Authenticator::new(issuer, keys),
+    };
+    if let Some(path) = env_path("MOQOM_RELAY_SEAL_KEYS") {
+        let document = std::fs::read_to_string(&path)
+            .map_err(|e| format!("reading MOQOM_RELAY_SEAL_KEYS {}: {e}", path.display()))?;
+        let seal = SealKey::parse_set(&document)
+            .map_err(|e| format!("MOQOM_RELAY_SEAL_KEYS {}: {e}", path.display()))?;
+        if seal.is_empty() {
+            return Err(format!("MOQOM_RELAY_SEAL_KEYS {} has no keys", path.display()).into());
+        }
+        tracing::info!(seal_keys = seal.len(), "opening sealed tokens");
+        authenticator = authenticator.with_seal_keys(seal);
     }
+    if let Some(pool) = env("MOQOM_RELAY_POOL").filter(|pool| !pool.is_empty()) {
+        tracing::info!(%pool, "serving one relay pool only");
+        authenticator = authenticator.pinned_to_pool(pool);
+    }
+    Ok(authenticator)
 }
 
 /// The parent relay this one fetches tracks from, if it has been given one.
@@ -949,9 +987,12 @@ fn upstream_tls() -> Result<rustls::ClientConfig, Box<dyn std::error::Error>> {
         tracing::info!(authorities = added, path = %path.display(), "trusting a private authority for the upstream link");
     }
 
-    let mut tls = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+    let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+        moqom_transport::key_exchange::link_provider(),
+    ))
+    .with_protocol_versions(&[&rustls::version::TLS13])?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
     tls.alpn_protocols = vec![moqom_transport::alpn::MOQT_DRAFT_19.to_vec()];
     Ok(tls)
 }
@@ -1056,12 +1097,21 @@ fn tls_from_pem(
     let key = rustls_pemfile::private_key(&mut io::BufReader::new(std::fs::File::open(key)?))?
         .ok_or("no private key in the key file")?;
 
-    Ok((
-        rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certs, key)?,
-        identity,
+    Ok((device_tls()?.with_single_cert(certs, key)?, identity))
+}
+
+/// The device listener's TLS: ML-KEM-1024 preferred, the hybrid an Apple
+/// device offers accepted, and nothing classical. See
+/// [`moqom_transport::key_exchange`].
+fn device_tls() -> Result<
+    rustls::ConfigBuilder<rustls::ServerConfig, rustls::server::WantsServerCert>,
+    rustls::Error,
+> {
+    Ok(rustls::ServerConfig::builder_with_provider(Arc::new(
+        moqom_transport::key_exchange::device_provider(),
     ))
+    .with_protocol_versions(&[&rustls::version::TLS13])?
+    .with_no_client_auth())
 }
 
 /// A certificate for `names`, and the hash a client pins it by.
@@ -1082,9 +1132,7 @@ fn self_signed(
     let hash = base64::engine::general_purpose::STANDARD.encode(digest.as_ref());
     let identity = certificate_identity(&der);
 
-    let tls = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(vec![der], key)?;
+    let tls = device_tls()?.with_single_cert(vec![der], key)?;
     Ok((tls, hash, identity))
 }
 

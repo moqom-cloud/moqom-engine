@@ -16,7 +16,7 @@ moqom-transport = { path = "../moqom-transport" }
 # The device key and the proof it signs, for an edge's links to its parent: the
 # same proof a client makes, so a parent checks a link exactly as it checks one.
 moqom-client = { path = "../moqom-client" }
-# Checking proofs of possession: ML-DSA-65, and ES256 during the rollover.
+# Checking proofs of possession, ML-DSA-65 only.
 moqom-proof = { workspace = true }
 bytes = { workspace = true }
 quinn = { workspace = true }

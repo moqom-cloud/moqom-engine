@@ -71,6 +71,12 @@ async fn a_participant_is_issued_a_ticket_and_a_fresh_one_every_renewal() {
     let claims = verify(&keys, ticket.as_bytes(), expected(&ada), SystemTime::now())
         .expect("a ticket the peer accepts");
     assert_eq!(claims.peer, PEER);
+    assert_eq!(
+        claims.jkt,
+        support::tokens::thumbprint_constant(),
+        "the whole thumbprint, which a peer checks the holder's proof against"
+    );
+    assert_ne!(claims.publish, 0, "a publisher's bits");
 
     let (second_header, second) = client.read_subgroup().await;
     let (renewed, _) = read_ticket(&second[0]);
@@ -99,10 +105,14 @@ async fn a_forged_ticket_is_refused_by_the_peers_check() {
     let ada = holder();
     let forger = TicketKeys::from_seed("ticket-test", &[12u8; 32]);
     let counterfeit = forger.issue(&moqom_relay::ticket::Claims::new(
-        "acme",
-        "room-42",
-        "ada",
-        DEVICE,
+        moqom_relay::ticket::Holder {
+            tenant: "acme",
+            room: "room-42",
+            user: "ada",
+            device: DEVICE,
+            jkt: support::tokens::thumbprint_constant(),
+            publish: 3,
+        },
         PEER,
         SystemTime::now(),
     ));

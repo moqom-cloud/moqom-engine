@@ -13,9 +13,11 @@
 //!    a decision the person holding the device has to have made.
 //! 4. Exchange [`CandidateOffer`]s over the room, sealed under a [`RoomSecret`]
 //!    so the relay carries them without being able to read them.
-//! 5. [`DirectEndpoint::establish`] opens the path through both NATs and speaks
-//!    MOQT over it. Each side checks the other's MOQOM credentials through a
-//!    [`PeerVerifier`] before a single object moves.
+//! 5. Ask this side's relay for a [`DirectTicket`] naming the peer, then
+//!    [`DirectEndpoint::establish`] opens the path through both NATs and speaks
+//!    MOQT over it. Each side presents its ticket and a proof of possession
+//!    over it, and checks the other's through a [`PeerVerifier`] before a
+//!    single object moves. MOQOM tokens never cross the direct path.
 //! 6. Read media through a [`DualSubscription`], which keeps the relay
 //!    subscription open as the fallback, moves to the direct path once it has
 //!    delivered for a while, pauses the relay copy, and resumes it and returns

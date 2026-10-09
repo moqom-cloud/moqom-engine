@@ -150,14 +150,24 @@ which pauses a subscriber's relay copy while its direct path carries the media.
 The design, including the two-modified-apps limitation, is in
 `moqom/docs/OPENZITI-AND-P2P.md` under "Direct tickets and billing".
 
-Key exchange prefers post-quantum. The workspace enables rustls's
-`prefer-post-quantum`, so every TLS configuration here offers the hybrid
-[X25519MLKEM768](https://datatracker.ietf.org/doc/draft-ietf-tls-ecdhe-mlkem/) first and plain X25519 second. That covers the relay listener,
-the client, relay links, direct paths, and gRPC. `moqom-client/tests/post_quantum.rs`
-completes real handshakes and asserts the negotiated group, for both the
-listener and both ends of a direct path. A classical peer still connects:
-X25519 costs no extra round trip, and only a peer with neither group pays for a
-HelloRetryRequest. Certificates are still classical.
+Key exchange is post-quantum, and the relay refuses anything else. Groups are
+set per configuration in `moqom-transport`'s `key_exchange` module:
+
+- Relay links (to a parent relay, the control plane's gRPC link, and the usage
+  and link-credential endpoints) offer only `MLKEM1024`. A server that cannot
+  negotiate it gets no connection.
+- The relay's QUIC listener for devices prefers `MLKEM1024` and also accepts the
+  hybrid [X25519MLKEM768](https://datatracker.ietf.org/doc/draft-ietf-tls-ecdhe-mlkem/),
+  which is what Apple devices offer. A device offering only classical groups
+  (X25519, P-256, P-384) fails the handshake.
+- Clients, direct paths and the admin port keep rustls's `prefer-post-quantum`
+  defaults: X25519MLKEM768 first, plain X25519 second.
+
+`moqom-transport/tests/key_exchange.rs` completes real handshakes against the
+listener's configuration and asserts the negotiated group, and that a
+classical-only peer is refused. `moqom-client/tests/post_quantum.rs` does the
+same for the client and both ends of a direct path. Certificates are still
+classical.
 
 Direct paths are dual-stack. The socket binds `[::]` with IPv4 mapped onto it,
 or IPv4 alone where the host has no IPv6. It gathers a host candidate and a

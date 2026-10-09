@@ -12,8 +12,7 @@ description = "A MOQT subscriber and publisher, for recorders, classifiers, and 
 [dependencies]
 moqom-proto = { path = "../moqom-proto" }
 moqom-transport = { path = "../moqom-transport" }
-# The device key and the proof it signs: ML-DSA-65, and ES256 for P-256 keys
-# made before the move.
+# The device key and the proof it signs, ML-DSA-65 only.
 moqom-proof = { workspace = true }
 # Already the provider rustls and quinn are built against here, so this adds an
 # API rather than a library.

@@ -62,7 +62,7 @@ struct RelayArgs {
     /// is still bound to whatever certificate the relay presented.
     #[arg(long)]
     insecure: bool,
-    /// The recorder's ES256 key, PKCS#8, PEM or DER.
+    /// The recorder's ML-DSA-65 key, PKCS#8, PEM or DER.
     #[arg(long, env = "MOQOM_RECORDER_KEY")]
     key: PathBuf,
     /// The local spool.

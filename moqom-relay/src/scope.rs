@@ -164,6 +164,12 @@ impl Publish {
         Self(bits)
     }
 
+    /// The raw bits, as the token's `moqt.pub` carried them.
+    #[must_use]
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
     /// Whether the holder may publish nothing at all, which is an ordinary
     /// viewer rather than a broken token.
     #[must_use]

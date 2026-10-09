@@ -9,7 +9,7 @@
 mod support;
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use moqom_proto::control::RequestErrorCode;
 use moqom_proto::model::{TrackAlias, TrackNamespace};
@@ -19,7 +19,7 @@ use moqom_relay::upstream::{self, Introduction};
 use support::tokens::Grant;
 use support::{Client, Relay, namespace, series, track, within};
 
-type Answer = dyn Fn(usize, &RoomKey, &str) -> Result<String, MintError> + Send + Sync;
+type Answer = dyn Fn(usize, &RoomKey, &str) -> Result<Credential, MintError> + Send + Sync;
 
 /// The control plane, as a script: `answer` is told how many credentials it has
 /// minted before, for which room, and for which key.
@@ -31,7 +31,7 @@ struct Scripted {
 
 impl Scripted {
     fn new(
-        answer: impl Fn(usize, &RoomKey, &str) -> Result<String, MintError> + Send + Sync + 'static,
+        answer: impl Fn(usize, &RoomKey, &str) -> Result<Credential, MintError> + Send + Sync + 'static,
     ) -> Self {
         Self {
             asked: Arc::default(),
@@ -63,33 +63,43 @@ impl Minter for Scripted {
             asked.len() - 1
         };
         let answer = (self.answer)(before, room, holder.thumbprint);
-        Box::pin(async move { answer.and_then(Credential::from_token) })
+        Box::pin(async move { answer })
     }
 }
 
 /// A link credential for `room`, as the control plane mints one: the relay
 /// grant, that room, bound to `thumbprint`, issued and expiring the given
-/// number of seconds from now.
-fn link_token(room: &RoomKey, thumbprint: &str, issued: i64, expires: i64) -> String {
+/// number of seconds from now, and the mint response saying the same.
+fn link_token(room: &RoomKey, thumbprint: &str, issued: i64, expires: i64) -> Credential {
     let room = match room.room.as_str() {
         "room-42" => "room-42",
         "room-7" => "room-7",
         other => panic!("no grant for {other}"),
     };
-    Grant {
+    let token = Grant {
         room: Some(room),
         ..Grant::relay_link()
     }
-    .token_for(thumbprint, issued, expires)
+    .token_for(thumbprint, issued, expires);
+    let from_now = |seconds: i64| {
+        let now = SystemTime::now();
+        let by = Duration::from_secs(seconds.unsigned_abs());
+        if seconds < 0 { now - by } else { now + by }
+    };
+    Credential {
+        token,
+        issued: from_now(issued),
+        expires: from_now(expires),
+    }
 }
 
 /// A credential the parent still accepts, inside its clock skew, but whose
 /// session it closes four seconds from now unless it is renewed.
-fn nearly_lapsed(room: &RoomKey, thumbprint: &str) -> String {
+fn nearly_lapsed(room: &RoomKey, thumbprint: &str) -> Credential {
     link_token(room, thumbprint, -34, -26)
 }
 
-fn fresh(room: &RoomKey, thumbprint: &str) -> String {
+fn fresh(room: &RoomKey, thumbprint: &str) -> Credential {
     link_token(room, thumbprint, 0, 600)
 }
 

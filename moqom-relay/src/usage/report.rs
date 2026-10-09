@@ -182,10 +182,16 @@ impl Endpoint {
                 // leaves the public roots, and the handshake says why.
                 let _ = roots.add(authority.clone());
             }
+            // The control plane is a MOQOM server: ML-KEM-1024 only, as every
+            // link. See `moqom_transport::key_exchange`.
             Arc::new(
-                rustls::ClientConfig::builder()
-                    .with_root_certificates(roots)
-                    .with_no_client_auth(),
+                rustls::ClientConfig::builder_with_provider(Arc::new(
+                    moqom_transport::key_exchange::link_provider(),
+                ))
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .unwrap_or_else(|_| unreachable!("aws-lc-rs supports TLS 1.3"))
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
             )
         }))
     }

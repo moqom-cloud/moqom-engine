@@ -242,7 +242,16 @@ async fn a_failed_report_is_retried_with_the_same_identifiers() {
         "{record}"
     );
 
-    let stats = usage.stats();
+    // The billing server has seen the third request; the reporter may not have
+    // read its answer yet.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let stats = loop {
+        let stats = usage.stats();
+        if stats.sent >= 1 || tokio::time::Instant::now() >= deadline {
+            break stats;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
     assert_eq!(stats.reports_failed, 2);
     assert!(stats.sent >= 1);
     assert!(stats.last_success > 0);

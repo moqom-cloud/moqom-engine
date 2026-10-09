@@ -450,23 +450,31 @@ mod tests {
         assert_eq!(offered, alpn::OFFERED);
     }
 
-    /// Every listener and client in the engine is built on this provider, so
-    /// this is the one place that has to hold for all of them to send the
-    /// hybrid share first. It fails if the workspace's `prefer-post-quantum`
-    /// feature on rustls is ever dropped.
+    /// The relay's device listener is built on this provider, so this is the
+    /// one place that has to hold for it to prefer ML-KEM-1024, still admit an
+    /// Apple device's hybrid share, and refuse every classical-only peer.
     #[test]
-    fn the_provider_listeners_are_built_on_prefers_the_hybrid() {
-        let provider = rustls::crypto::aws_lc_rs::default_provider();
+    fn the_provider_listeners_are_built_on_prefers_ml_kem_1024() {
+        let provider = crate::key_exchange::device_provider();
         let groups: Vec<rustls::NamedGroup> = provider
             .kx_groups
             .iter()
             .map(|group| group.name())
             .collect();
         assert_eq!(
-            groups.first(),
-            Some(&rustls::NamedGroup::X25519MLKEM768),
+            groups,
+            [
+                rustls::NamedGroup::MLKEM1024,
+                rustls::NamedGroup::X25519MLKEM768
+            ],
             "{groups:?}"
         );
-        assert!(groups.contains(&rustls::NamedGroup::X25519), "{groups:?}");
+        for classical in [
+            rustls::NamedGroup::X25519,
+            rustls::NamedGroup::secp256r1,
+            rustls::NamedGroup::secp384r1,
+        ] {
+            assert!(!groups.contains(&classical), "{groups:?}");
+        }
     }
 }

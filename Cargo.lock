@@ -1235,6 +1235,7 @@ dependencies = [
  "libc",
  "moqom-proto",
  "quinn",
+ "quinn-proto",
  "quinn-udp",
  "rcgen",
  "rustls",

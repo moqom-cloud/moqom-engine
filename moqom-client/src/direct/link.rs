@@ -16,11 +16,15 @@
 //! the network does.
 //!
 //! Then MOQT SETUP, in both directions this time, each carrying the sender's
-//! MOQOM token and proof of possession. Each side hands what it received to the
-//! [`PeerVerifier`], which runs the relay's own checks, and then requires the
-//! token to be for this room, to grant publishing, and to name the participant
-//! the offer came from. A failure closes the connection with the reason, as a
-//! relay would.
+//! current direct ticket naming the other side, as `AUTHORIZATION_TOKEN`, and a
+//! proof of possession over the ticket's bytes, bound to the other side's
+//! certificate, by the key the ticket's `jkt` names. Neither side's MOQOM token
+//! crosses the direct path: the ticket says what a peer needs to know, signed
+//! by the relay, and the token may be sealed. Each side hands what it received
+//! to the [`PeerVerifier`] with its own relay's ticket keys, which runs the
+//! relay's own checks, and then requires the ticket to be for this room, to
+//! grant publishing, and to name the participant the offer came from. A failure
+//! closes the connection with the reason, as a relay would.
 //!
 //! The dialler sends SETUP first and checks the answer last, so it ends the
 //! exchange by opening one empty unidirectional stream: the acceptor's only
@@ -36,9 +40,12 @@ use web_transport_quinn::SendStream;
 
 use super::socket::{DirectSocket, SocketConfig, StunServer};
 use super::verify::admissible;
-use super::{CandidateOffer, Eligibility, IpExposure, PeerCredentials, PeerVerifier, VerifiedPeer};
+use super::{
+    CandidateOffer, DirectTicket, Eligibility, IpExposure, PeerCredentials, PeerVerifier,
+    VerifiedPeer,
+};
 use crate::Error;
-use crate::device::{Credentials, certificate_identity};
+use crate::device::{DeviceKey, certificate_identity};
 use crate::session::{Frames, IMPLEMENTATION, Session, placeholder_url, relay_identity, write};
 
 /// How long the STUN server has to answer while binding.
@@ -50,9 +57,9 @@ const UNAUTHORIZED: u32 = 0x03;
 /// How a direct endpoint behaves.
 #[derive(Debug, Clone)]
 pub struct DirectConfig {
-    /// This side's tenant, which the peer's token must share.
+    /// This side's tenant, which the peer's ticket must share.
     pub tenant: String,
-    /// The room, which the peer's token must admit them to.
+    /// The room, which the peer's ticket must be for.
     pub room: String,
     /// This participant, as `user/device`. Offers are addressed by it.
     pub me: String,
@@ -200,9 +207,12 @@ impl DirectEndpoint {
 
     /// Open a direct, verified MOQT session with the peer that sent `offer`.
     ///
-    /// Both peers call this after exchanging offers. `credentials` are this
-    /// side's, exactly as presented to the relay; the proof is made afresh for
-    /// the peer. Returns the session and who the peer's token says they are.
+    /// Both peers call this after exchanging offers. `ticket` is this side's
+    /// current direct ticket for the offer's sender, from this side's relay;
+    /// it is presented to the peer, and its keys are what the peer's ticket is
+    /// checked against. `key` is the device key this side's token is bound to,
+    /// which proves the ticket, made afresh for the peer. Returns the session
+    /// and who the peer's ticket says they are.
     ///
     /// # Errors
     /// [`Error::Unreachable`] if no path opened within the configured patience,
@@ -212,7 +222,8 @@ impl DirectEndpoint {
     pub async fn establish(
         &self,
         offer: &CandidateOffer,
-        credentials: &Credentials<'_>,
+        ticket: &DirectTicket,
+        key: Option<&DeviceKey>,
         verifier: &dyn PeerVerifier,
     ) -> Result<(Session, VerifiedPeer), Error> {
         if offer.to != self.config.me {
@@ -233,9 +244,9 @@ impl DirectEndpoint {
         let patience = self.config.patience;
         let attempt = async {
             if dialling {
-                self.dial(offer, credentials, verifier).await
+                self.dial(offer, ticket, key, verifier).await
             } else {
-                self.accept(offer, credentials, verifier).await
+                self.accept(offer, ticket, key, verifier).await
             }
         };
         tokio::time::timeout(patience, attempt)
@@ -246,7 +257,8 @@ impl DirectEndpoint {
     async fn dial(
         &self,
         offer: &CandidateOffer,
-        credentials: &Credentials<'_>,
+        ticket: &DirectTicket,
+        key: Option<&DeviceKey>,
         verifier: &dyn PeerVerifier,
     ) -> Result<(Session, VerifiedPeer), Error> {
         // Every candidate at once. Whichever completes first is the path; the
@@ -260,7 +272,7 @@ impl DirectEndpoint {
         let quic = connection.clone();
         let transport = raw(connection);
         let (mut send, recv) = transport.open_bi().await?;
-        write(&mut send, &setup(credentials, &peer_identity)?).await?;
+        write(&mut send, &setup(ticket, key, &peer_identity)?).await?;
 
         let mut frames = Frames::new(recv);
         let Some(frame) = frames.next().await? else {
@@ -273,7 +285,7 @@ impl DirectEndpoint {
             });
         }
         let theirs = decode_setup(&frame.body)?;
-        let peer = self.check(&transport, &theirs, offer, verifier)?;
+        let peer = self.check(&transport, &theirs, offer, ticket, verifier)?;
 
         // The accepting side spoke last, so it cannot know from SETUP alone
         // that its credentials passed here. An empty unidirectional stream says
@@ -295,7 +307,8 @@ impl DirectEndpoint {
     async fn accept(
         &self,
         offer: &CandidateOffer,
-        credentials: &Credentials<'_>,
+        ticket: &DirectTicket,
+        key: Option<&DeviceKey>,
         verifier: &dyn PeerVerifier,
     ) -> Result<(Session, VerifiedPeer), Error> {
         // Anything that is not the pinned peer fails the handshake and is
@@ -316,8 +329,8 @@ impl DirectEndpoint {
             });
         }
         let theirs = decode_setup(&frame.body)?;
-        let peer = self.check(&transport, &theirs, offer, verifier)?;
-        write(&mut send, &setup(credentials, &peer_identity)?).await?;
+        let peer = self.check(&transport, &theirs, offer, ticket, verifier)?;
+        write(&mut send, &setup(ticket, key, &peer_identity)?).await?;
 
         // Not admitted until the dialler says so; a refusal arrives as the
         // connection closing with its reason instead.
@@ -342,18 +355,24 @@ impl DirectEndpoint {
         transport: &moqom_transport::Session,
         theirs: &Setup,
         offer: &CandidateOffer,
+        ours: &DirectTicket,
         verifier: &dyn PeerVerifier,
     ) -> Result<VerifiedPeer, Error> {
         let result = (|| {
-            let token = theirs
+            let ticket = theirs
                 .options
                 .authorization_tokens()
                 .next()
-                .ok_or_else(|| "a direct session needs a MOQOM token".to_owned())?;
+                .ok_or_else(|| "a direct session needs a direct ticket".to_owned())?;
             let presented = PeerCredentials {
-                token,
+                ticket,
                 proof: theirs.options.authorization_proof().map(Bytes::as_ref),
                 local_certificate: &self.identity,
+                ticket_keys: &ours.keys,
+                tenant: &self.config.tenant,
+                room: &self.config.room,
+                holder: &offer.from,
+                me: &self.config.me,
             };
             let peer = verifier.verify(&presented)?;
             admissible(&peer, &self.config.tenant, &self.config.room, &offer.from)?;
@@ -408,8 +427,13 @@ fn raw(connection: quinn::Connection) -> moqom_transport::Session {
     )
 }
 
-/// This side's SETUP: the token, and a proof bound to the peer's certificate.
-fn setup(credentials: &Credentials<'_>, peer_identity: &str) -> Result<Setup, Error> {
+/// This side's SETUP: the ticket, and a proof over it bound to the peer's
+/// certificate.
+fn setup(
+    ticket: &DirectTicket,
+    key: Option<&DeviceKey>,
+    peer_identity: &str,
+) -> Result<Setup, Error> {
     use moqom_proto::control::setup::option_type;
     let mut ours = Setup::new();
     ours.options
@@ -418,11 +442,11 @@ fn setup(credentials: &Credentials<'_>, peer_identity: &str) -> Result<Setup, Er
     ours.options
         .set_bytes(
             option_type::AUTHORIZATION_TOKEN,
-            Bytes::copy_from_slice(credentials.token),
+            Bytes::copy_from_slice(ticket.compact.as_bytes()),
         )
         .map_err(Error::setup)?;
-    if let Some(key) = credentials.key {
-        let proof = key.prove(credentials.token, peer_identity)?;
+    if let Some(key) = key {
+        let proof = key.prove(ticket.compact.as_bytes(), peer_identity)?;
         ours.options
             .set_bytes(option_type::AUTHORIZATION_PROOF, Bytes::from(proof))
             .map_err(Error::setup)?;

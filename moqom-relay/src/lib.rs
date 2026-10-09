@@ -126,7 +126,7 @@ mod generated;
 
 pub use cache::{Cache, Limits};
 pub use fabric::Fabric;
-pub use identity::{Admission, AuthError, Authenticator, VerificationKey};
+pub use identity::{Admission, AuthError, Authenticator, SealKey, VerificationKey};
 pub use link::{Link, Supervisor};
 pub use metrics::Metrics;
 pub use policy::{Ban, Banned, Policy, Rules};

@@ -20,6 +20,18 @@
 //! counters. The alternative — a client library feeding a second forwarding
 //! implementation — would have been two of everything, and the second one would be
 //! the one without the bug fixes.
+//!
+//! # Pools
+//!
+//! A relay in a pool forwards only to relays in the same pool: its parent must
+//! be one, and so must every relay that names it as theirs. The parent enforces
+//! the half that matters. It admits the link like any session, so a link token
+//! naming another pool than the parent's, or naming one at a shared-fleet
+//! parent, is refused (`wrong_pool`), and with it everything the link would
+//! have carried. The edge does not check the other half: its credential may be
+//! sealed and is opaque to it, so there is nothing it could compare, and an
+//! operator who points a pool relay at a shared parent finds out at the first
+//! link rather than when a tenant's media has crossed the line.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -85,7 +97,7 @@ pub struct Parent {
 /// this relay cannot prove would be refused at the parent's door.
 #[derive(Debug, Clone)]
 pub struct Credential {
-    /// The token, exactly as issued.
+    /// The token, exactly as issued. Never decoded here: it may be sealed.
     pub token: String,
     /// The key its `cnf` names.
     pub key: Arc<DeviceKey>,

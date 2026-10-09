@@ -26,6 +26,9 @@ tracing = { workspace = true }
 workspace = true
 
 [dev-dependencies]
+# Adds the negotiated key exchange group to quinn's handshake data, which is how
+# `tests/key_exchange.rs` reads it.
+quinn-proto = { workspace = true, features = ["__rustls-post-quantum-test"] }
 rcgen = { workspace = true }
 # Reading the type-of-service byte off a received datagram, which is the only place the codepoint
 # is observable. See `tests/marking.rs`.

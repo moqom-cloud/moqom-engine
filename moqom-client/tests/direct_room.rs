@@ -24,11 +24,11 @@ use moqom_client::direct::{
 use moqom_client::{
     Announcement, Credentials, DeviceKey, FullTrackName, OutgoingObject, Session, TrackNamespace,
 };
-use moqom_relay::direct::PeerCheck;
+use moqom_relay::direct::{PeerCheck, Presented};
 use moqom_relay::fabric::Ticketing;
 use moqom_relay::metrics::Gauges;
 use moqom_relay::possession::{Enforcement, Possession};
-use moqom_relay::ticket::TicketKeys;
+use moqom_relay::ticket::{Expected, TicketKeys};
 use moqom_relay::{Authenticator, Cache, Fabric, Limits, Metrics, Session as RelaySession};
 use moqom_token::{Claims, Confirmation, Grant, Signer};
 use moqom_transport::{Server, server::with_moqt_alpn};
@@ -88,10 +88,23 @@ fn token(user: &str, key: &DeviceKey, backstage: bool) -> Vec<u8> {
 }
 
 /// The relay's check, against whichever certificate this attempt's endpoint
-/// presented.
+/// presented and the ticket keys from this side's relay session.
 fn verify(presented: &PeerCredentials<'_>) -> Result<VerifiedPeer, String> {
-    PeerCheck::new(authenticator(), presented.local_certificate)
-        .check(presented.token, presented.proof, SystemTime::now())
+    PeerCheck::new(presented.local_certificate)
+        .check(
+            Presented {
+                ticket: presented.ticket,
+                proof: presented.proof,
+                keys: presented.ticket_keys,
+                expected: Expected {
+                    tenant: presented.tenant,
+                    room: presented.room,
+                    holder: presented.holder,
+                    peer: presented.me,
+                },
+            },
+            SystemTime::now(),
+        )
         .map(|peer| VerifiedPeer {
             tenant: peer.tenant.to_string(),
             user: peer.user.to_string(),
@@ -522,7 +535,10 @@ async fn backstage_stays_on_the_relay() {
     dan.sees(&[&cat]);
 
     let backstage = |state: Option<&PathState>| {
-        state == Some(&PathState::Relay(Fallback::Ineligible(Ineligible::Backstage)))
+        state
+            == Some(&PathState::Relay(Fallback::Ineligible(
+                Ineligible::Backstage,
+            )))
     };
     ada.until(&bob, "backstage to be refused", backstage).await;
     bob.until(&ada, "backstage to be refused", backstage).await;

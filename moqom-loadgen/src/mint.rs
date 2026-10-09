@@ -161,7 +161,7 @@ impl Identity {
     }
 
     fn new(tenant: &str, room: &str, user: &str) -> Self {
-        let key = DeviceKey::from_pkcs8(&Self::pkcs8(user)).expect("a P-256 scalar");
+        let key = Self::key(user);
         Self {
             tenant: tenant.to_owned(),
             user: user.to_owned(),
@@ -171,25 +171,21 @@ impl Identity {
         }
     }
 
-    /// The PKCS#8 P-256 private key for `user`, its scalar a hash of the name.
-    ///
-    /// A hash falls outside the curve's order with probability about 2^-32, and
-    /// the names used here are fixed, so the tests would catch the one that did.
-    #[must_use]
-    pub fn pkcs8(user: &str) -> Vec<u8> {
-        // PrivateKeyInfo { v1, id-ecPublicKey/prime256v1, ECPrivateKey { v1, d } },
-        // up to the 32 bytes of d.
-        const PREFIX: [u8; 35] = [
-            0x30, 0x41, 0x02, 0x01, 0x00, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d,
-            0x02, 0x01, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x04, 0x27,
-            0x30, 0x25, 0x02, 0x01, 0x01, 0x04, 0x20,
-        ];
+    /// The ML-DSA-65 key for `user`, its seed a hash of the name, so a run and
+    /// the relay it targets agree on every device without exchanging keys.
+    fn key(user: &str) -> DeviceKey {
         let mut seed = b"moqom-loadgen device key ".to_vec();
         seed.extend_from_slice(user.as_bytes());
-        let scalar = digest::digest(&digest::SHA256, &seed);
-        let mut der = PREFIX.to_vec();
-        der.extend_from_slice(scalar.as_ref());
-        der
+        DeviceKey::from_seed(digest::digest(&digest::SHA256, &seed).as_ref())
+            .expect("a SHA-256 digest is a 32-byte seed")
+    }
+
+    /// The PKCS#8 ML-DSA-65 private key for `user`, the one [`Self::key`] makes.
+    #[must_use]
+    pub fn pkcs8(user: &str) -> Vec<u8> {
+        Self::key(user)
+            .to_pkcs8()
+            .expect("an ML-DSA-65 key serialises")
     }
 
     /// The device field a namespace of this identity's carries.

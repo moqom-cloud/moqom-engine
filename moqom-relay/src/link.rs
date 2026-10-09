@@ -43,7 +43,7 @@ use crate::fabric::Fabric;
 use crate::generated::admin::v1 as admin;
 use crate::generated::relay::v1 as pb;
 use crate::geo;
-use crate::identity::VerificationKey;
+use crate::identity::{SealKey, VerificationKey};
 use crate::media;
 use crate::policy::{self, Banned, Rules};
 use crate::roster::{Departure, Note, Presence};
@@ -291,6 +291,32 @@ async fn serve(supervisor: Supervisor, fabric: Fabric, mut notes: mpsc::Unbounde
     }
 }
 
+/// Hold the control link to ML-KEM-1024, as every link is.
+///
+/// tonic builds its client configuration from the process's default provider
+/// and accepts no other, so that default is what decides the link's key
+/// exchange. Installed here if nothing is yet; a default an embedder installed
+/// that offers anything else refuses the link rather than dialling the control
+/// plane on a weaker group.
+fn link_key_exchange() -> Result<(), tonic::Status> {
+    let _ = moqom_transport::key_exchange::link_provider().install_default();
+    let offered: Vec<_> = rustls::crypto::CryptoProvider::get_default()
+        .map(|provider| {
+            provider
+                .kx_groups
+                .iter()
+                .map(|group| group.name())
+                .collect()
+        })
+        .unwrap_or_default();
+    if offered != moqom_transport::key_exchange::LINK_GROUPS {
+        return Err(tonic::Status::failed_precondition(format!(
+            "the process TLS provider offers {offered:?}; the control link offers ML-KEM-1024 only"
+        )));
+    }
+    Ok(())
+}
+
 /// Open a channel to the control plane, over TLS where it is configured.
 async fn dial(supervisor: &Supervisor) -> Result<tonic::transport::Channel, tonic::Status> {
     let mut endpoint = tonic::transport::Endpoint::from_shared(supervisor.endpoint.clone())
@@ -301,6 +327,7 @@ async fn dial(supervisor: &Supervisor) -> Result<tonic::transport::Channel, toni
         .keep_alive_timeout(Duration::from_secs(20));
 
     if let Some(tls) = &supervisor.tls {
+        link_key_exchange()?;
         let (certificate, key) = &tls.identity;
         endpoint = endpoint
             .tls_config(
@@ -553,9 +580,20 @@ fn react(
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 ticker
             });
+            // Every Welcome, not just the first: a relay the control plane moves
+            // between pools learns it on its next connection.
+            if fabric.authenticator().join_pool(&welcome.pool) {
+                tracing::error!(
+                    configured = %fabric.authenticator().pool(),
+                    welcome = %welcome.pool,
+                    "MOQOM_RELAY_POOL and the control plane name different relay pools; \
+                     refusing every session until they agree"
+                );
+            }
             tracing::info!(
                 grace_s = grace.as_secs(),
                 snapshot_s = interval.map_or(0, |d| d.as_secs()),
+                pool = %welcome.pool,
                 "control plane accepted this relay"
             );
             None
@@ -576,7 +614,8 @@ fn react(
     }
 }
 
-/// Take the verification keys the control plane published.
+/// Take the verification keys the control plane published, and the seal keys
+/// with them.
 ///
 /// This is how a deployed relay comes to have keys at all. Distributing a JWK
 /// set to every machine out of band is a second copy of something the control
@@ -590,6 +629,13 @@ fn react(
 /// the same standard. A malformed set is rejected whole: taking the keys that
 /// happened to parse would mean a rotation could half-apply, and half of a key
 /// set is a relay that refuses an unpredictable subset of its sessions.
+///
+/// The seal keys are held to the same rule and taken in the same step, so a
+/// push that rotates both never leaves a moment with one new and one old; a
+/// seal key that is not an 8-byte ID and a 32-byte secret rejects the push
+/// along with every signing key in it. `require_sealed` arrives with them, so
+/// the end of the rollover is the control plane's to call and reaches every
+/// relay on its next push.
 fn adopt(fabric: &Fabric, keys: &pb::VerificationKeys) {
     let documents: Vec<&str> = keys
         .keys
@@ -613,9 +659,23 @@ fn adopt(fabric: &Fabric, keys: &pb::VerificationKeys) {
             return;
         }
     };
+    let seal = match keys
+        .seal_keys
+        .iter()
+        .map(|key| SealKey::new(&key.key_id, &key.secret))
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(seal) => seal,
+        Err(e) => {
+            tracing::error!(error = %e, "control plane pushed seal keys this relay cannot read");
+            return;
+        }
+    };
 
     let verifying = fabric.authenticator().is_verifying();
-    let total = fabric.authenticator().accept(parsed);
+    let (total, sealing) = fabric
+        .authenticator()
+        .accept_pushed(parsed, seal, keys.require_sealed);
 
     // At info, and worth the line: this is the moment a relay's answer to "may
     // this session publish" changes, and the transition from verifying nothing
@@ -624,6 +684,8 @@ fn adopt(fabric: &Fabric, keys: &pb::VerificationKeys) {
     tracing::info!(
         pushed = documents.len(),
         verifying = total,
+        seal_keys = sealing,
+        require_sealed = keys.require_sealed,
         first = !verifying,
         "took the control plane's verification keys"
     );
@@ -686,7 +748,10 @@ fn apply(fabric: &Fabric, snapshot: &pb::RoomSnapshot) {
             ceiling: snapshot.max_participants,
             mutes,
             grants,
-            relay_only: snapshot.direct.as_ref().is_some_and(|direct| !direct.allowed),
+            relay_only: snapshot
+                .direct
+                .as_ref()
+                .is_some_and(|direct| !direct.allowed),
         },
     );
 
@@ -1291,6 +1356,7 @@ mod tests {
                         nanos: 0,
                     }),
                     snapshot_interval: None,
+                    pool: String::new(),
                 })),
             };
 
@@ -1771,6 +1837,7 @@ mod tests {
                         not_before: None,
                         retires_at: None,
                     }],
+                    ..Default::default()
                 },
             )),
         });
@@ -1811,6 +1878,7 @@ mod tests {
                         not_before: None,
                         retires_at: None,
                     }],
+                    ..Default::default()
                 },
             )),
         });
@@ -1835,6 +1903,133 @@ mod tests {
             !fabric.authenticator().is_verifying(),
             "a key set that cannot be parsed must not half-apply"
         );
+    }
+
+    fn pushed_keys(seal_keys: Vec<pb::SealKey>, require_sealed: bool) -> pb::ControlMessage {
+        pb::ControlMessage {
+            body: Some(pb::control_message::Body::VerificationKeys(
+                pb::VerificationKeys {
+                    keys: vec![admin::VerificationKey {
+                        key_id: "k1".to_owned(),
+                        algorithm: "EdDSA".to_owned(),
+                        jwk: r#"{"kty":"OKP","crv":"Ed25519","kid":"k1","x":"11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"}"#
+                            .to_owned(),
+                        not_before: None,
+                        retires_at: None,
+                    }],
+                    seal_keys,
+                    require_sealed,
+                },
+            )),
+        }
+    }
+
+    #[tokio::test]
+    async fn seal_keys_arrive_with_the_verification_keys() {
+        let control = FakeControl::default();
+        control.will_say(pushed_keys(
+            vec![pb::SealKey {
+                key_id: vec![1; 8],
+                secret: vec![2; 32],
+            }],
+            true,
+        ));
+        let serving = control.start().await;
+        let fabric = Fabric::new().authenticated(crate::Authenticator::new(
+            "https://api.moqom.cloud",
+            Vec::new(),
+        ));
+        let _link = Link::attach(supervisor(serving.endpoint()), fabric.clone());
+
+        until("the pushed keys to reach the authenticator", || {
+            fabric.authenticator().is_verifying()
+        })
+        .await;
+        assert!(format!("{:?}", fabric.authenticator()).contains("seal_keys: 1"));
+    }
+
+    #[tokio::test]
+    async fn a_seal_key_that_cannot_be_read_rejects_the_whole_push() {
+        let control = FakeControl::default();
+        control.will_say(pushed_keys(
+            vec![pb::SealKey {
+                key_id: vec![1; 3],
+                secret: vec![2; 32],
+            }],
+            true,
+        ));
+        let serving = control.start().await;
+        let fabric = Fabric::new().authenticated(crate::Authenticator::new(
+            "https://api.moqom.cloud",
+            Vec::new(),
+        ));
+        let _link = Link::attach(supervisor(serving.endpoint()), fabric.clone());
+        control
+            .hears("the hello", |message| {
+                matches!(message.body, Some(pb::relay_message::Body::Hello(_)))
+            })
+            .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert!(
+            !fabric.authenticator().is_verifying(),
+            "the signing keys beside a bad seal key must not apply either"
+        );
+    }
+
+    fn welcome(pool: &str) -> pb::ControlMessage {
+        pb::ControlMessage {
+            body: Some(pb::control_message::Body::Welcome(pb::Welcome {
+                pool: pool.to_owned(),
+                ..Default::default()
+            })),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_welcome_names_the_pool_this_relay_serves() {
+        let control = FakeControl::default();
+        control.will_say(welcome("acme-eu"));
+        let serving = control.start().await;
+        let fabric = Fabric::new().authenticated(crate::Authenticator::new(
+            "https://api.moqom.cloud",
+            Vec::new(),
+        ));
+        assert_eq!(fabric.authenticator().pool(), "");
+        let _link = Link::attach(supervisor(serving.endpoint()), fabric.clone());
+
+        until("the pool to reach the authenticator", || {
+            fabric.authenticator().pool() == "acme-eu"
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_welcome_naming_another_pool_than_configured_refuses_every_session() {
+        let control = FakeControl::default();
+        control.will_say(welcome("globex"));
+        let serving = control.start().await;
+        let fabric = Fabric::new().authenticated(
+            crate::Authenticator::new("https://api.moqom.cloud", Vec::new())
+                .pinned_to_pool("acme-eu"),
+        );
+        let address = std::net::IpAddr::from([198, 51, 100, 4]);
+        assert!(
+            fabric
+                .authenticator()
+                .identify([], address, SystemTime::now())
+                .is_ok()
+        );
+        let _link = Link::attach(supervisor(serving.endpoint()), fabric.clone());
+
+        until("the conflict to close the relay", || {
+            fabric
+                .authenticator()
+                .identify([], address, SystemTime::now())
+                == Err(crate::identity::AuthError::PoolConflict)
+        })
+        .await;
+        assert_eq!(fabric.authenticator().pool(), "acme-eu");
     }
 
     #[tokio::test]

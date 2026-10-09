@@ -383,6 +383,90 @@ pub fn rfc3339(seconds: u64) -> String {
     )
 }
 
+/// An RFC 3339 timestamp as a time, or `None` for anything else.
+///
+/// What Go's `time.Time` marshals to: fractional seconds of any length, and `Z`
+/// or a numeric offset. Fractions are kept to the nanosecond.
+#[must_use]
+pub fn parse_rfc3339(text: &str) -> Option<SystemTime> {
+    let bytes = text.as_bytes();
+    let digits = |from: usize, len: usize| -> Option<u64> {
+        let part = text.get(from..from + len)?;
+        part.bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| part.parse().ok())
+            .flatten()
+    };
+    if bytes.len() < 20 || bytes[4] != b'-' || bytes[7] != b'-' || bytes[13] != b':' {
+        return None;
+    }
+    if !matches!(bytes[10], b'T' | b't') || bytes[16] != b':' {
+        return None;
+    }
+    let (year, month, day) = (digits(0, 4)?, digits(5, 2)?, digits(8, 2)?);
+    let (hour, minute, second) = (digits(11, 2)?, digits(14, 2)?, digits(17, 2)?);
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || minute > 59 {
+        return None;
+    }
+    if second > 60 {
+        return None;
+    }
+
+    let mut at = 19;
+    let mut nanos = 0u32;
+    if bytes.get(at) == Some(&b'.') {
+        let start = at + 1;
+        let mut end = start;
+        while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+            end += 1;
+        }
+        if end == start {
+            return None;
+        }
+        let kept = &text[start..end.min(start + 9)];
+        nanos = kept.parse::<u32>().ok()? * 10u32.pow(9 - u32::try_from(kept.len()).ok()?);
+        at = end;
+    }
+    let offset: i64 = match &text[at..] {
+        "Z" | "z" => 0,
+        zone if zone.len() == 6 && zone.as_bytes()[3] == b':' => {
+            let sign = match zone.as_bytes()[0] {
+                b'+' => 1,
+                b'-' => -1,
+                _ => return None,
+            };
+            let (hours, minutes) = (digits(at + 1, 2)?, digits(at + 4, 2)?);
+            if hours > 23 || minutes > 59 {
+                return None;
+            }
+            sign * i64::try_from(hours * 3600 + minutes * 60).ok()?
+        }
+        _ => return None,
+    };
+
+    let days = days_from_civil(year, month, day)?;
+    let local = days.checked_mul(86_400)? + hour * 3600 + minute * 60 + second;
+    let utc = i64::try_from(local).ok()?.checked_sub(offset)?;
+    let utc = u64::try_from(utc).ok()?;
+    Some(UNIX_EPOCH + Duration::new(utc, nanos))
+}
+
+/// Days from 1970-01-01 to the given proleptic Gregorian date, after Howard
+/// Hinnant's `days_from_civil`; `None` before the epoch.
+fn days_from_civil(year: u64, month: u64, day: u64) -> Option<u64> {
+    let year = if month <= 2 {
+        year.checked_sub(1)?
+    } else {
+        year
+    };
+    let era = year / 400;
+    let of_era = year - era * 400;
+    let shifted = if month > 2 { month - 3 } else { month + 9 };
+    let of_year = (153 * shifted + 2) / 5 + day - 1;
+    let of_era_days = of_era * 365 + of_era / 4 - of_era / 100 + of_year;
+    (era * 146_097 + of_era_days).checked_sub(719_468)
+}
+
 /// The proleptic Gregorian date `days` after 1970-01-01, after Howard Hinnant's
 /// `civil_from_days`, specialised to dates on or after the epoch.
 const fn civil(days: u64) -> (u64, u64, u64) {
@@ -1359,6 +1443,42 @@ mod tests {
         assert_eq!(rfc3339(951_782_400), "2000-02-29T00:00:00Z");
         assert_eq!(rfc3339(1_791_278_100), "2026-10-06T09:15:00Z");
         assert_eq!(rfc3339(4_102_444_799), "2099-12-31T23:59:59Z");
+    }
+
+    #[test]
+    fn what_go_writes_is_read_back() {
+        let at = |seconds, nanos| Some(UNIX_EPOCH + Duration::new(seconds, nanos));
+        for seconds in [0, 951_782_400, 1_791_278_100, 4_102_444_799] {
+            assert_eq!(parse_rfc3339(&rfc3339(seconds)), at(seconds, 0));
+        }
+        assert_eq!(
+            parse_rfc3339("2026-10-06T09:15:00.123456789Z"),
+            at(1_791_278_100, 123_456_789)
+        );
+        assert_eq!(
+            parse_rfc3339("2026-10-06T09:15:00.5Z"),
+            at(1_791_278_100, 500_000_000)
+        );
+        assert_eq!(
+            parse_rfc3339("2026-10-06T11:15:00+02:00"),
+            at(1_791_278_100, 0)
+        );
+        assert_eq!(
+            parse_rfc3339("2026-10-06T04:15:00-05:00"),
+            at(1_791_278_100, 0)
+        );
+        for rubbish in [
+            "",
+            "2026-10-06",
+            "2026-10-06T09:15:00",
+            "2026-13-06T09:15:00Z",
+            "2026-10-06T09:15:00.Z",
+            "2026-10-06T09:15:00+0200",
+            "1969-12-31T23:59:59Z",
+            "２０２6-10-06T09:15:00Z",
+        ] {
+            assert_eq!(parse_rfc3339(rubbish), None, "{rubbish}");
+        }
     }
 
     #[test]

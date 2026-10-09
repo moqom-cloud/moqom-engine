@@ -10,6 +10,12 @@
 //! does not verify or runs out. An app that drops its relay session therefore
 //! loses its direct path as well.
 //!
+//! The first ticket is also the credential each side is admitted on: the
+//! direct SETUP carries it, with a proof of possession over it, in place of the
+//! MOQOM token (see [`super::DirectEndpoint`]). That is why it carries the
+//! holder's key thumbprint (`jkt`) and publish bits (`pub`) as well as who it
+//! is: they are what a peer would otherwise have read off the token.
+//!
 //! A ticket is checked as a token is, a compact JWS by `kid`, against the
 //! ticket keys each side takes from its own relay's ticket objects. A key the
 //! peer handed over would prove nothing. The check is the relay's
@@ -130,6 +136,8 @@ pub fn verify_ticket(
         typ: String,
         kid: String,
     }
+    // `jkt` and `pub` are the setup check's, which the relay's verifier does;
+    // a ticket later in the path is judged on who it names and when it lapses.
     #[derive(Deserialize)]
     struct Claims {
         ten: String,
@@ -243,12 +251,16 @@ fn direct_track(tenant: &str, room: &str, holder: &str, peer: &str) -> Option<Fu
 /// Present this side's tickets to the peer on `direct` and hold the peer to
 /// its own, until a ticket of the peer's is refused.
 ///
+/// `first` is the ticket this side was admitted on, read off `tickets` before
+/// the path was established; later ones follow on `tickets`.
+///
 /// Runs until it returns the refusal; the caller ends the direct path with it.
 /// Dropped, it stops presenting and checking, and drops `tickets`, which is
 /// what stops the relay metering.
 pub(crate) async fn guard(
     direct: Session,
     mut tickets: Subscription,
+    first: DirectTicket,
     peer: VerifiedPeer,
     me: String,
     settings: TicketSettings,
@@ -286,7 +298,7 @@ pub(crate) async fn guard(
         }
     });
 
-    let mut current: Option<DirectTicket> = None;
+    let mut current: Option<DirectTicket> = Some(first);
     let mut pending: Option<Bytes> = None;
     let mut peer_expires: Option<SystemTime> = None;
     let mut deadline = Instant::now() + settings.grace;

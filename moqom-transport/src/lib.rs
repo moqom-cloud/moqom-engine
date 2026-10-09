@@ -40,6 +40,7 @@
 /// not a trait.
 pub type Session = web_transport_quinn::Session;
 
+pub mod key_exchange;
 pub mod liveness;
 pub mod server;
 

@@ -38,12 +38,41 @@
 //! The `cnf.jkt` thumbprint names the device the token was issued to, and
 //! [`crate::possession`] turns naming into proving: every session shows a
 //! signature from that device, so a copied token is worth nothing.
+//!
+//! # Sealed tokens
+//!
+//! A token may arrive sealed: the JWS encrypted under an AES-256-GCM key the
+//! issuer shares with its relays and nobody else, so its claims are opaque to
+//! the holder and to everything the holder hands it to. The relay opens it
+//! with its seal keys and verifies what is inside exactly as it would the bare
+//! JWS. Seal keys come from `MOQOM_RELAY_SEAL_KEYS` and from the control plane,
+//! which rotates them alongside the signing keys and says when tokens that are
+//! not sealed stop being accepted. A proof of possession commits to the token
+//! as presented, sealed bytes and all, and is checked against those bytes: the
+//! holder never sees the JWS, so it could not have proved anything over it.
+//!
+//! Nothing on this side of the relay reads a token's claims any more. A
+//! participant learns what it may do from the response that handed it the
+//! token, a direct peer from the relay's ticket (see [`crate::ticket`]), and an
+//! edge when its link credential lapses from the mint response (see
+//! [`crate::edge`]).
+//!
+//! # Relay pools
+//!
+//! A private tenant's tokens name the relay pool they are confined to, and a
+//! relay admits only tokens naming its own: a pool's relay refuses everybody
+//! else's, and a relay in the shared fleet, whose pool is empty, refuses every
+//! token that names one (`wrong_pool`). The pool is the control plane's
+//! `Welcome` and, for a relay with no control plane or one an operator wants
+//! held to a pool, `MOQOM_RELAY_POOL`; the two disagreeing refuses every
+//! session (`pool_conflict`) rather than guessing. Until a `Welcome` arrives a
+//! linked relay serves the configured pool, or the shared fleet.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub use moqom_token::{Algorithm as KeyAlgorithm, PublicKey as VerificationKey};
+pub use moqom_token::{Algorithm as KeyAlgorithm, PublicKey as VerificationKey, SealKey};
 
 use crate::possession::Possession;
 use crate::quota::Principal;
@@ -96,6 +125,17 @@ pub enum AuthError {
     /// says this.
     #[error("token is for another tenant")]
     WrongTenant,
+    /// Verified, but for another relay pool. A shared relay says this of a
+    /// token that names any pool, and a pool's relay of every token that does
+    /// not name its own: a private tenant's sessions never land on the shared
+    /// fleet, and nobody else's land on theirs.
+    #[error("token is for another relay pool")]
+    WrongPool,
+    /// This relay has been told two different pools, by its operator and by
+    /// the control plane, and serves nobody until they agree. Guessing which
+    /// is right would put one tenant's sessions on the other's machines.
+    #[error("this relay's pool is misconfigured")]
+    PoolConflict,
     /// Verified, but does not name a tenant, user, and device.
     #[error("token does not name a complete identity")]
     Incomplete,
@@ -131,7 +171,9 @@ impl AuthError {
             | Self::BadSignature
             | Self::WrongIssuer
             | Self::WrongTenant
+            | Self::WrongPool
             | Self::Unproven(_) => Code::UNAUTHORIZED,
+            Self::PoolConflict => Code::INTERNAL_ERROR,
         }
     }
 
@@ -148,6 +190,8 @@ impl AuthError {
             Self::Lifetime => "lifetime",
             Self::WrongIssuer => "wrong_issuer",
             Self::WrongTenant => "wrong_tenant",
+            Self::WrongPool => "wrong_pool",
+            Self::PoolConflict => "pool_conflict",
             Self::Incomplete => "incomplete",
             Self::Unproven(e) => e.name(),
         }
@@ -167,6 +211,7 @@ impl From<moqom_token::Error> for AuthError {
             Error::Lifetime => Self::Lifetime,
             Error::WrongIssuer => Self::WrongIssuer,
             Error::WrongTenant => Self::WrongTenant,
+            Error::WrongPool => Self::WrongPool,
             Error::Incomplete => Self::Incomplete,
             // `cnf.jkt` is not a SHA-256 thumbprint, so no proof can match it.
             Error::Thumbprint => Self::Malformed("thumbprint"),
@@ -194,7 +239,10 @@ impl From<moqom_token::Error> for AuthError {
 /// So the effective set is the union, recomputed when a push arrives, and a
 /// push cannot remove what the operator configured. Sessions read it through a
 /// lock rather than holding a copy, because a rotation has to reach the
-/// sessions that already exist and not only the next one.
+/// sessions that already exist and not only the next one. Seal keys are held
+/// the same way, as the operator's and the latest push's; so is the pool,
+/// though a change of pool reaches only the next admission and a renewal,
+/// not a session already admitted.
 ///
 /// The push is trusted exactly as far as the link it arrives on, and that link
 /// authenticates the relay to the control plane and not the other way around.
@@ -214,36 +262,77 @@ struct Shared {
     effective: RwLock<Arc<Keys>>,
 }
 
-struct Keys {
+/// Everything a verifier is built from, kept so that one change can rebuild it
+/// without losing the others.
+#[derive(Clone, Default)]
+struct Settings {
     issuer: String,
     /// The one tenant this relay serves, or empty for any.
     tenant: String,
+    /// The relay pool this relay serves, empty for the shared fleet.
+    pool: String,
+    /// The pool the operator wrote down, which the control plane must agree
+    /// with. `None` follows whatever the control plane says.
+    pinned_pool: Option<String>,
+    /// The control plane named a pool other than [`Self::pinned_pool`].
+    conflict: bool,
     by_id: HashMap<String, VerificationKey>,
+    /// Seal keys from the operator, which a push cannot withdraw.
+    configured_seal: Vec<SealKey>,
+    /// Seal keys from the most recent push, replaced whole by the next.
+    pushed_seal: Vec<SealKey>,
+    /// Refuse a token that is not sealed, once there are keys to open one with.
+    require_sealed: bool,
+}
+
+struct Keys {
+    settings: Settings,
     verifier: moqom_token::Verifier,
 }
 
 impl Keys {
-    fn new(issuer: String, tenant: String, by_id: HashMap<String, VerificationKey>) -> Self {
-        let verifier = moqom_token::Verifier::new(issuer.as_str(), by_id.values().cloned())
-            .for_tenant(tenant.as_str());
-        Self {
-            issuer,
-            tenant,
-            by_id,
-            verifier,
+    fn new(settings: Settings) -> Self {
+        let mut verifier =
+            moqom_token::Verifier::new(settings.issuer.as_str(), settings.by_id.values().cloned())
+                .for_tenant(settings.tenant.as_str())
+                .for_pool(settings.pool.as_str());
+        let seal = settings.seal_keys();
+        if !seal.is_empty() {
+            verifier = verifier.with_seal_keys(seal);
+            if !settings.require_sealed {
+                verifier = verifier.accepting_unsealed();
+            }
         }
+        Self { settings, verifier }
+    }
+}
+
+impl Settings {
+    /// The operator's seal keys, then the pushed ones whose ID the operator's
+    /// do not already use: a sealed token names its key by ID, and two secrets
+    /// under one ID would open it with whichever happened to be first.
+    fn seal_keys(&self) -> Vec<SealKey> {
+        let mut keys = self.configured_seal.clone();
+        for key in &self.pushed_seal {
+            if !keys.iter().any(|held| held.id() == key.id()) {
+                keys.push(key.clone());
+            }
+        }
+        keys
     }
 }
 
 impl std::fmt::Debug for Authenticator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let keys = self.keys();
-        if keys.by_id.is_empty() {
+        if keys.settings.by_id.is_empty() {
             return f.write_str("Authenticator(no keys)");
         }
         f.debug_struct("Authenticator")
-            .field("issuer", &keys.issuer)
-            .field("keys", &keys.by_id.len())
+            .field("issuer", &keys.settings.issuer)
+            .field("keys", &keys.settings.by_id.len())
+            .field("seal_keys", &keys.verifier.seal_keys().len())
+            .field("pool", &keys.settings.pool)
             .finish()
     }
 }
@@ -258,16 +347,19 @@ impl Authenticator {
     /// An empty `keys` is not the same as [`Self::disabled`] even though it
     /// verifies nothing yet: it remembers the issuer, so keys arriving later
     /// from the control plane are checked against the right one.
+    ///
+    /// It serves the shared fleet, refusing every token that names a pool,
+    /// until [`Self::pinned_to_pool`] or [`Self::join_pool`] says otherwise.
     #[must_use]
     pub fn new(issuer: impl Into<String>, keys: Vec<VerificationKey>) -> Self {
         let configured: HashMap<_, _> = keys.into_iter().map(|key| (key.id.clone(), key)).collect();
         Self {
             inner: Arc::new(Shared {
-                effective: RwLock::new(Arc::new(Keys::new(
-                    issuer.into(),
-                    String::new(),
-                    configured.clone(),
-                ))),
+                effective: RwLock::new(Arc::new(Keys::new(Settings {
+                    issuer: issuer.into(),
+                    by_id: configured.clone(),
+                    ..Settings::default()
+                }))),
                 configured,
             }),
         }
@@ -288,19 +380,37 @@ impl Authenticator {
     ) -> Self {
         let authenticator = Self::new(issuer, keys);
         let tenant = tenant.into();
-        {
-            let mut effective = authenticator
-                .inner
-                .effective
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            *effective = Arc::new(Keys::new(
-                effective.issuer.clone(),
-                tenant,
-                effective.by_id.clone(),
-            ));
-        }
+        authenticator.update(|settings| settings.tenant = tenant);
         authenticator
+    }
+
+    /// The same, also opening tokens sealed under `keys`.
+    ///
+    /// The operator's half, from `MOQOM_RELAY_SEAL_KEYS`: kept through every
+    /// push, as the verification keys are. Tokens that are not sealed are still
+    /// accepted unless the control plane says otherwise, since a relay given
+    /// seal keys by hand has nobody else to tell it the rollover is over.
+    #[must_use]
+    pub fn with_seal_keys(self, keys: Vec<SealKey>) -> Self {
+        self.update(|settings| settings.configured_seal = keys);
+        self
+    }
+
+    /// The same, serving relay pool `pool` and holding the control plane to it.
+    ///
+    /// The operator's pin, from `MOQOM_RELAY_POOL`. It is the pool from the
+    /// first session, which is what an unlinked relay has and what a linked
+    /// one serves until its `Welcome` arrives. A `Welcome` naming another
+    /// pool is a misconfiguration this relay will not guess its way out of:
+    /// see [`Self::join_pool`].
+    #[must_use]
+    pub fn pinned_to_pool(self, pool: impl Into<String>) -> Self {
+        let pool = pool.into();
+        self.update(|settings| {
+            settings.pool.clone_from(&pool);
+            settings.pinned_pool = Some(pool);
+        });
+        self
     }
 
     /// An authenticator with no keys, which verifies nothing.
@@ -328,18 +438,77 @@ impl Authenticator {
         let mut by_id = self.inner.configured.clone();
         by_id.extend(pushed.into_iter().map(|key| (key.id.clone(), key)));
         let count = by_id.len();
+        self.update(|settings| settings.by_id = by_id);
+        count
+    }
 
+    /// Take the keys the control plane published, seal keys with them, in one
+    /// step.
+    ///
+    /// One step because the two rotate together: a push that changed the
+    /// signing keys and then, a moment later, the seal keys would have a window
+    /// in which a token minted under the new pair opened and failed, or the
+    /// other way round. Both sets are replaced whole, each as [`Self::accept`]
+    /// replaces its own, and the operator's half of each stays.
+    ///
+    /// `require_sealed` refuses tokens that are not sealed. It means nothing
+    /// until there is a seal key to open one with, since otherwise it would
+    /// refuse every token there is.
+    ///
+    /// Returns how many verification keys and how many seal keys now apply.
+    #[must_use]
+    pub fn accept_pushed(
+        &self,
+        pushed: Vec<VerificationKey>,
+        seal: Vec<SealKey>,
+        require_sealed: bool,
+    ) -> (usize, usize) {
+        let mut by_id = self.inner.configured.clone();
+        by_id.extend(pushed.into_iter().map(|key| (key.id.clone(), key)));
+        let keys = self.update(|settings| {
+            settings.by_id = by_id;
+            settings.pushed_seal = seal;
+            settings.require_sealed = require_sealed;
+        });
+        (keys.settings.by_id.len(), keys.verifier.seal_keys().len())
+    }
+
+    /// Serve the relay pool the control plane's `Welcome` named, empty for the
+    /// shared fleet.
+    ///
+    /// A relay the operator pinned to a pool ([`Self::pinned_to_pool`]) and the
+    /// control plane then placed in another serves nobody until they agree: a
+    /// pool is a tenant's promise that its sessions share machines with nobody
+    /// else's, and either guess would break it for somebody. The next `Welcome`
+    /// that agrees ends it.
+    ///
+    /// Returns whether the two now disagree.
+    #[must_use]
+    pub fn join_pool(&self, pool: &str) -> bool {
+        let keys = self.update(|settings| match &settings.pinned_pool {
+            Some(pinned) => settings.conflict = pinned != pool,
+            None => pool.clone_into(&mut settings.pool),
+        });
+        keys.settings.conflict
+    }
+
+    /// The relay pool this relay serves, empty for the shared fleet.
+    #[must_use]
+    pub fn pool(&self) -> String {
+        self.keys().settings.pool.clone()
+    }
+
+    /// Rebuild the verifier with one thing changed, for every session at once.
+    fn update(&self, change: impl FnOnce(&mut Settings)) -> Arc<Keys> {
         let mut effective = self
             .inner
             .effective
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *effective = Arc::new(Keys::new(
-            effective.issuer.clone(),
-            effective.tenant.clone(),
-            by_id,
-        ));
-        count
+        let mut settings = effective.settings.clone();
+        change(&mut settings);
+        *effective = Arc::new(Keys::new(settings));
+        Arc::clone(&effective)
     }
 
     /// The set in force right now.
@@ -356,7 +525,7 @@ impl Authenticator {
     /// Whether tokens are checked at all.
     #[must_use]
     pub fn is_verifying(&self) -> bool {
-        !self.keys().by_id.is_empty()
+        !self.keys().settings.by_id.is_empty()
     }
 
     /// Whether this relay checks credentials at all.
@@ -435,7 +604,12 @@ impl Authenticator {
         now: SystemTime,
     ) -> Result<Admission, AuthError> {
         let keys = self.keys();
-        if keys.by_id.is_empty() {
+        // Before anything else, the keyless case included: a relay that does
+        // not know which pool it is in cannot say which sessions are its own.
+        if keys.settings.conflict {
+            return Err(AuthError::PoolConflict);
+        }
+        if keys.settings.by_id.is_empty() {
             return Ok(Admission::anonymous(address));
         }
 
@@ -491,7 +665,12 @@ impl Authenticator {
         now: SystemTime,
     ) -> Result<Admission, AuthError> {
         let keys = self.keys();
-        if keys.by_id.is_empty() {
+        // Before anything else, the keyless case included: a relay that does
+        // not know which pool it is in cannot say which sessions are its own.
+        if keys.settings.conflict {
+            return Err(AuthError::PoolConflict);
+        }
+        if keys.settings.by_id.is_empty() {
             return Ok(Admission::anonymous(address));
         }
 
@@ -1438,5 +1617,233 @@ mod tests {
         assert!(VerificationKey::parse_set(short).is_err());
         let other = r#"[{"kty":"AKP","alg":"ML-DSA-44","kid":"k","pub":"AAAA"}]"#;
         assert!(VerificationKey::parse_set(other).is_err());
+    }
+
+    fn seal_key(id: u8) -> SealKey {
+        SealKey::new(&[id; 8], &[id.wrapping_add(100); 32]).expect("a seal key")
+    }
+
+    fn sealed(key: &SealKey, claims: &serde_json::Value) -> String {
+        key.seal(&mint(&header(), claims)).expect("seals")
+    }
+
+    #[test]
+    fn a_sealed_token_is_opened_and_then_verified() {
+        let now = at(0);
+        let key = seal_key(1);
+        let token = sealed(&key, &claims(now));
+        assert!(moqom_token::is_sealed(token.as_bytes()));
+
+        let opening = authenticator().with_seal_keys(vec![key]);
+        assert_eq!(
+            opening.identify([token.as_bytes()], peer(), now),
+            Ok(Principal::verified("acme", "ada", "OuXpLpEHW7dCPqjK"))
+        );
+        assert!(
+            authenticator()
+                .identify([token.as_bytes()], peer(), now)
+                .is_err(),
+            "a relay without the seal key cannot read it"
+        );
+        assert_eq!(
+            authenticator().with_seal_keys(vec![seal_key(2)]).identify(
+                [token.as_bytes()],
+                peer(),
+                now
+            ),
+            Err(AuthError::UnknownKey)
+        );
+    }
+
+    #[test]
+    fn unsealed_tokens_are_accepted_until_the_control_plane_requires_sealing() {
+        let now = at(0);
+        let plain = mint(&header(), &claims(now));
+        let configured = authenticator().with_seal_keys(vec![seal_key(1)]);
+        assert!(configured.identify([plain.as_bytes()], peer(), now).is_ok());
+
+        let keys = vec![
+            VerificationKey::ed25519(KID.to_owned(), signer().public_key().as_ref().to_vec())
+                .expect("an Ed25519 key"),
+        ];
+        assert_eq!(
+            configured.accept_pushed(keys.clone(), vec![seal_key(2)], true),
+            (1, 2)
+        );
+        assert_eq!(
+            configured.identify([plain.as_bytes()], peer(), now),
+            Err(AuthError::Unsupported)
+        );
+        for key in [seal_key(1), seal_key(2)] {
+            assert!(
+                configured
+                    .identify([sealed(&key, &claims(now)).as_bytes()], peer(), now)
+                    .is_ok()
+            );
+        }
+
+        // A later push replaces the pushed half and keeps the operator's.
+        assert_eq!(configured.accept_pushed(keys, Vec::new(), true), (1, 1));
+        assert!(
+            configured
+                .identify([sealed(&seal_key(2), &claims(now)).as_bytes()], peer(), now)
+                .is_err()
+        );
+        assert!(
+            configured
+                .identify([sealed(&seal_key(1), &claims(now)).as_bytes()], peer(), now)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn requiring_sealing_with_no_key_to_open_one_refuses_nothing() {
+        let now = at(0);
+        let authenticator = Authenticator::new("https://api.moqom.cloud", Vec::new());
+        let _ = authenticator.accept_pushed(
+            vec![
+                VerificationKey::ed25519(KID.to_owned(), signer().public_key().as_ref().to_vec())
+                    .expect("an Ed25519 key"),
+            ],
+            Vec::new(),
+            true,
+        );
+        assert!(
+            authenticator
+                .identify([mint(&header(), &claims(now)).as_bytes()], peer(), now)
+                .is_ok()
+        );
+    }
+
+    /// The holder never sees the JWS inside a sealed token, so a proof can only
+    /// commit to the sealed bytes, and those are what it is checked against.
+    #[test]
+    fn a_proof_is_over_the_token_as_presented_not_as_opened() {
+        let now = SystemTime::now();
+        let device = moqom_proof::Prover::generate(moqom_proof::Algorithm::MlDsa65).expect("a key");
+        let mut bound = claims(now);
+        bound["cnf"]["jkt"] = serde_json::json!(device.thumbprint());
+        let key = seal_key(1);
+        let jws = mint(&header(), &bound);
+        let token = key.seal(&jws).expect("seals");
+        let authenticator = authenticator().with_seal_keys(vec![key]);
+        let possession = Possession::new(crate::possession::Enforcement::Required, None);
+        let prove = |over: &str| {
+            device
+                .prove(
+                    over.as_bytes(),
+                    &[],
+                    &moqom_proof::nonce().expect("a nonce"),
+                    now,
+                )
+                .expect("a proof")
+        };
+        let admit = |proof: &[u8]| {
+            authenticator.admit_presented(
+                &[token.as_bytes()],
+                Some(proof),
+                &possession,
+                peer(),
+                now,
+            )
+        };
+
+        assert!(admit(&prove(&token)).is_ok());
+        assert_eq!(
+            admit(&prove(&jws)).err(),
+            Some(AuthError::Unproven(
+                crate::possession::ProofError::WrongToken
+            ))
+        );
+    }
+
+    fn pooled(pool: &str, now: SystemTime) -> String {
+        let mut confined = claims(now);
+        confined["pool"] = serde_json::json!(pool);
+        mint(&header(), &confined)
+    }
+
+    #[test]
+    fn the_shared_fleet_refuses_a_pools_token_and_a_pool_everybody_elses() {
+        let now = at(0);
+        let shared = authenticator();
+        assert_eq!(shared.pool(), "");
+        assert_eq!(
+            shared.identify([pooled("acme-eu", now).as_bytes()], peer(), now),
+            Err(AuthError::WrongPool)
+        );
+        assert!(
+            shared
+                .identify([mint(&header(), &claims(now)).as_bytes()], peer(), now)
+                .is_ok()
+        );
+
+        let pool = authenticator().pinned_to_pool("acme-eu");
+        assert!(
+            pool.identify([pooled("acme-eu", now).as_bytes()], peer(), now)
+                .is_ok()
+        );
+        for other in [pooled("globex", now), mint(&header(), &claims(now))] {
+            assert_eq!(
+                pool.identify([other.as_bytes()], peer(), now),
+                Err(AuthError::WrongPool)
+            );
+        }
+        assert_eq!(AuthError::WrongPool.name(), "wrong_pool");
+        assert_eq!(
+            AuthError::WrongPool.code(),
+            moqom_proto::control::RequestErrorCode::UNAUTHORIZED
+        );
+    }
+
+    #[test]
+    fn the_welcome_places_an_unpinned_relay_in_its_pool() {
+        let now = at(0);
+        let authenticator = authenticator();
+        assert!(!authenticator.join_pool("acme-eu"));
+        assert_eq!(authenticator.pool(), "acme-eu");
+        assert!(
+            authenticator
+                .identify([pooled("acme-eu", now).as_bytes()], peer(), now)
+                .is_ok()
+        );
+        assert!(!authenticator.join_pool(""));
+        assert_eq!(
+            authenticator.identify([pooled("acme-eu", now).as_bytes()], peer(), now),
+            Err(AuthError::WrongPool)
+        );
+    }
+
+    #[test]
+    fn a_welcome_that_disagrees_with_the_pinned_pool_refuses_everybody() {
+        let now = at(0);
+        let pinned = authenticator().pinned_to_pool("acme-eu");
+        assert!(pinned.join_pool("globex"));
+        assert_eq!(pinned.pool(), "acme-eu");
+        for tokens in [
+            vec![pooled("acme-eu", now)],
+            vec![pooled("globex", now)],
+            vec![],
+        ] {
+            assert_eq!(
+                pinned
+                    .identify(tokens.iter().map(String::as_bytes), peer(), now)
+                    .err(),
+                Some(AuthError::PoolConflict)
+            );
+        }
+        assert!(
+            Authenticator::disabled()
+                .pinned_to_pool("acme-eu")
+                .join_pool("globex"),
+            "a relay without keys is held to its pool too"
+        );
+
+        assert!(!pinned.join_pool("acme-eu"), "agreement ends it");
+        assert!(
+            pinned
+                .identify([pooled("acme-eu", now).as_bytes()], peer(), now)
+                .is_ok()
+        );
     }
 }

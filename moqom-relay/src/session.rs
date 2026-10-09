@@ -524,6 +524,9 @@ struct Held {
     /// When it was minted, which a renewal that changes grants must not
     /// precede.
     issued: Option<SystemTime>,
+    /// The whole `cnf.jkt` it named, which a direct ticket carries so a peer
+    /// can check the holder's proof.
+    thumbprint: Option<Arc<str>>,
 }
 
 /// The per-subscription state [`Session::hold`] watches, shared with the
@@ -1642,6 +1645,7 @@ impl Session {
                 Permission::Unrestricted | Permission::Nothing => None,
             };
             held.issued = admitted.issued;
+            held.thumbprint.clone_from(&admitted.thumbprint);
         }
         // Under any ceiling a moderator has set, and this is the line that makes
         // a demotion survive a reconnection. Without it, somebody demoted who
@@ -1817,6 +1821,7 @@ impl Session {
                 let mut held = self.lock_held();
                 held.scope = Some(scope.clone());
                 held.issued = admitted.issued;
+                held.thumbprint.clone_from(&admitted.thumbprint);
             }
             let permission = self.under_ceiling(Permission::scoped(scope));
             if let Permission::Scoped(scope) = permission {
@@ -3062,11 +3067,18 @@ impl Session {
         group: u64,
         ticketing: &crate::fabric::Ticketing,
     ) -> Result<(), SessionError> {
+        // A scoped session was admitted on a verified token, and every one
+        // names a key; an empty `jkt` would be a ticket no proof could match.
+        let jkt = self.lock_held().thumbprint.clone().unwrap_or_default();
         let claims = crate::ticket::Claims::new(
-            &scope.tenant,
-            scope.room.as_deref().unwrap_or_default(),
-            &scope.user,
-            &scope.device,
+            crate::ticket::Holder {
+                tenant: &scope.tenant,
+                room: scope.room.as_deref().unwrap_or_default(),
+                user: &scope.user,
+                device: &scope.device,
+                jkt: &jkt,
+                publish: scope.publish.bits(),
+            },
             peer,
             SystemTime::now(),
         );

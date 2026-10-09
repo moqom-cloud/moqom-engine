@@ -57,12 +57,17 @@
 //!
 //! # The algorithms
 //!
-//! `ML-DSA-65`, because the point of this module is a key that cannot be
-//! extracted and the Secure Enclave holds ML-DSA-65 keys from iOS 26 and macOS
-//! 26; and `ES256`, which is what the enclave held before, accepted while
-//! devices that made a P-256 key keep it. Ed25519 is not accepted: `CryptoKit`
-//! offers it only in software, with the private key in ordinary memory — where it
-//! can be dumped alongside the token by exactly the attacker this exists to stop.
+//! `ML-DSA-65` and nothing else, because the point of this module is a key that
+//! cannot be extracted and the Secure Enclave holds ML-DSA-65 keys from iOS 26
+//! and macOS 26. `ES256`, which the enclave held before, is refused: a P-256
+//! device key is a signature a quantum adversary could forge later, against a
+//! credential that names the key forever. Ed25519 is not accepted either:
+//! `CryptoKit` offers it only in software, with the private key in ordinary
+//! memory — where it can be dumped alongside the token by exactly the attacker
+//! this exists to stop.
+//!
+//! The list is this module's rather than `moqom-proof`'s, so that the library
+//! still knowing an algorithm cannot widen what the relay admits.
 //!
 //! The format and the check are `moqom-proof`'s, shared with the clients and
 //! the control plane; this module adds the relay's policy, its spent set and its
@@ -72,7 +77,10 @@ use std::time::SystemTime;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use moqom_proof::{Checker, MemoryNonceStore};
+use moqom_proof::{Algorithm, Checker, MemoryNonceStore};
+
+/// What a device key may be. See the module docs.
+const ALGORITHMS: &[Algorithm] = &[Algorithm::MlDsa65];
 
 /// Why a proof of possession was not accepted.
 ///
@@ -229,12 +237,17 @@ impl Possession {
     /// `certificate` is the SHA-256 of the relay's certificate in base64url, the
     /// same digest the client pins. `None` disables the relay binding; see the
     /// note on the `relay` field.
+    ///
+    /// # Panics
+    /// Never: the algorithm list is a constant and not empty.
     #[must_use]
     pub fn new(mode: Enforcement, certificate: Option<String>) -> Self {
         Self {
             mode,
             relay: certificate,
-            checker: Checker::new(MemoryNonceStore::default()),
+            checker: Checker::new(MemoryNonceStore::default())
+                .with_algorithms(ALGORITHMS)
+                .expect("the list is not empty"),
         }
     }
 
@@ -303,7 +316,7 @@ impl Possession {
 mod tests {
     use std::time::Duration;
 
-    use moqom_proof::{Algorithm, Jwk, NonceStore as _, Prover};
+    use moqom_proof::{Jwk, NonceStore as _, Prover};
     use serde::Deserialize;
 
     use super::*;
@@ -325,12 +338,8 @@ mod tests {
 
     impl Device {
         fn new() -> Self {
-            Self::of(Algorithm::MlDsa65)
-        }
-
-        fn of(algorithm: Algorithm) -> Self {
             Self {
-                prover: Prover::generate(algorithm).expect("a key"),
+                prover: Prover::generate(Algorithm::MlDsa65).expect("a key"),
             }
         }
 
@@ -356,17 +365,14 @@ mod tests {
 
     #[test]
     fn a_proof_from_the_right_key_for_the_right_token_is_accepted() {
-        for algorithm in Algorithm::ALL {
-            let device = Device::of(algorithm);
-            let token = b"a.token";
-            let proof = device.prove(token, "one", RELAY);
+        let device = Device::new();
+        let token = b"a.token";
+        let proof = device.prove(token, "one", RELAY);
 
-            assert_eq!(
-                checker().check(token, Some(&proof), &device.thumbprint(), expires(), now()),
-                Ok(()),
-                "{algorithm:?}"
-            );
-        }
+        assert_eq!(
+            checker().check(token, Some(&proof), &device.thumbprint(), expires(), now()),
+            Ok(())
+        );
     }
 
     /// The check the module exists for. Anybody can make a key pair and sign
@@ -688,8 +694,9 @@ mod tests {
             }
         }
 
-        /// Every proof the client produced is one this relay accepts, ML-DSA-65
-        /// and ES256 alike.
+        /// Every proof the client produced is one this relay accepts, and every
+        /// one is ML-DSA-65: a fixture still carrying another algorithm is a
+        /// client still making it.
         ///
         /// A fresh checker per case, because a shared one would spend the
         /// identifiers and the second half of the loop would be testing the
@@ -720,8 +727,8 @@ mod tests {
             }
             assert_eq!(
                 algorithms,
-                ["ES256".to_owned(), "ML-DSA-65".to_owned()].into(),
-                "the fixture must carry both algorithms"
+                ["ML-DSA-65".to_owned()].into(),
+                "the client makes ML-DSA-65 proofs and nothing else"
             );
         }
 

@@ -131,7 +131,7 @@ pub struct Hello {
     #[prost(message, repeated, tag = "4")]
     pub existing: ::prost::alloc::vec::Vec<SessionState>,
 }
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Welcome {
     /// Confirms the relay is registered and its sessions are accounted for.
     #[prost(message, optional, tag = "1")]
@@ -156,6 +156,12 @@ pub struct Welcome {
     /// single-replica deployment.
     #[prost(message, optional, tag = "3")]
     pub snapshot_interval: ::core::option::Option<::prost_types::Duration>,
+    /// The relay pool this relay belongs to, or empty for the shared fleet. A
+    /// relay admits only tokens whose `pool` claim equals this, so a shared relay
+    /// refuses a private tenant's tokens and a pool relay refuses everyone
+    /// else's (`wrong_pool`).
+    #[prost(string, tag = "4")]
+    pub pool: ::prost::alloc::string::String,
 }
 /// One session, as the relay sees it.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -485,6 +491,25 @@ pub struct Heartbeat {
 pub struct VerificationKeys {
     #[prost(message, repeated, tag = "1")]
     pub keys: ::prost::alloc::vec::Vec<super::super::admin::v1::VerificationKey>,
+    /// The keys tokens are sealed under (AES-256-GCM), each with the 8-byte key
+    /// ID a sealed token names. A relay opens a token with these before verifying
+    /// its signature. A relay that serves one tenant is sent only that tenant's.
+    #[prost(message, repeated, tag = "2")]
+    pub seal_keys: ::prost::alloc::vec::Vec<SealKey>,
+    /// Refuse a token that is not sealed. False only during the rollover, while
+    /// tokens minted before sealing are still unexpired.
+    #[prost(bool, tag = "3")]
+    pub require_sealed: bool,
+}
+/// One AES-256-GCM token seal key.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SealKey {
+    /// 8 bytes
+    #[prost(bytes = "vec", tag = "1")]
+    pub key_id: ::prost::alloc::vec::Vec<u8>,
+    /// 32 bytes
+    #[prost(bytes = "vec", tag = "2")]
+    pub secret: ::prost::alloc::vec::Vec<u8>,
 }
 /// Generated client implementations.
 pub mod relay_link_client {

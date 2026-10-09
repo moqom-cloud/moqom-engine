@@ -23,6 +23,18 @@
 //! which is why the configuration is a set and why every key in it is
 //! published: rotation is a new key added, then signing moved, then the old one
 //! removed once its tickets have expired.
+//!
+//! # The peer's credential on a direct path
+//!
+//! A ticket is also what a peer is admitted on. The direct SETUP carries the
+//! holder's current ticket naming the other side as `peer`, in place of the
+//! holder's MOQOM token, and a proof of possession over the ticket's bytes by
+//! the key `jkt` names, bound to the accepting side's certificate. So a peer
+//! never sees the other's token, which may be sealed and is not its to read;
+//! what it learns of the other — who it is, which device, whether it may
+//! publish (`pub`) — is what the relay signed for it to learn. A ticket copied
+//! off one peer is no use to a third party: it names one peer, and without the
+//! holder's key there is no proof to go with it.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -228,6 +240,12 @@ pub struct Claims {
     /// The holder's device: the first sixteen characters of its key thumbprint,
     /// as in every participant name.
     pub dev: String,
+    /// The holder's whole key thumbprint, its token's `cnf.jkt`: the key a
+    /// proof presented with this ticket must be signed by.
+    pub jkt: String,
+    /// The holder's publish bits, its token's `moqt.pub`.
+    #[serde(rename = "pub")]
+    pub publish: u8,
     /// The peer it is for, as `user/device`.
     pub peer: String,
     /// Issued at, in seconds since the epoch.
@@ -236,24 +254,36 @@ pub struct Claims {
     pub exp: u64,
 }
 
+/// Who a ticket is issued to, as its relay session was admitted.
+#[derive(Clone, Copy, Debug)]
+pub struct Holder<'a> {
+    /// The tenant.
+    pub tenant: &'a str,
+    /// The room.
+    pub room: &'a str,
+    /// The user.
+    pub user: &'a str,
+    /// The device field of its participant name.
+    pub device: &'a str,
+    /// Its device key's thumbprint.
+    pub jkt: &'a str,
+    /// Its publish bits.
+    pub publish: u8,
+}
+
 impl Claims {
-    /// A ticket for `holder` (`tenant`, `room`, `user`, `device`) on a direct
-    /// path to `peer`, issued `now` and lasting [`LIFETIME`].
+    /// A ticket for `holder` on a direct path to `peer`, issued `now` and
+    /// lasting [`LIFETIME`].
     #[must_use]
-    pub fn new(
-        tenant: &str,
-        room: &str,
-        user: &str,
-        device: &str,
-        peer: &str,
-        now: SystemTime,
-    ) -> Self {
+    pub fn new(holder: Holder<'_>, peer: &str, now: SystemTime) -> Self {
         let iat = unix(now);
         Self {
-            ten: tenant.to_owned(),
-            room: room.to_owned(),
-            sub: user.to_owned(),
-            dev: device.to_owned(),
+            ten: holder.tenant.to_owned(),
+            room: holder.room.to_owned(),
+            sub: holder.user.to_owned(),
+            dev: holder.device.to_owned(),
+            jkt: holder.jkt.to_owned(),
+            publish: holder.publish,
             peer: peer.to_owned(),
             iat,
             exp: iat + LIFETIME.as_secs(),
@@ -405,10 +435,14 @@ mod tests {
 
     fn claims(now: SystemTime) -> Claims {
         Claims::new(
-            "acme",
-            "room-42",
-            "ada",
-            "OuXpLpEHW7dCPqjK",
+            Holder {
+                tenant: "acme",
+                room: "room-42",
+                user: "ada",
+                device: "OuXpLpEHW7dCPqjK",
+                jkt: "OuXpLpEHW7dCPqjKWm8Zq1TfBb2nQ4ZtAAAAAAAAAAA",
+                publish: 3,
+            },
             "bob/0123456789abcdef",
             now,
         )
@@ -422,6 +456,18 @@ mod tests {
         let read = verify(keys.verification_keys(), ticket.as_bytes(), EXPECTED, now)
             .expect("a fresh ticket");
         assert_eq!(read.exp - read.iat, LIFETIME.as_secs());
+        assert_eq!(read, claims(now));
+    }
+
+    #[test]
+    fn the_key_and_publish_bits_travel_as_jkt_and_pub() {
+        let ticket = keys().issue(&claims(SystemTime::now()));
+        let body = ticket.split('.').nth(1).expect("a body");
+        let body: serde_json::Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(body).expect("base64url"))
+                .expect("JSON");
+        assert_eq!(body["jkt"], "OuXpLpEHW7dCPqjKWm8Zq1TfBb2nQ4ZtAAAAAAAAAAA");
+        assert_eq!(body["pub"], 3);
     }
 
     #[test]

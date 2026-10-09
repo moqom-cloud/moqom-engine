@@ -10,11 +10,12 @@
 //! 1. Bind an endpoint, asking the STUN server [`DirectPolicy::opt_in`] chose,
 //!    and send its offer, sealed, on this participant's `.direct` track, again
 //!    every second until the peer answers.
-//! 2. Read the peer's offers on theirs, and establish with the newest one not
-//!    tried yet: pinned TLS, then each side checks the other's token and proof
-//!    as a relay would.
-//! 3. Once up: ask this side's relay for direct tickets, present them and hold
-//!    the peer to its own; copy every [`RoomPublication`] onto the direct
+//! 2. Read the peer's offers on theirs, and for the newest one not tried yet
+//!    ask this side's relay for direct tickets naming the peer and establish
+//!    with the first: pinned TLS, then each side checks the other's ticket and
+//!    the proof over it as a relay would.
+//! 3. Once up: keep presenting tickets and hold the peer to its own; copy
+//!    every [`RoomPublication`] onto the direct
 //!    session; and attach a direct subscription beside each
 //!    [`RoomSubscription`] to the peer, where [`DualSubscription`] merges the
 //!    two, pauses the relay copy, and falls back by itself.
@@ -40,14 +41,14 @@ use bytes::Bytes;
 use moqom_proto::model::{FullTrackName, TrackAlias, TrackNamespace};
 use tokio::sync::{mpsc, oneshot, watch};
 
-use super::ticket::{self, TicketRefusal, TicketSettings};
+use super::ticket::{self, DirectTicket, TicketRefusal, TicketSettings};
 use super::{
     CandidateOffer, Delivery, DirectConfig, DirectEndpoint, DirectPolicy, DualSubscription,
     Eligibility, Ineligible, IpExposure, OptIn, Path, PathSettings, PeerVerifier, RoomDirectPolicy,
     RoomSecret, VerifiedPeer,
 };
 use crate::Error;
-use crate::device::{Credentials, DeviceKey};
+use crate::device::DeviceKey;
 use crate::properties::ObjectProperties;
 use crate::session::{OutgoingObject, Publication, Session, Subscription};
 
@@ -159,7 +160,7 @@ pub struct DirectRoomConfig {
     pub endpoint: DirectConfig,
     /// The acknowledgement that peers will learn this device's IP addresses.
     pub exposure: IpExposure,
-    /// Checks a peer's token and proof as the relay would.
+    /// Checks a peer's ticket and proof as the relay would.
     pub verifier: Arc<dyn PeerVerifier>,
     /// When the merge trusts the direct path, and when it gives up on it.
     pub path: PathSettings,
@@ -200,22 +201,16 @@ impl std::fmt::Debug for DirectRoomConfig {
     }
 }
 
-/// The credentials in force, presented to a direct peer as to the relay.
+/// The credentials in force on the relay session.
+///
+/// A direct peer is shown a ticket and not the token: the key is what proves
+/// the ticket to it, and the token is kept so that a renewal states both.
 #[derive(Debug, Clone)]
 pub struct RoomCredentials {
-    /// The token, as issued.
+    /// The token, as issued. Never sent to a direct peer.
     pub token: Vec<u8>,
     /// The key it is bound to.
     pub key: Option<Arc<DeviceKey>>,
-}
-
-impl RoomCredentials {
-    fn borrowed(&self) -> Credentials<'_> {
-        Credentials {
-            token: &self.token,
-            key: self.key.as_deref(),
-        }
-    }
 }
 
 enum Command {
@@ -716,10 +711,37 @@ enum Event {
     },
 }
 
+/// Subscribe to this side's tickets for a peer and wait for the first that
+/// reads, which is what the direct SETUP presents.
+async fn first_ticket(
+    relay: &mut Session,
+    track: FullTrackName,
+    patience: Duration,
+) -> Result<(Subscription, DirectTicket), Fallback> {
+    let mut tickets = relay
+        .subscribe(track)
+        .await
+        .map_err(|_| Fallback::TicketsUnavailable)?;
+    let first = tokio::time::timeout(patience, async {
+        while let Ok(Some(object)) = tickets.next_object().await {
+            if let Ok(ticket) = DirectTicket::from_object(&object.payload) {
+                return Some(ticket);
+            }
+        }
+        None
+    })
+    .await
+    .ok()
+    .flatten()
+    .ok_or(Fallback::TicketsUnavailable)?;
+    Ok((tickets, first))
+}
+
 struct Established {
     session: Session,
     verified: VerifiedPeer,
     tickets: Subscription,
+    first: DirectTicket,
 }
 
 type OfferChannel = (Arc<Publication>, Arc<AtomicU64>);
@@ -1224,32 +1246,32 @@ impl Driver {
             return;
         };
         peer.tried.insert(offer.certificate);
-        let credentials = self.credentials.clone();
+        let key = self.credentials.key.clone();
         let verifier = Arc::clone(&self.config.verifier);
+        let patience = self.config.endpoint.patience;
         let mut relay = self.relay.clone();
         let events = self.events.clone();
         let name = who.to_owned();
         peer.establishing = Some(Task::spawn(async move {
             let certificate = offer.certificate;
-            let result = match endpoint
-                .establish(&offer, &credentials.borrowed(), verifier.as_ref())
-                .await
-            {
-                Err(error) => Err(Fallback::Failed(error.to_string())),
-                // Holding this subscription is what the relay meters, so it is
-                // opened only once there is a path to meter.
-                Ok((session, admitted)) => {
-                    if let Ok(tickets) = relay.subscribe(tickets).await {
-                        Ok(Box::new(Established {
-                            session,
-                            verified: admitted,
-                            tickets,
-                        }))
-                    } else {
-                        session.close(0, "no direct tickets");
-                        Err(Fallback::TicketsUnavailable)
-                    }
-                }
+            // Tickets first, because the first one is the credential the peer
+            // admits this side on. Holding the subscription is what the relay
+            // meters, so an attempt that then fails to open a path is metered
+            // for as long as it took to fail, at most the endpoint's patience.
+            let result = match first_ticket(&mut relay, tickets, patience).await {
+                Err(reason) => Err(reason),
+                Ok((tickets, first)) => match endpoint
+                    .establish(&offer, &first, key.as_deref(), verifier.as_ref())
+                    .await
+                {
+                    Err(error) => Err(Fallback::Failed(error.to_string())),
+                    Ok((session, admitted)) => Ok(Box::new(Established {
+                        session,
+                        verified: admitted,
+                        tickets,
+                        first,
+                    })),
+                },
             };
             let _ = events.send(Event::Established {
                 peer: name,
@@ -1297,6 +1319,7 @@ impl Driver {
             session,
             verified,
             tickets,
+            first,
         } = *established;
         let guard = {
             let events = self.events.clone();
@@ -1305,7 +1328,7 @@ impl Driver {
             let me = self.me().to_owned();
             let settings = self.config.tickets;
             Task::spawn(async move {
-                let refusal = ticket::guard(direct, tickets, verified, me, settings).await;
+                let refusal = ticket::guard(direct, tickets, first, verified, me, settings).await;
                 let _ = events.send(Event::Ended {
                     peer,
                     attempt,

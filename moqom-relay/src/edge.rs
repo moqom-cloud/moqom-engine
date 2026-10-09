@@ -7,9 +7,9 @@
 //! instead each room an edge is asked for gets a link of its own:
 //!
 //! 1. The edge asks the control plane ([`Minter`]) for a link credential for the
-//!    room, bound to a P-256 key the edge generated at startup and holds only in
-//!    memory. The credential carries `moqt.rly` and the room, nothing else, and
-//!    `cnf.jkt` names the key.
+//!    room, bound to an ML-DSA-65 key the edge generated at startup and holds
+//!    only in memory. The credential carries `moqt.rly` and the room, nothing
+//!    else, and `cnf.jkt` names the key.
 //! 2. It dials the parent, reads the parent's leaf certificate off the handshake,
 //!    and signs a proof of possession bound to the token and to that certificate
 //!    (`ath`, `rel`, a fresh `jti`) — the client's proof, from
@@ -35,12 +35,31 @@
 //!
 //! A link nobody pulls anything over for [`Timing::idle`] ends, and the next
 //! subscription in its room starts another.
+//!
+//! # The credential is opaque here
+//!
+//! The edge never reads the token it is given. It may be sealed, encrypted to
+//! the relays that verify it, and an edge is not one of those for its own link
+//! credential: it is the holder, and a holder that could read its credential
+//! would be one that could be made to depend on what it says. What the edge
+//! needs — when to renew — comes from the mint response's `expiresAt`, beside
+//! the token, and the lifetime is measured from when the response arrived
+//! rather than from the token's `iat`, which costs at most the request's
+//! round trip of renewal margin. The proof of possession is over the token's
+//! bytes as received. The parent is what reads the claims, room and pool
+//! included.
+//!
+//! A pool relay's parent must be in the same pool. The control plane mints a
+//! pool edge's link credentials for that pool, and a parent in another pool, or
+//! in the shared fleet, refuses them (`wrong_pool`): the edge does not check
+//! where it is linking, because it cannot read what it would check against,
+//! and the parent's refusal is the check that cannot be skipped.
 
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
 use moqom_client::device::DeviceKey;
@@ -53,40 +72,36 @@ use crate::usage::report::{self, Endpoint};
 /// A link credential, with the times it was minted for.
 #[derive(Debug, Clone)]
 pub struct Credential {
-    /// The compact JWS.
+    /// The token, sealed or not, exactly as the control plane returned it.
     pub token: String,
-    /// Its `iat`.
+    /// When it arrived, which is when its lifetime is counted from.
     pub issued: SystemTime,
-    /// Its `exp`.
+    /// When the control plane said it expires.
     pub expires: SystemTime,
 }
 
 impl Credential {
-    /// Read the times off `token`'s claims.
-    ///
-    /// Unverified, and only ever used to decide when to renew: the parent is
-    /// what verifies the token, and a lie here costs this edge its own link.
+    /// `token`, received now, expiring at `expires` as the mint response said.
     ///
     /// # Errors
-    /// [`MintError::Unavailable`] for a token whose claims cannot be read.
-    pub fn from_token(token: String) -> Result<Self, MintError> {
-        use base64::Engine as _;
-        #[derive(serde::Deserialize)]
-        struct Times {
-            iat: Option<u64>,
-            exp: u64,
+    /// [`MintError::Unavailable`] for an empty token or one already expired,
+    /// which a link could not be started on.
+    pub fn received(token: String, expires: SystemTime) -> Result<Self, MintError> {
+        let issued = SystemTime::now();
+        if token.is_empty() {
+            return Err(MintError::Unavailable(
+                "an empty link credential".to_owned(),
+            ));
         }
-        let unreadable = || MintError::Unavailable("the link credential is not a JWS".to_owned());
-        let payload = token.split('.').nth(1).ok_or_else(unreadable)?;
-        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(payload)
-            .map_err(|_| unreadable())?;
-        let times: Times = serde_json::from_slice(&payload).map_err(|_| unreadable())?;
-        let at = |seconds| UNIX_EPOCH + Duration::from_secs(seconds);
+        if expires <= issued {
+            return Err(MintError::Unavailable(
+                "a link credential that has already expired".to_owned(),
+            ));
+        }
         Ok(Self {
-            issued: times.iat.map_or_else(SystemTime::now, at),
-            expires: at(times.exp),
             token,
+            issued,
+            expires,
         })
     }
 }
@@ -180,11 +195,20 @@ impl Minter for ControlPlane {
                     #[derive(serde::Deserialize)]
                     struct Answer {
                         token: String,
+                        #[serde(rename = "expiresAt")]
+                        expires_at: String,
                     }
                     let answer: Answer = serde_json::from_slice(&answer).map_err(|_| {
                         MintError::Unavailable("an unreadable link credential".to_owned())
                     })?;
-                    Credential::from_token(answer.token)
+                    let expires =
+                        crate::usage::parse_rfc3339(&answer.expires_at).ok_or_else(|| {
+                            MintError::Unavailable(format!(
+                                "a link credential expiring at {:?}",
+                                answer.expires_at
+                            ))
+                        })?;
+                    Credential::received(answer.token, expires)
                 }
                 // Unauthorised, forbidden, no such room, room ended.
                 401 | 403 | 404 | 410 => Err(MintError::Revoked(message())),
@@ -508,6 +532,8 @@ impl Inner {
 mod tests {
     use super::*;
 
+    use std::time::UNIX_EPOCH;
+
     fn lasting(issued: u64, expires: u64) -> Credential {
         Credential {
             token: String::new(),
@@ -551,13 +577,19 @@ mod tests {
     }
 
     #[test]
-    fn the_times_come_from_the_token() {
-        use base64::Engine as _;
-        let claims = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(br#"{"iat":100,"exp":400,"sub":"moqom-relay"}"#);
-        let credential = Credential::from_token(format!("e30.{claims}.sig")).expect("readable");
-        assert_eq!(credential.issued, UNIX_EPOCH + Duration::from_secs(100));
-        assert_eq!(credential.expires, UNIX_EPOCH + Duration::from_secs(400));
-        assert!(Credential::from_token("not a token".to_owned()).is_err());
+    fn the_times_come_from_the_mint_response_not_the_token() {
+        let expires = SystemTime::now() + Duration::from_mins(5);
+        let credential =
+            Credential::received("an opaque, sealed token".to_owned(), expires).expect("usable");
+        assert_eq!(credential.expires, expires);
+        assert!(credential.issued <= SystemTime::now());
+        assert!(Credential::received(String::new(), expires).is_err());
+        assert!(
+            Credential::received(
+                "lapsed".to_owned(),
+                SystemTime::now() - Duration::from_secs(1)
+            )
+            .is_err()
+        );
     }
 }

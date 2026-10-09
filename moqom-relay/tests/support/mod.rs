@@ -241,10 +241,16 @@ impl Relay {
         let certificate = generated.cert.der().clone();
         let key = rustls::pki_types::PrivateKeyDer::try_from(generated.signing_key.serialize_der())
             .expect("generated key is usable");
-        let tls = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(vec![certificate.clone()], key)
-            .expect("certificate and key agree");
+        // The production listener's groups, so every client here is held to
+        // what a deployed relay accepts.
+        let tls = rustls::ServerConfig::builder_with_provider(Arc::new(
+            moqom_transport::key_exchange::device_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("TLS 1.3")
+        .with_no_client_auth()
+        .with_single_cert(vec![certificate.clone()], key)
+        .expect("certificate and key agree");
 
         let server = Server::bind(
             SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
@@ -365,7 +371,7 @@ impl Relay {
     /// Outgoing sockets for linking to this relay, trusting its certificate.
     pub fn dialer(&self) -> moqom_relay::upstream::Dialer {
         install_crypto_provider();
-        let tls = rustls::ClientConfig::builder()
+        let tls = link_client()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(PinnedCertificate(self.certificate.clone())))
             .with_no_client_auth();
@@ -414,7 +420,7 @@ impl Relay {
     ) {
         install_crypto_provider();
 
-        let mut tls = rustls::ClientConfig::builder()
+        let mut tls = link_client()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(PinnedCertificate(
                 parent.certificate.clone(),
@@ -1631,8 +1637,8 @@ pub mod tokens {
     /// the device field a client announces under. The relay derives one from
     /// the other, so these two constants are one fact and have to be written as
     /// one; `device::thumbprint` is checked against it.
-    const THUMBPRINT: &str = "6sJbku90U16EBFQrQOCPWqR1Sg8BLxq7un4tlyvnTzY";
-    pub const DEVICE: &str = "6sJbku90U16EBFQr";
+    const THUMBPRINT: &str = "F5YJgp0Tsbu7o3PW0b5SNJL9NamEIMTLf33yDRpA1y4";
+    pub const DEVICE: &str = "F5YJgp0Tsbu7o3PW";
 
     pub(crate) fn thumbprint_constant() -> &'static str {
         THUMBPRINT
@@ -1835,7 +1841,7 @@ pub mod tokens {
     /// other. This builds one the way a client must — a compact JWS carrying its
     /// own public key — so what is being tested is the format.
     pub mod device {
-        use aws_lc_rs::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair as _};
+        use aws_lc_rs::signature::{KeyPair as _, ML_DSA_65_SIGNING, PqdsaKeyPair};
         use base64::Engine as _;
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
@@ -1843,29 +1849,19 @@ pub mod tokens {
         /// every token this harness mints — not only the ones a possession
         /// test asks for — is bound to a key the harness holds, and a client
         /// can prove it on a relay that requires that of everybody.
-        fn pair() -> EcdsaKeyPair {
-            const PKCS8: &str = "308187020100301306072a8648ce3d020106082a8648ce3d030107046d306b0201010420701e80798abc0b4a4f6e625cd20d685cc8ca00cb01e4986290cb021935acdf6ea14403420004ff93fe6aad058f6c091b26a29277f15484991e66fb044c007c5b7165c64bf5a498223001987d9e6a86695803807d7dbe850d382c7b76534d89badc5246badad5";
-            let document: Vec<u8> = (0..PKCS8.len())
-                .step_by(2)
-                .map(|i| u8::from_str_radix(&PKCS8[i..i + 2], 16).expect("hex"))
-                .collect();
-            EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &document)
-                .expect("a valid P-256 key")
+        fn pair() -> PqdsaKeyPair {
+            PqdsaKeyPair::from_seed(&ML_DSA_65_SIGNING, &[23u8; 32])
+                .expect("a valid ML-DSA-65 seed")
         }
 
-        /// The public key as the two JWK coordinates a proof carries.
-        fn coordinates() -> (String, String) {
-            let point = pair().public_key().as_ref().to_vec();
-            (
-                URL_SAFE_NO_PAD.encode(&point[1..33]),
-                URL_SAFE_NO_PAD.encode(&point[33..65]),
-            )
+        /// The public key as the JWK `pub` a proof carries.
+        fn public() -> String {
+            URL_SAFE_NO_PAD.encode(pair().public_key().as_ref())
         }
 
-        /// The RFC 7638 thumbprint of the device key, which a token commits to.
+        /// The thumbprint of the device key, which a token commits to.
         pub fn thumbprint() -> String {
-            let (x, y) = coordinates();
-            let canonical = format!(r#"{{"crv":"P-256","kty":"EC","x":"{x}","y":"{y}"}}"#);
+            let canonical = format!(r#"{{"alg":"ML-DSA-65","kty":"AKP","pub":"{}"}}"#, public());
             sha256(canonical.as_bytes())
         }
 
@@ -1889,9 +1885,9 @@ pub mod tokens {
         /// test that wants to be refused as a replay presents the same proof
         /// twice, and every other test uses a fresh one.
         pub fn prove(token: &str, relay: &str, id: &str) -> String {
-            let (x, y) = coordinates();
             let header = format!(
-                r#"{{"alg":"ES256","typ":"MOQT-POP","jwk":{{"kty":"EC","crv":"P-256","x":"{x}","y":"{y}"}}}}"#
+                r#"{{"alg":"ML-DSA-65","typ":"MOQT-POP","jwk":{{"kty":"AKP","alg":"ML-DSA-65","pub":"{}"}}}}"#,
+                public()
             );
             let iat = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1907,11 +1903,12 @@ pub mod tokens {
                 URL_SAFE_NO_PAD.encode(claims)
             );
 
-            let rng = aws_lc_rs::rand::SystemRandom::new();
-            let signature = pair()
-                .sign(&rng, signing.as_bytes())
+            let mut signature = vec![0u8; ML_DSA_65_SIGNING.signature_len()];
+            let written = pair()
+                .sign(signing.as_bytes(), &mut signature)
                 .expect("signing a proof");
-            format!("{signing}.{}", URL_SAFE_NO_PAD.encode(signature.as_ref()))
+            signature.truncate(written);
+            format!("{signing}.{}", URL_SAFE_NO_PAD.encode(&signature))
         }
 
         fn sha256(bytes: &[u8]) -> String {
@@ -1936,4 +1933,14 @@ pub mod tokens {
         signature.truncate(written);
         format!("{signing}.{}", URL_SAFE_NO_PAD.encode(&signature))
     }
+}
+
+/// A client configuration as a relay dialling another builds one: ML-KEM-1024
+/// only.
+fn link_client() -> rustls::ConfigBuilder<rustls::ClientConfig, rustls::WantsVerifier> {
+    rustls::ClientConfig::builder_with_provider(Arc::new(
+        moqom_transport::key_exchange::link_provider(),
+    ))
+    .with_protocol_versions(&[&rustls::version::TLS13])
+    .expect("TLS 1.3")
 }

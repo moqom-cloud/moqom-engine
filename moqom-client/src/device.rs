@@ -16,9 +16,8 @@
 //!
 //! # What is signed
 //!
-//! A `moqom-proof` proof: a compact JWS typed `MOQT-POP`, `ML-DSA-65` for a key
-//! made here and `ES256` for a P-256 key loaded from before the move, with four
-//! claims:
+//! A `moqom-proof` proof: a compact JWS typed `MOQT-POP`, signed `ML-DSA-65`,
+//! with four claims:
 //!
 //! * `ath`, the hash of the token, which ties this proof to that token and no
 //!   other;
@@ -30,6 +29,17 @@
 //! Together those are why no challenge from the relay is needed, which matters
 //! because the client speaks first: SETUP carries the proof, and there is nothing
 //! before it to carry a nonce.
+//!
+//! The token is hashed as presented and never read. It may be sealed, in which
+//! case its claims are not this client's to read, and the relay checks `ath`
+//! against the same sealed bytes.
+//!
+//! # Only ML-DSA-65
+//!
+//! A P-256 key from before the move to ML-DSA is refused at load, rather than
+//! loaded and then refused by every relay: relays accept ML-DSA-65 proofs and
+//! nothing else, and a key that cannot be admitted anywhere is better reported
+//! where it is read. Such a machine makes a new key and is enrolled again.
 
 use std::time::SystemTime;
 
@@ -41,8 +51,8 @@ use moqom_proof::{Algorithm, Prover};
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum DeviceKeyError {
-    /// The bytes are not a PKCS#8 ML-DSA-65 or P-256 private key.
-    #[error("not a PKCS#8 ML-DSA-65 or P-256 private key")]
+    /// The bytes are not a PKCS#8 ML-DSA-65 private key.
+    #[error("not a PKCS#8 ML-DSA-65 private key")]
     Malformed,
 
     /// A key could not be generated, or its private half could not be serialised.
@@ -58,8 +68,7 @@ pub enum DeviceKeyError {
     Relay,
 }
 
-/// A key pair identifying one device: ML-DSA-65 when made here, P-256 when
-/// loaded from a key made before proofs moved to ML-DSA.
+/// An ML-DSA-65 key pair identifying one device.
 ///
 /// The thumbprint is what a token commits to, so this key is the device's name as
 /// far as authorisation is concerned: revoking it revokes the machine, which is
@@ -87,14 +96,40 @@ impl DeviceKey {
         Ok((Self { prover }, pkcs8))
     }
 
-    /// Load a key from PKCS#8 bytes, ML-DSA-65 or P-256.
+    /// Load an ML-DSA-65 key from PKCS#8 bytes.
     ///
     /// # Errors
-    /// Bytes that are neither.
+    /// Bytes that are not one, a P-256 key from before the move included.
     pub fn from_pkcs8(pkcs8: &[u8]) -> Result<Self, DeviceKeyError> {
+        let prover = Prover::from_pkcs8(pkcs8).map_err(|_| DeviceKeyError::Malformed)?;
+        if prover.algorithm() != Algorithm::MlDsa65 {
+            return Err(DeviceKeyError::Malformed);
+        }
+        Ok(Self { prover })
+    }
+
+    /// The ML-DSA-65 key `seed` determines, for a caller that must make the same
+    /// key twice: a load generator naming its synthetic devices, a test.
+    ///
+    /// A device's own key comes from [`Self::generate`]; a seed anybody can
+    /// recompute is a key anybody holds.
+    ///
+    /// # Errors
+    /// A seed that is not 32 bytes.
+    pub fn from_seed(seed: &[u8]) -> Result<Self, DeviceKeyError> {
         Ok(Self {
-            prover: Prover::from_pkcs8(pkcs8).map_err(|_| DeviceKeyError::Malformed)?,
+            prover: Prover::ml_dsa_65_from_seed(seed).map_err(|_| DeviceKeyError::Malformed)?,
         })
+    }
+
+    /// The private key as PKCS#8, as [`Self::generate`] returns it.
+    ///
+    /// # Errors
+    /// The platform's key store refusing to serialise it.
+    pub fn to_pkcs8(&self) -> Result<Vec<u8>, DeviceKeyError> {
+        self.prover
+            .to_pkcs8()
+            .map_err(|error| DeviceKeyError::Unavailable(error.to_string()))
     }
 
     /// The algorithm this key proves with.
@@ -215,19 +250,35 @@ mod tests {
         assert_eq!(key.public_key_jwk(), reloaded.public_key_jwk());
     }
 
-    /// A machine that made its key before the move keeps its identity.
+    /// No relay accepts its proofs, so it is refused where it is read.
     #[test]
-    fn a_p256_key_from_before_the_move_still_loads_and_proves() {
+    fn a_p256_key_from_before_the_move_is_refused() {
         let rng = aws_lc_rs::rand::SystemRandom::new();
         let pkcs8 = aws_lc_rs::signature::EcdsaKeyPair::generate_pkcs8(
             &aws_lc_rs::signature::ECDSA_P256_SHA256_FIXED_SIGNING,
             &rng,
         )
         .expect("a P-256 key");
-        let key = DeviceKey::from_pkcs8(pkcs8.as_ref()).expect("loads");
-        assert_eq!(key.algorithm(), Algorithm::Es256);
-        let proof = key.prove(b"token", RELAY).expect("a proof");
-        assert_eq!(checked(&key, &proof, b"token"), Ok(()));
+        assert!(matches!(
+            DeviceKey::from_pkcs8(pkcs8.as_ref()),
+            Err(DeviceKeyError::Malformed)
+        ));
+    }
+
+    #[test]
+    fn a_seed_is_one_key_every_time() {
+        let first = DeviceKey::from_seed(&[7; 32]).expect("a key");
+        let again = DeviceKey::from_seed(&[7; 32]).expect("the same key");
+        assert_eq!(first.algorithm(), Algorithm::MlDsa65);
+        assert_eq!(first.thumbprint(), again.thumbprint());
+        assert_ne!(
+            first.thumbprint(),
+            DeviceKey::from_seed(&[8; 32]).expect("a key").thumbprint()
+        );
+        let reloaded =
+            DeviceKey::from_pkcs8(&first.to_pkcs8().expect("serialises")).expect("loads");
+        assert_eq!(first.thumbprint(), reloaded.thumbprint());
+        assert!(DeviceKey::from_seed(&[7; 31]).is_err());
     }
 
     #[test]

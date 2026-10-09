@@ -2,10 +2,15 @@
 //!
 //! Everything a direct path promises is exercised here over real sockets on the
 //! loopback interface: offers sealed under the room secret and opened by their
-//! addressee, a pinned mutual handshake, SETUP in both directions with a proof
-//! bound to the peer's ephemeral certificate, and media published on one device
-//! and read on the other. The verifier is `moqom_relay::direct::PeerCheck`, so a
-//! peer admitted here is one a relay would have admitted.
+//! addressee, a pinned mutual handshake, SETUP in both directions carrying a
+//! direct ticket and a proof over it bound to the peer's ephemeral certificate,
+//! and media published on one device and read on the other. The verifier is
+//! `moqom_relay::direct::PeerCheck`, so a peer admitted here is one a relay
+//! would have admitted.
+//!
+//! Tickets are signed here with the fleet's ticket keys, as the relay each
+//! device is attached to would sign them; `direct_room.rs` has them come from
+//! a relay.
 //!
 //! The last test adds a relay and reads one track over both paths at once, which
 //! is the fallback the direct path is never allowed to be without.
@@ -15,20 +20,18 @@ use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 use moqom_client::direct::{
-    CandidateOffer, DirectConfig, DirectEndpoint, DualSubscription, Eligibility, IpExposure, Path,
-    PathSettings, PeerCredentials, RoomSecret, VerifiedPeer,
+    CandidateOffer, DirectConfig, DirectEndpoint, DirectTicket, DualSubscription, Eligibility,
+    IpExposure, Path, PathSettings, PeerCredentials, RoomSecret, VerifiedPeer,
 };
 use moqom_client::{
-    Announcement, Credentials, DeviceKey, Error, FullTrackName, Session, Subscription,
-    TrackNamespace,
+    Announcement, DeviceKey, Error, FullTrackName, Session, Subscription, TrackNamespace,
 };
-use moqom_relay::direct::PeerCheck;
-use moqom_relay::{Authenticator, Cache, Fabric, Limits, Session as RelaySession};
-use moqom_token::{Claims, Confirmation, Grant, Signer};
+use moqom_relay::direct::{PeerCheck, Presented};
+use moqom_relay::ticket::{Claims, Expected, Holder, TicketKeys};
+use moqom_relay::{Cache, Fabric, Limits, Session as RelaySession};
 use moqom_transport::{Server, server::with_moqt_alpn};
 
 const PATIENCE: Duration = Duration::from_secs(10);
-const KEY_ID: &str = "test-key";
 const TENANT: &str = "acme";
 const ROOM: &str = "room-42";
 
@@ -47,43 +50,9 @@ async fn within<F: Future>(what: &str, future: F) -> F::Output {
         .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
 }
 
-fn signer() -> Signer {
-    Signer::from_seed(&[7u8; 32])
-        .expect("a valid ML-DSA-65 seed")
-        .with_id(KEY_ID)
-}
-
-fn authenticator() -> Authenticator {
-    Authenticator::new("", vec![signer().public_key()])
-}
-
-/// A token for `user` in `room`, bound to `key`, minted the way the control
-/// plane mints one. `publish` is the media-kind bitmask; zero is a viewer.
-fn token(user: &str, room: &str, key: &DeviceKey, publish: u32) -> Vec<u8> {
-    let issued = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("after the epoch")
-        .as_secs()
-        .cast_signed();
-    signer()
-        .sign(&Claims {
-            iss: "https://api.moqom.cloud".to_owned(),
-            sub: user.to_owned(),
-            tenant: TENANT.to_owned(),
-            iat: issued,
-            exp: issued + 600,
-            cnf: Confirmation {
-                jkt: key.thumbprint(),
-            },
-            grant: Grant {
-                room: room.to_owned(),
-                publish: u8::try_from(publish).expect("a media-kind bitmask"),
-                ..Grant::default()
-            },
-            ..Claims::default()
-        })
-        .expect("a complete ten-minute token")
-        .into_bytes()
+/// The fleet's direct-ticket keys.
+fn ticket_keys() -> TicketKeys {
+    TicketKeys::from_seed("ticket-test", &[11u8; 32])
 }
 
 /// `user/device`, with the device derived from the key the way the relay does.
@@ -92,23 +61,25 @@ fn participant(user: &str, key: &DeviceKey) -> String {
     format!("{user}/{}", &thumbprint[..thumbprint.len().min(16)])
 }
 
-/// One device: its key, its token, and its endpoint on loopback.
+/// One device: its key, the grants its relay session was admitted with, and
+/// its endpoint on loopback.
 struct Device {
+    user: String,
     me: String,
     key: DeviceKey,
-    token: Vec<u8>,
+    room: String,
+    publish: u8,
     endpoint: DirectEndpoint,
     check: PeerCheck,
 }
 
 impl Device {
-    async fn new(user: &str, publish: u32, room: &str) -> Self {
+    async fn new(user: &str, publish: u8, room: &str) -> Self {
         Self::with_patience(user, publish, room, Duration::from_secs(5)).await
     }
 
-    async fn with_patience(user: &str, publish: u32, room: &str, patience: Duration) -> Self {
+    async fn with_patience(user: &str, publish: u8, room: &str, patience: Duration) -> Self {
         let (key, _) = DeviceKey::generate().expect("a device key");
-        let token = token(user, room, &key, publish);
         let me = participant(user, &key);
         let mut config = DirectConfig::new(TENANT, ROOM, me.clone());
         config.bind = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
@@ -120,19 +91,57 @@ impl Device {
         )
         .await
         .expect("binding a direct endpoint");
-        let check = PeerCheck::new(authenticator(), endpoint.certificate_identity());
+        let check = PeerCheck::new(endpoint.certificate_identity());
         Self {
+            user: user.to_owned(),
             me,
             key,
-            token,
+            room: room.to_owned(),
+            publish,
             endpoint,
             check,
         }
     }
 
+    /// The ticket this device's relay would issue it for a path to `peer`.
+    fn ticket(&self, peer: &str) -> DirectTicket {
+        let keys = ticket_keys();
+        let thumbprint = self.key.thumbprint();
+        let claims = Claims::new(
+            Holder {
+                tenant: TENANT,
+                room: &self.room,
+                user: &self.user,
+                device: &thumbprint[..16],
+                jkt: &thumbprint,
+                publish: self.publish,
+            },
+            peer,
+            SystemTime::now(),
+        );
+        DirectTicket {
+            compact: keys.issue(&claims),
+            expires: SystemTime::UNIX_EPOCH + Duration::from_secs(claims.exp),
+            keys: keys.verification_keys().to_vec(),
+        }
+    }
+
     fn verify(&self, presented: &PeerCredentials<'_>) -> Result<VerifiedPeer, String> {
         self.check
-            .check(presented.token, presented.proof, SystemTime::now())
+            .check(
+                Presented {
+                    ticket: presented.ticket,
+                    proof: presented.proof,
+                    keys: presented.ticket_keys,
+                    expected: Expected {
+                        tenant: presented.tenant,
+                        room: presented.room,
+                        holder: presented.holder,
+                        peer: presented.me,
+                    },
+                },
+                SystemTime::now(),
+            )
             .map(|peer| VerifiedPeer {
                 tenant: peer.tenant.to_string(),
                 user: peer.user.to_string(),
@@ -146,11 +155,7 @@ impl Device {
     async fn establish(&self, offer: &CandidateOffer) -> Result<(Session, VerifiedPeer), Error> {
         let verifier = |presented: &PeerCredentials<'_>| self.verify(presented);
         self.endpoint
-            .establish(
-                offer,
-                &Credentials::proven(&self.token, &self.key),
-                &verifier,
-            )
+            .establish(offer, &self.ticket(&offer.from), Some(&self.key), &verifier)
             .await
     }
 }
@@ -240,7 +245,7 @@ async fn two_devices_admit_each_other_and_exchange_media_directly() {
     assert_eq!(second.object, 1);
 }
 
-/// A viewer's token verifies, and is still refused: a direct path would hand a
+/// A viewer's ticket verifies, and is still refused: a direct path would hand a
 /// viewer the publisher's network address.
 #[tokio::test]
 async fn a_viewer_is_refused_a_direct_path() {
@@ -269,9 +274,9 @@ async fn a_viewer_is_refused_a_direct_path() {
     );
 }
 
-/// A token for another room is refused even though it verifies.
+/// A ticket for another room is refused even though its signature verifies.
 #[tokio::test]
-async fn a_token_for_another_room_is_refused() {
+async fn a_ticket_for_another_room_is_refused() {
     install_provider();
     let ada = Device::new("ada", 3, ROOM).await;
     let eve = Device::new("eve", 3, "room-7").await;
@@ -282,9 +287,11 @@ async fn a_token_for_another_room_is_refused() {
     })
     .await;
     match at_ada {
-        Err(Error::PeerUnverified(reason)) => assert!(reason.contains("another room"), "{reason}"),
+        Err(Error::PeerUnverified(reason)) => {
+            assert!(reason.contains("names somebody other"), "{reason}");
+        }
         Err(other) => panic!("refused for the wrong reason: {other}"),
-        Ok(_) => panic!("a token for another room was admitted"),
+        Ok(_) => panic!("a ticket for another room was admitted"),
     }
 }
 
