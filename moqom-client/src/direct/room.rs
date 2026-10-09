@@ -23,9 +23,9 @@
 //!    what it was doing all along. Another attempt follows after a backoff, for
 //!    as long as the room still qualifies.
 //!
-//! Offers travel under the participant's stage slot, or its backstage one
-//! while it is backstage ([`RoomView::backstage`]), so backstage pairs only
-//! with backstage. Both offers tracks are published on the relay session when
+//! Offers travel under the participant's stage slot. A device that is
+//! backstage ([`RoomView::backstage`]) never goes direct: backstage feeds a
+//! broadcast that is on the relay anyway. Both offers tracks are published on the relay session when
 //! the room is made, and the caller announces the slot as it does to publish
 //! media: after making the room, so that a peer's subscription to the offers
 //! never reaches this session before the offers track exists.
@@ -88,8 +88,7 @@ pub struct RoomView {
     pub encrypted: bool,
     /// This device is publishing, on stage or backstage.
     pub publishing: bool,
-    /// It is publishing backstage, so its offers and its peers are there. Its
-    /// token must be a backstage one, as the relay checks.
+    /// It is publishing backstage, which keeps it on the relay.
     pub backstage: bool,
     /// A watchdog (recorder, safety detector) is attached to the room.
     pub watchdog: bool,
@@ -948,6 +947,9 @@ impl Driver {
         let Some(applied) = self.applied.as_ref() else {
             return Some(Fallback::Off);
         };
+        if self.view.backstage {
+            return Some(Fallback::Ineligible(Ineligible::Backstage));
+        }
         let me = self.me().to_owned();
         let mut everyone: BTreeSet<String> = self.view.peers.clone();
         everyone.extend(self.view.members.iter().flatten().cloned());

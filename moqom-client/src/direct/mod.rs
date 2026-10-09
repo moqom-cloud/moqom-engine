@@ -122,6 +122,10 @@ pub enum Ineligible {
     /// publisher's network address.
     #[error("viewers never use direct paths")]
     Audience,
+    /// This device is backstage, which feeds a broadcast already on the relay.
+    /// Direct paths are for calls and small private rooms.
+    #[error("backstage stays on the relay")]
+    Backstage,
 }
 
 impl Eligibility {

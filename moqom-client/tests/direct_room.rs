@@ -506,11 +506,9 @@ async fn relay_only_never_offers_an_address() {
     assert_eq!(relay.stun_answered(), 0, "no STUN server was asked");
 }
 
-/// Backstage meets backstage and the stage meets the stage, because offers
-/// travel on the slot each participant is in. A caller that pairs across the
-/// two gets no path rather than a wrong one.
+/// Backstage never goes direct; the stage beside it still does.
 #[tokio::test(flavor = "multi_thread")]
-async fn backstage_pairs_only_with_backstage() {
+async fn backstage_stays_on_the_relay() {
     let relay = Relay::start();
     let grant = relay.grant();
     let ada = Member::join(&relay, "ada", true, DirectPolicy::AUTOMATIC, grant.clone()).await;
@@ -520,18 +518,19 @@ async fn backstage_pairs_only_with_backstage() {
 
     ada.sees(&[&bob]);
     bob.sees(&[&ada]);
-    // Cat's caller has Ada beside her on stage, which she is not.
-    cat.sees(&[&dan, &ada]);
+    cat.sees(&[&dan]);
     dan.sees(&[&cat]);
 
-    ada.until_direct(&bob).await;
-    bob.until_direct(&ada).await;
+    let backstage = |state: Option<&PathState>| {
+        state == Some(&PathState::Relay(Fallback::Ineligible(Ineligible::Backstage)))
+    };
+    ada.until(&bob, "backstage to be refused", backstage).await;
+    bob.until(&ada, "backstage to be refused", backstage).await;
     cat.until_direct(&dan).await;
     dan.until_direct(&cat).await;
 
     tokio::time::sleep(Duration::from_secs(2)).await;
-    assert_eq!(cat.state(&ada), Some(PathState::Connecting));
-    assert_eq!(ada.state(&bob), Some(PathState::Direct));
+    assert!(backstage(ada.state(&bob).as_ref()));
     assert_eq!(cat.state(&dan), Some(PathState::Direct));
 }
 
