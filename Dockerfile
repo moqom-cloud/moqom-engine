@@ -30,6 +30,7 @@ COPY --from=security rust /moqom-security/rust
 COPY moqom-proto/Cargo.toml moqom-proto/
 COPY moqom-rans/Cargo.toml moqom-rans/
 COPY moqom-rans-ffi/Cargo.toml moqom-rans-ffi/
+COPY moqom-direct-ffi/Cargo.toml moqom-direct-ffi/
 COPY moqom-relay/Cargo.toml moqom-relay/
 COPY moqom-transport/Cargo.toml moqom-transport/
 COPY moqom-client/Cargo.toml moqom-client/
@@ -37,7 +38,7 @@ COPY moqom-media/Cargo.toml moqom-media/
 COPY moqom-cli/Cargo.toml moqom-cli/
 COPY moqom-loadgen/Cargo.toml moqom-loadgen/
 COPY moqom-recorder/Cargo.toml moqom-recorder/
-RUN for crate in moqom-proto moqom-rans moqom-rans-ffi moqom-relay moqom-transport moqom-client moqom-media moqom-cli moqom-loadgen moqom-recorder; do \
+RUN for crate in moqom-proto moqom-rans moqom-rans-ffi moqom-direct-ffi moqom-relay moqom-transport moqom-client moqom-media moqom-cli moqom-loadgen moqom-recorder; do \
         mkdir -p "$crate/src" && echo "fn main() {}" > "$crate/src/main.rs" && \
         touch "$crate/src/lib.rs"; \
     done && \
@@ -50,6 +51,7 @@ RUN for crate in moqom-proto moqom-rans moqom-rans-ffi moqom-relay moqom-transpo
 COPY moqom-proto moqom-proto
 COPY moqom-rans moqom-rans
 COPY moqom-rans-ffi moqom-rans-ffi
+COPY moqom-direct-ffi moqom-direct-ffi
 COPY moqom-relay moqom-relay
 COPY moqom-transport moqom-transport
 COPY moqom-client moqom-client
