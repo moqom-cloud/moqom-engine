@@ -43,7 +43,8 @@ sudo install -m 0644 /tmp/jwks.json /opt/moqom/jwks.json
 # relay refuses to do that without a credential. Random per build rather than a
 # constant like the seed above, and readable by every account on these hosts,
 # which only matters to somebody who already has a shell on one.
-tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 48 > /tmp/admin-token
+# `head` closing the pipe kills `tr` with SIGPIPE, which pipefail would treat as failure.
+{ LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom || true; } | head -c 48 > /tmp/admin-token
 sudo install -m 0644 /tmp/admin-token /opt/moqom/admin-token
 rm -f /tmp/admin-token
 

@@ -351,6 +351,255 @@ async fn a_client_at_the_request_limit_says_so_and_waits() {
     ));
 }
 
+/// The next group the client publishes, read whole by the relay.
+async fn read_group(connection: &quinn::Connection) -> (SubgroupHeader, Vec<SubgroupObject>) {
+    let mut stream = within("the group's stream", connection.accept_uni())
+        .await
+        .unwrap();
+    let bytes = within("the whole group", stream.read_to_end(1 << 16))
+        .await
+        .unwrap();
+    let mut cursor = &bytes[..];
+    Draft::D16.scope(|| {
+        let header = SubgroupHeader::decode(&mut cursor).unwrap();
+        let mut reader = moqom_proto::data::SubgroupReader::new(&header);
+        let mut objects = Vec::new();
+        while !cursor.is_empty() {
+            objects.push(reader.read(&mut cursor).unwrap());
+        }
+        (header, objects)
+    })
+}
+
+#[tokio::test]
+async fn a_publication_offers_the_track_then_sends_its_groups() {
+    let relay = Scripted::start();
+    let connecting = Session::connect_to(
+        relay.addr,
+        "localhost",
+        moqom_client::tls::pinned(relay.certificate.clone()),
+        "t",
+    );
+    let (session, (connection, mut control, _)) = tokio::join!(connecting, relay.accept(10));
+    let session = session.unwrap();
+
+    let relay_side = async {
+        let Message::Publish {
+            request_id,
+            track: offered,
+            track_alias,
+            ..
+        } = control.read().await
+        else {
+            panic!("expected PUBLISH");
+        };
+        assert_eq!(request_id.get(), 0, "a client's first request ID is 0");
+        assert_eq!(offered, track("video"));
+        assert_eq!(track_alias.get(), 7);
+        let mut ok = Parameters::new();
+        ok.push(Parameter::varint(param::FORWARD, VarInt::from_u32(1)).unwrap());
+        control
+            .write(&Message::PublishOk {
+                request_id,
+                parameters: ok,
+            })
+            .await;
+    };
+    let (publication, ()) = tokio::join!(
+        session.publish(track("video"), TrackAlias::new(VarInt::from_u32(7))),
+        relay_side
+    );
+    let publication = publication.expect("published");
+    assert!(publication.forward);
+
+    let mut group = publication
+        .open_group(3, moqom_client::Metadata::Present)
+        .await
+        .unwrap();
+    let tagged = moqom_client::ObjectProperties {
+        capture_time_micros: Some(1_234_567),
+        ..moqom_client::ObjectProperties::default()
+    };
+    group
+        .write(&moqom_client::OutgoingObject::tagged(&b"key"[..], tagged))
+        .await
+        .unwrap();
+    group
+        .write(&moqom_client::OutgoingObject::tagged(
+            &b"delta"[..],
+            moqom_client::ObjectProperties::default(),
+        ))
+        .await
+        .unwrap();
+    group.finish().unwrap();
+
+    let (header, objects) = read_group(&connection).await;
+    assert_eq!((header.track_alias.get(), header.group.get()), (7, 3));
+    assert!(header.properties_present);
+    assert_eq!(objects.len(), 2);
+    let moqom_proto::data::SubgroupContent::Normal {
+        payload,
+        properties,
+    } = &objects[0].content
+    else {
+        panic!("a normal object");
+    };
+    assert_eq!(&payload[..], b"key");
+    assert_eq!(
+        moqom_client::ObjectProperties::from_wire(properties).capture_time_micros,
+        Some(1_234_567),
+        "the capture time survives, so latency can be read at the far end"
+    );
+
+    publication.finish().await.unwrap();
+    let Message::PublishDone {
+        request_id,
+        status,
+        stream_count,
+        ..
+    } = control.read().await
+    else {
+        panic!("expected PUBLISH_DONE");
+    };
+    assert_eq!(
+        (request_id.get(), status.get(), stream_count.get()),
+        (0, 2, 1),
+        "TRACK_ENDED, after the one stream it opened"
+    );
+}
+
+#[tokio::test]
+async fn a_refused_publish_reports_why() {
+    let relay = Scripted::start();
+    let connecting = Session::connect_to(
+        relay.addr,
+        "localhost",
+        moqom_client::tls::pinned(relay.certificate.clone()),
+        "t",
+    );
+    let (session, (_connection, mut control, _)) = tokio::join!(connecting, relay.accept(10));
+    let session = session.unwrap();
+
+    let relay_side = async {
+        let Message::Publish { request_id, .. } = control.read().await else {
+            panic!("expected PUBLISH");
+        };
+        control
+            .write(&Message::RequestError {
+                request_id,
+                code: VarInt::from_u32(0x1),
+                retry_interval: VarInt::from_u32(0),
+                reason: ReasonPhrase::truncating("subscribe-only token"),
+            })
+            .await;
+    };
+    let (publication, ()) = tokio::join!(
+        session.publish(track("video"), TrackAlias::new(VarInt::from_u32(1))),
+        relay_side
+    );
+    assert!(matches!(
+        publication,
+        Err(moqom_client::Error::Refused { code: 1, ref reason }) if reason == "subscribe-only token"
+    ));
+}
+
+/// Publish through a Cloudflare relay of our own and read it back, once per
+/// subgroup header shape, to learn which shapes Cloudflare forwards.
+#[tokio::test]
+#[ignore = "needs the network, MOQOM_CF_PUBLISH_TOKEN and MOQOM_CF_SUBSCRIBE_TOKEN"]
+async fn live_cloudflare_publish_shapes() {
+    let publish = std::env::var("MOQOM_CF_PUBLISH_TOKEN").expect("MOQOM_CF_PUBLISH_TOKEN");
+    let subscribe = std::env::var("MOQOM_CF_SUBSCRIBE_TOKEN").expect("MOQOM_CF_SUBSCRIBE_TOKEN");
+    let shapes = [
+        ("default priority, no properties", None, false),
+        ("default priority, properties", None, true),
+        ("priority 128, no properties", Some(128u8), false),
+        ("priority 128, properties", Some(128u8), true),
+    ];
+    for (index, (label, priority, properties)) in shapes.into_iter().enumerate() {
+        let name = format!("shape-{index}-{}", std::process::id());
+        let track = FullTrackName::new(
+            TrackNamespace::from_parts(["probe"]).unwrap(),
+            Bytes::from(name),
+        )
+        .unwrap();
+        let publisher = within(
+            "publisher",
+            Session::connect(DEMO_HOST, DEMO_PORT, &publish),
+        )
+        .await
+        .unwrap();
+        let publication = within(
+            "PUBLISH",
+            publisher.publish(track.clone(), TrackAlias::new(VarInt::from_u32(1))),
+        )
+        .await
+        .unwrap();
+        let subscriber = within(
+            "subscriber",
+            Session::connect(DEMO_HOST, DEMO_PORT, &subscribe),
+        )
+        .await
+        .unwrap();
+        let mut subscription = within("SUBSCRIBE", subscriber.subscribe(track.clone(), None))
+            .await
+            .unwrap();
+
+        let bytes = Draft::D16.scope(|| {
+            let mut header = SubgroupHeader::new(
+                TrackAlias::new(VarInt::from_u32(1)),
+                GroupId::new(VarInt::from_u32(0)),
+                SubgroupSource::Zero,
+            );
+            header.priority = priority;
+            header.properties_present = properties;
+            let mut buf = Vec::new();
+            header.encode(&mut buf);
+            let mut writer = SubgroupWriter::new(&header);
+            let object = if properties {
+                SubgroupObject {
+                    object: 0u32.into(),
+                    content: moqom_proto::data::SubgroupContent::Normal {
+                        payload: Bytes::from_static(b"frame"),
+                        properties: moqom_client::ObjectProperties {
+                            capture_time_micros: Some(1),
+                            ..moqom_client::ObjectProperties::default()
+                        }
+                        .to_wire(),
+                    },
+                }
+            } else {
+                SubgroupObject::new(0u32, Bytes::from_static(b"frame"))
+            };
+            writer.write(&mut buf, &object).unwrap();
+            buf
+        });
+        let _ = publication;
+        let sent = async {
+            let mut stream = publisher
+                .connection()
+                .open_uni()
+                .await
+                .map_err(|e| e.to_string())?;
+            stream.write_all(&bytes).await.map_err(|e| e.to_string())?;
+            stream.finish().map_err(|e| e.to_string())?;
+            stream
+                .stopped()
+                .await
+                .map_err(|e| e.to_string())
+                .map(|code| format!("{code:?}"))
+        };
+        let received = tokio::time::timeout(Duration::from_secs(5), subscription.next_object());
+        let (sent, received) = tokio::join!(sent, received);
+        eprintln!(
+            "{label}: stream end {sent:?}; subscriber {:?}",
+            received.map(|r| r.map(|o| o.map(|o| o.payload)))
+        );
+        publisher.close();
+        subscriber.close();
+    }
+}
+
 /// Against Cloudflare's relay, for real. The demo broadcast `bbb` is
 /// moq-pub's layout: `0.mp4` is the init segment, `<track id>.m4s` the media.
 #[tokio::test]

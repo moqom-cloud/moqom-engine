@@ -1,4 +1,4 @@
-//! A draft-16 subscriber, for Cloudflare's relays.
+//! A draft-16 subscriber and publisher, for Cloudflare's relays.
 //!
 //! Cloudflare runs draft-ietf-moq-transport-16 at
 //! [`DEMO_HOST`], over raw QUIC with the `moqt-16` ALPN. Its session
@@ -17,24 +17,31 @@
 //! - A subscription ends with `UNSUBSCRIBE` (sent when a [`Subscription`] is
 //!   dropped) or the relay's `PUBLISH_DONE`.
 //!
-//! Subscribing is all this does. The relay is told it may make no requests
-//! of us (`MAX_REQUEST_ID` 0), so it cannot `PUBLISH` to this session; one
-//! that does anyway is a protocol violation.
+//! Publishing is publisher-initiated: Cloudflare's draft-16 relays take
+//! `PUBLISH` and not `PUBLISH_NAMESPACE`, so a track is offered with the alias
+//! its objects will carry, and objects follow once `PUBLISH_OK` arrives.
+//!
+//! The relay is told it may make no requests of us (`MAX_REQUEST_ID` 0), so it
+//! cannot `SUBSCRIBE` or `PUBLISH` to this session; one that does anyway is a
+//! protocol violation.
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use moqom_proto::Draft;
 use moqom_proto::control::d16::{
-    ClientRequestIds, Message, TrackRequest, largest_object, setup_param,
+    ClientRequestIds, Message, TrackRequest, largest_object, param, setup_param,
 };
-use moqom_proto::control::{Parameter, Parameters, RequestId};
-use moqom_proto::data::{SubgroupContent, SubgroupHeader, SubgroupReader};
+use moqom_proto::control::{Parameter, Parameters, Properties, ReasonPhrase, RequestId};
+use moqom_proto::data::{
+    SubgroupContent, SubgroupHeader, SubgroupObject, SubgroupReader, SubgroupSource, SubgroupWriter,
+};
 use moqom_proto::error::DecodeError;
-use moqom_proto::model::{FullTrackName, Location, TrackAlias};
+use moqom_proto::model::{FullTrackName, GroupId, Location, TrackAlias};
 use moqom_proto::varint::VarInt;
 use tokio::sync::{Notify, mpsc, oneshot};
 
@@ -42,7 +49,7 @@ pub use moqom_proto::control::d16::Filter;
 
 use crate::Error;
 use crate::properties::ObjectProperties;
-use crate::session::{IMPLEMENTATION, Object, rejection};
+use crate::session::{IMPLEMENTATION, Metadata, Object, OutgoingObject, rejection};
 use crate::tls::install_crypto_provider;
 
 /// Cloudflare's draft-16 relay.
@@ -58,6 +65,14 @@ const PROTOCOL_VIOLATION: u32 = 0x3;
 
 /// `NO_ERROR` (§13.4.1).
 const NO_ERROR: u32 = 0x0;
+
+/// The publisher priority every subgroup header states. Cloudflare drops
+/// subgroups whose header leaves it to the default (types 0x30–0x3D) without
+/// forwarding them, as measured on 21 October 2026.
+const PUBLISHER_PRIORITY: u8 = 128;
+
+/// `TRACK_ENDED` (§13.4.3), the `PUBLISH_DONE` status for a finished track.
+const TRACK_ENDED: u32 = 0x2;
 
 /// How long a data stream naming an alias not yet known is held for the
 /// `SUBSCRIBE_OK` that introduces it. §10.4.2 allows buffering "for a brief
@@ -268,6 +283,57 @@ impl Session {
         }
     }
 
+    /// Offer `track` to the relay, its objects to carry `alias`.
+    ///
+    /// # Errors
+    /// The relay refused, the session failed, or the relay's request limit
+    /// did not rise in time.
+    pub async fn publish(
+        &self,
+        track: FullTrackName,
+        alias: TrackAlias,
+    ) -> Result<Publication, Error> {
+        let request_id = self.allocate().await?;
+        let (answered, answer) = oneshot::channel();
+        lock(&self.shared.pending).insert(request_id, answered);
+        self.send(&Message::Publish {
+            request_id,
+            track,
+            track_alias: alias,
+            parameters: Parameters::new(),
+            extensions: Properties::new(),
+        })
+        .await?;
+        let answer = answer.await.map_err(|_| self.fault())?;
+
+        match answer {
+            Message::PublishOk { parameters, .. } => Ok(Publication {
+                request_id,
+                alias,
+                // FORWARD defaults to 1 when absent.
+                forward: parameters
+                    .get(param::FORWARD)
+                    .and_then(Parameter::as_varint)
+                    .is_none_or(|forward| forward.get() != 0),
+                streams: AtomicU64::new(0),
+                connection: self.connection.clone(),
+                control: Arc::clone(&self.control),
+            }),
+            Message::RequestError { code, reason, .. } => Err(Error::Refused {
+                code: code.get(),
+                reason: reason.to_string(),
+            }),
+            other => Err(Error::Protocol(format!("{other:?} in answer to PUBLISH"))),
+        }
+    }
+
+    /// The QUIC connection, for probing what the relay accepts below the
+    /// session layer.
+    #[must_use]
+    pub const fn connection(&self) -> &quinn::Connection {
+        &self.connection
+    }
+
     /// End the session, saying nothing went wrong.
     pub fn close(&self) {
         self.connection.close(NO_ERROR.into(), b"");
@@ -344,6 +410,115 @@ impl Subscription {
     #[must_use]
     pub fn ended(&self) -> Option<Ended> {
         lock(&self.shared.ended).get(&self.request_id).cloned()
+    }
+}
+
+/// A track the relay accepted with `PUBLISH_OK`.
+///
+/// Lives on its [`Session`]'s connection: closing the session ends it.
+pub struct Publication {
+    /// The `PUBLISH`'s Request ID.
+    pub request_id: RequestId,
+    /// The alias its objects carry.
+    pub alias: TrackAlias,
+    /// `FORWARD` from `PUBLISH_OK`. False means the relay asked for nothing
+    /// to be sent yet, and draft-16 Cloudflare has no `REQUEST_UPDATE` to
+    /// ask again, so objects sent anyway may be dropped.
+    pub forward: bool,
+    /// Data streams opened, for `PUBLISH_DONE`.
+    streams: AtomicU64,
+    connection: quinn::Connection,
+    control: Arc<tokio::sync::Mutex<quinn::SendStream>>,
+}
+
+impl Publication {
+    /// Open group `group` on a new data stream, writing its header.
+    ///
+    /// # Errors
+    /// Opening the stream, or writing the header.
+    pub async fn open_group(&self, group: u64, metadata: Metadata) -> Result<GroupWriter, Error> {
+        let group = GroupId::new(VarInt::new(group)?);
+        let mut stream = self.connection.open_uni().await?;
+        let mut header = SubgroupHeader::new(self.alias, group, SubgroupSource::Zero);
+        header.priority = Some(PUBLISHER_PRIORITY);
+        header.properties_present = metadata == Metadata::Present;
+
+        let mut buf = BytesMut::new();
+        DRAFT.scope(|| header.encode(&mut buf));
+        stream.write_all(&buf).await.map_err(Error::write)?;
+        self.streams.fetch_add(1, Ordering::Relaxed);
+
+        Ok(GroupWriter {
+            writer: SubgroupWriter::new(&header).in_draft(DRAFT),
+            properties_present: header.properties_present,
+            stream,
+            next: 0,
+        })
+    }
+
+    /// Say the track has ended, with `PUBLISH_DONE`.
+    ///
+    /// # Errors
+    /// The control stream could not be written.
+    pub async fn finish(self) -> Result<(), Error> {
+        let done = Message::PublishDone {
+            request_id: self.request_id,
+            status: VarInt::from_u32(TRACK_ENDED),
+            stream_count: VarInt::new(self.streams.load(Ordering::Relaxed))?,
+            reason: ReasonPhrase::truncating("track ended"),
+        };
+        write(&mut *self.control.lock().await, &done).await
+    }
+}
+
+/// A group being written one object at a time, IDs assigned from zero.
+///
+/// Dropping this without [`Self::finish`] resets the stream, so a group
+/// abandoned halfway cannot pass for a complete one.
+pub struct GroupWriter {
+    stream: quinn::SendStream,
+    writer: SubgroupWriter,
+    properties_present: bool,
+    next: u32,
+}
+
+impl GroupWriter {
+    /// Append an object, and return the ID it was given.
+    ///
+    /// # Errors
+    /// Encoding or writing the object, or properties in a group that
+    /// [`Metadata::Absent`] opened.
+    pub async fn write(&mut self, object: &OutgoingObject<'_>) -> Result<u64, Error> {
+        if !self.properties_present && !object.properties.is_empty() {
+            return Err(Error::PropertiesNotDeclared);
+        }
+        let id = self.next;
+        let payload = Bytes::copy_from_slice(object.payload);
+        let encoded = if self.properties_present {
+            SubgroupObject {
+                object: id.into(),
+                content: SubgroupContent::Normal {
+                    payload,
+                    properties: object.properties.to_wire(),
+                },
+            }
+        } else {
+            SubgroupObject::new(id, payload)
+        };
+
+        let mut buf = BytesMut::new();
+        self.writer.write(&mut buf, &encoded)?;
+        self.stream.write_all(&buf).await.map_err(Error::write)?;
+        self.next = self.next.saturating_add(1);
+        Ok(u64::from(id))
+    }
+
+    /// Close the group.
+    ///
+    /// # Errors
+    /// The stream was already reset.
+    pub fn finish(mut self) -> Result<(), Error> {
+        self.stream.finish().map_err(Error::write)
     }
 }
 
@@ -473,6 +648,7 @@ fn route(shared: &Shared, message: Message) -> Result<(), String> {
             shared.raised.notify_waiters();
         }
         Message::SubscribeOk { request_id, .. }
+        | Message::PublishOk { request_id, .. }
         | Message::RequestError { request_id, .. }
         | Message::RequestOk { request_id, .. } => {
             let Some(waiting) = lock(&shared.pending).remove(&request_id) else {

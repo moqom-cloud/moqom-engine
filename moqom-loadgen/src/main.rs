@@ -53,6 +53,20 @@
 //! moqom-load fanout --relay 127.0.0.1:4433 --metrics 127.0.0.1:9091 \
 //!   --subscribers 200 --seconds 20 --insecure
 //! ```
+//!
+//! # Cloudflare's relay
+//!
+//! `--cloudflare` drives Cloudflare's draft-16 relay with the same traffic and
+//! the same loss accounting. Tokens come from Cloudflare rather than from this
+//! harness, and Cloudflare exposes no counters, so a run there reports only
+//! what arrived:
+//!
+//! ```text
+//! export MOQOM_CF_PUBLISH_TOKEN=...    # the relay's publish-and-subscribe token
+//! export MOQOM_CF_SUBSCRIBE_TOKEN=...  # its subscribe-only token, shared by every viewer
+//! moqom-load fanout --cloudflare --relay draft-16.cloudflare.mediaoverquic.com:443 \
+//!   --subscribers 1000 --seconds 90
+//! ```
 
 mod film;
 mod mint;
@@ -64,13 +78,13 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
 use moqom_client::{
     Announcement, Bytes, Credentials, DeviceKey, FullTrackName, Metadata, Object, ObjectProperties,
-    OutgoingObject, Session, TrackNamespace,
+    OutgoingObject, Session, TrackNamespace, cloudflare,
 };
 use moqom_media::annexb::{AccessUnit, Codec};
 use tokio::sync::{mpsc, watch};
@@ -167,6 +181,40 @@ const DOES_NOT_EXIST: u64 = 0x10;
 
 /// How long to leave a track alone before asking for it again.
 const RETRY_SUBSCRIBE: Duration = Duration::from_millis(500);
+
+/// Cloudflare's refusal of a track in a namespace that exists: `INTERNAL_ERROR`
+/// rather than `DOES_NOT_EXIST`, so it is retried the same way.
+const CLOUDFLARE_NO_TRACK: u64 = 0x0;
+
+/// How long a Cloudflare subscriber waits before asking again for a track
+/// that is not there yet. Slower than [`RETRY_SUBSCRIBE`] because each refusal
+/// spends one of a session's few Request IDs.
+const CF_RETRY_SUBSCRIBE: Duration = Duration::from_secs(2);
+
+/// Cloudflare's reason for refusing a `PUBLISH` that no subscriber has asked
+/// for yet.
+const CF_UNINTERESTED: &str = "uninterested";
+
+/// How long a Cloudflare publisher keeps offering its track to nobody.
+const CF_PUBLISH_PATIENCE: Duration = Duration::from_mins(5);
+
+/// How long a Cloudflare subscriber waits after a refused setup before
+/// connecting again.
+const CF_RETRY_SETUP: Duration = Duration::from_secs(1);
+
+/// Setups Cloudflare refused and a subscriber retried, across this host. A
+/// burst of hundreds of sessions from one address on one token is refused in
+/// part, which is a property of the relay worth reporting.
+static CF_SETUP_RETRIES: AtomicU64 = AtomicU64::new(0);
+
+/// Where the publisher's Cloudflare token is read from.
+const CF_PUBLISH_TOKEN: &str = "MOQOM_CF_PUBLISH_TOKEN";
+
+/// Where the subscribers' shared Cloudflare token is read from.
+const CF_SUBSCRIBE_TOKEN: &str = "MOQOM_CF_SUBSCRIBE_TOKEN";
+
+/// The alias the publisher gives its track on Cloudflare.
+const CF_ALIAS: u32 = 1;
 
 /// Stands in for the parameter sets a real keyframe carries.
 ///
@@ -267,6 +315,17 @@ struct Common {
     /// Skip certificate verification, for a self-signed development relay.
     #[arg(long)]
     insecure: bool,
+
+    /// Drive Cloudflare's draft-16 relay instead of a MOQOM relay.
+    ///
+    /// The publisher presents `MOQOM_CF_PUBLISH_TOKEN` and every subscriber
+    /// shares `MOQOM_CF_SUBSCRIBE_TOKEN`, since a Cloudflare relay holds at most
+    /// ten tokens. Cloudflare has no counters to scrape, so `--metrics` is
+    /// refused. Cloudflare never says when a track gains a subscriber, so on a
+    /// fleet start the `watch` hosts before `publish`: they retry until the
+    /// track exists.
+    #[arg(long)]
+    cloudflare: bool,
 
     /// How often to print a live line while the run is in progress, in seconds.
     ///
@@ -397,6 +456,14 @@ struct Crowd {
     /// mistake here that produces a plausible-looking wrong answer.
     #[arg(long, default_value_t = 0)]
     first_viewer: usize,
+
+    /// Sessions to open per second, or 0 to open them all at once.
+    ///
+    /// Thousands of handshakes at once from one address are a burst no real
+    /// audience produces: a relay may refuse some, and the host's own CPU spent
+    /// on them delays the frames that arrive meanwhile.
+    #[arg(long, default_value_t = 0)]
+    ramp: u32,
 }
 
 #[derive(clap::Args)]
@@ -483,9 +550,18 @@ async fn run() -> Fallible<bool> {
             println!("{}", mint.token(&who, 0, args.seconds)?);
             Ok(true)
         }
-        Command::Fanout(args) => fanout(&args).await,
-        Command::Publish(args) => publish_only(&args).await,
-        Command::Watch(args) => watch_only(&args).await,
+        Command::Fanout(args) => {
+            check_target(&args.common, &[CF_PUBLISH_TOKEN, CF_SUBSCRIBE_TOKEN])?;
+            fanout(&args).await
+        }
+        Command::Publish(args) => {
+            check_target(&args.common, &[CF_PUBLISH_TOKEN])?;
+            publish_only(&args).await
+        }
+        Command::Watch(args) => {
+            check_target(&args.common, &[CF_SUBSCRIBE_TOKEN])?;
+            watch_only(&args).await
+        }
     }
 }
 
@@ -516,19 +592,7 @@ async fn fanout(args: &FanoutArgs) -> Fallible<bool> {
     // fan-out deduplication as missing.
     let before = read_metrics(args.common.metrics.as_deref()).await;
 
-    let token = mint.token(&publisher, 0b11, TOKEN_SECONDS)?;
-    let mut session = connect(
-        addr,
-        &server_name,
-        args.common.insecure,
-        &token,
-        &publisher.key,
-    )
-    .await?;
-    let announcement = session
-        .announce(track.namespace().clone())
-        .await
-        .map_err(|e| format!("announcing the track: {e}"))?;
+    let offered = offer(&args.common, &mint, &publisher, &track, addr, &server_name).await?;
 
     // Subscribers first, so the publisher is asked for the track before it sends
     // anything. A subscription arriving mid-group would start at the next one,
@@ -543,17 +607,14 @@ async fn fanout(args: &FanoutArgs) -> Fallible<bool> {
         &track,
         0,
     );
-    let refused = wait_for_subscribers(&mut crowd.arrived, args.crowd.subscribers).await?;
+    let refused =
+        wait_for_subscribers(&mut crowd.arrived, args.crowd.subscribers, READY_PATIENCE).await?;
     if refused > 0 {
         eprintln!("{refused} subscriber(s) never started; the rest continue");
     }
-    // The relay asks for a track once however many people are watching, so this
-    // is the moment the publisher learns anybody is there at all.
-    tokio::time::timeout(READY_PATIENCE, announcement.subscribed())
-        .await
-        .map_err(|_| "the relay never asked for the track")?;
-    let alias = announcement.alias();
-    let _renewing = keep_renewed(announcement, Arc::clone(&mint), publisher.clone());
+    let outlet = offered
+        .when_watched(Arc::clone(&mint), publisher.clone())
+        .await?;
 
     let live = spawn_live(
         args.common.live,
@@ -561,14 +622,14 @@ async fn fanout(args: &FanoutArgs) -> Fallible<bool> {
         args.common.metrics.clone(),
         Some(Arc::clone(&crowd.progress)),
     );
-    let sent = publish(&session, alias, &args.shape, film.as_ref()).await?;
+    let sent = publish(&outlet, &args.shape, film.as_ref()).await?;
     live.abort();
-    // Drop nothing yet: the publisher's session has to outlive the drain below,
+    // End nothing yet: the publisher's session has to outlive the drain below,
     // or the relay withdraws the track and the tail of the last group is lost for
     // reasons that would read as loss.
     let drained = drain(&crowd.stop, crowd.watchers, &crowd.progress).await;
     let after = read_metrics(args.common.metrics.as_deref()).await;
-    drop(session);
+    outlet.end().await;
 
     Ok(report(
         &Reporting {
@@ -594,29 +655,15 @@ async fn publish_only(args: &PublishArgs) -> Fallible<bool> {
     // the growth is measured over.
     let before = read_metrics(args.common.metrics.as_deref()).await;
 
-    let token = mint.token(&publisher, 0b11, TOKEN_SECONDS)?;
-    let mut session = connect(
-        addr,
-        &server_name,
-        args.common.insecure,
-        &token,
-        &publisher.key,
-    )
-    .await?;
-    let announcement = session
-        .announce(track.namespace().clone())
-        .await
-        .map_err(|e| format!("announcing the track: {e}"))?;
-    eprintln!("announced {track}; waiting for the first subscriber");
+    let offered = offer(&args.common, &mint, &publisher, &track, addr, &server_name).await?;
+    eprintln!("offered {track}; waiting for the first subscriber");
 
     // Nothing is published until somebody is watching, because objects sent before
     // the relay has asked for the track are not pulled and would be silently lost
     // — and on a fleet the subscriber hosts start after this one.
-    tokio::time::timeout(READY_PATIENCE, announcement.subscribed())
-        .await
-        .map_err(|_| "nobody subscribed, so there was nothing to publish to")?;
-    let alias = announcement.alias();
-    let _renewing = keep_renewed(announcement, Arc::clone(&mint), publisher.clone());
+    let outlet = offered
+        .when_watched(Arc::clone(&mint), publisher.clone())
+        .await?;
 
     let live = spawn_live(
         args.common.live,
@@ -624,7 +671,7 @@ async fn publish_only(args: &PublishArgs) -> Fallible<bool> {
         args.common.metrics.clone(),
         None,
     );
-    let sent = publish(&session, alias, &args.shape, film.as_ref()).await?;
+    let sent = publish(&outlet, &args.shape, film.as_ref()).await?;
     println!(
         "published     {} frames in {} group(s), {:.1} MiB at {:.1}/s",
         sent.frames,
@@ -636,6 +683,7 @@ async fn publish_only(args: &PublishArgs) -> Fallible<bool> {
     eprintln!("holding the track open for {}s", args.linger);
     tokio::time::sleep(Duration::from_secs(args.linger)).await;
     live.abort();
+    outlet.end().await;
 
     // The relay's own account belongs to whichever host was given --metrics, and
     // on a fleet that should be this one: it is the host that started first, so
@@ -682,11 +730,15 @@ async fn watch_only(args: &WatchArgs) -> Fallible<bool> {
         &track,
         args.wait,
     );
-    let refused = wait_for_subscribers(&mut crowd.arrived, args.crowd.subscribers).await?;
+    crowd.counting.store(false, Ordering::Relaxed);
+    let patience = READY_PATIENCE.max(Duration::from_secs(args.wait));
+    let refused =
+        wait_for_subscribers(&mut crowd.arrived, args.crowd.subscribers, patience).await?;
     if refused > 0 {
         eprintln!("{refused} subscriber(s) never started; the rest continue");
     }
 
+    crowd.counting.store(true, Ordering::Relaxed);
     eprintln!("watching for {}s", args.shape.seconds);
     let live = spawn_live(
         args.common.live,
@@ -721,6 +773,7 @@ struct Crowded {
     arrived: mpsc::Receiver<Result<(), String>>,
     stop: watch::Sender<bool>,
     progress: Arc<AtomicU64>,
+    counting: Arc<AtomicBool>,
 }
 
 /// Start this host's share of the subscribers.
@@ -740,24 +793,39 @@ fn gather(
     let (ready, arrived) = mpsc::channel(crowd.subscribers.max(1));
     let (stop, listening) = watch::channel(false);
     let progress = Arc::new(AtomicU64::new(0));
+    let counting = Arc::new(AtomicBool::new(true));
     let mut watchers = Vec::with_capacity(crowd.subscribers);
+    let shared = cloudflare_token(common, CF_SUBSCRIBE_TOKEN).map(Arc::<str>::from);
 
     for n in 0..crowd.subscribers {
-        let who = Identity::viewer(&common.tenant, &common.room, crowd.first_viewer + n);
-        let token = mint
-            .token(&who, 0, TOKEN_SECONDS)
-            .expect("TOKEN_SECONDS is within the lifetime a token may have");
+        let admission = if let Some(token) = &shared {
+            Admission::Cloudflare(Arc::clone(token))
+        } else {
+            let who = Identity::viewer(&common.tenant, &common.room, crowd.first_viewer + n);
+            let token = mint
+                .token(&who, 0, TOKEN_SECONDS)
+                .expect("TOKEN_SECONDS is within the lifetime a token may have");
+            Admission::Moqom {
+                token,
+                mint: Arc::clone(mint),
+                who,
+            }
+        };
         watchers.push(tokio::spawn(watch_track(
             Watching {
                 addr,
                 server_name: server_name.to_owned(),
                 insecure: common.insecure,
-                token,
-                mint: Arc::clone(mint),
-                who,
+                admission,
                 track: track.clone(),
                 progress: Arc::clone(&progress),
                 wait: Duration::from_secs(wait),
+                delay: if crowd.ramp == 0 {
+                    Duration::ZERO
+                } else {
+                    Duration::from_secs(1) * u32::try_from(n).unwrap_or(u32::MAX) / crowd.ramp
+                },
+                counting: Arc::clone(&counting),
             },
             ready.clone(),
             listening.clone(),
@@ -769,6 +837,7 @@ fn gather(
         arrived,
         stop,
         progress,
+        counting,
     }
 }
 
@@ -777,16 +846,285 @@ struct Watching {
     addr: SocketAddr,
     server_name: String,
     insecure: bool,
-    token: String,
-    /// What renews `token`, for the identity it was minted for.
-    mint: Arc<Mint>,
-    who: Identity,
+    admission: Admission,
     track: FullTrackName,
     /// Objects received across every subscriber, so the drain can tell delivery
     /// still in flight from delivery that has stopped.
     progress: Arc<AtomicU64>,
     /// How long to keep retrying a track the relay says nobody publishes.
     wait: Duration,
+    /// How long after the host starts this subscriber connects.
+    delay: Duration,
+    /// Whether objects count yet. A watch host opens it once all of its own
+    /// subscribers are in, so frames that arrived while it was still connecting
+    /// the rest don't reach the results.
+    counting: Arc<AtomicBool>,
+}
+
+/// What a subscriber presents to be let in.
+enum Admission {
+    /// A token this harness minted, renewed by `mint` for `who`.
+    Moqom {
+        token: String,
+        mint: Arc<Mint>,
+        who: Identity,
+    },
+    /// Cloudflare's subscribe token, the same for every subscriber.
+    Cloudflare(Arc<str>),
+}
+
+/// A subscriber's open subscription, on whichever relay the run drives.
+///
+/// Holds the session too: dropping it closes the connection.
+#[allow(clippy::large_enum_variant)]
+enum Feed {
+    Moqom {
+        _session: Session,
+        subscription: moqom_client::Subscription,
+    },
+    Cloudflare {
+        _session: cloudflare::Session,
+        subscription: cloudflare::Subscription,
+    },
+}
+
+impl Feed {
+    async fn next_object(&mut self) -> Result<Option<Object>, moqom_client::Error> {
+        match self {
+            Self::Moqom { subscription, .. } => subscription.next_object().await,
+            Self::Cloudflare { subscription, .. } => subscription.next_object().await,
+        }
+    }
+
+    /// Present a fresh token where the relay expects one. Cloudflare's last
+    /// as long as they were issued for, so there is nothing to renew there.
+    async fn renew(&mut self, admission: &Admission) -> Result<(), String> {
+        let (Self::Moqom { subscription, .. }, Admission::Moqom { mint, who, .. }) =
+            (self, admission)
+        else {
+            return Ok(());
+        };
+        let token = mint
+            .token(who, 0, TOKEN_SECONDS)
+            .map_err(|e| e.to_string())?;
+        subscription
+            .renew(&Credentials::proven(token.as_bytes(), &who.key))
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// The publisher's track, offered and not yet watched.
+#[allow(clippy::large_enum_variant)]
+enum Offered {
+    Moqom {
+        session: Session,
+        announcement: Announcement,
+    },
+    Cloudflare {
+        session: cloudflare::Session,
+        publication: cloudflare::Publication,
+    },
+}
+
+/// The publisher's track, being watched and ready for objects.
+#[allow(clippy::large_enum_variant)]
+enum Outlet {
+    Moqom {
+        session: Session,
+        alias: moqom_client::TrackAlias,
+        _renewing: Renewing,
+    },
+    Cloudflare {
+        session: cloudflare::Session,
+        publication: cloudflare::Publication,
+    },
+}
+
+/// A group being written, on whichever relay the run drives.
+enum Group {
+    Moqom(moqom_client::GroupWriter),
+    Cloudflare(cloudflare::GroupWriter),
+}
+
+impl Offered {
+    /// Wait until the relay wants the track, then hand back where to write it.
+    ///
+    /// A MOQOM relay asks for a track once however many people are watching, so
+    /// that is the moment the publisher learns anybody is there. Cloudflare
+    /// accepted the track with `PUBLISH_OK` and never says who joined, so the
+    /// caller's own ordering is all there is.
+    async fn when_watched(self, mint: Arc<Mint>, publisher: Identity) -> Fallible<Outlet> {
+        match self {
+            Self::Moqom {
+                session,
+                announcement,
+            } => {
+                tokio::time::timeout(READY_PATIENCE, announcement.subscribed())
+                    .await
+                    .map_err(|_| "the relay never asked for the track")?;
+                let alias = announcement.alias();
+                Ok(Outlet::Moqom {
+                    session,
+                    alias,
+                    _renewing: keep_renewed(announcement, mint, publisher),
+                })
+            }
+            Self::Cloudflare {
+                session,
+                publication,
+            } => {
+                if !publication.forward {
+                    eprintln!(
+                        "Cloudflare accepted the track with FORWARD 0, so objects may not be forwarded"
+                    );
+                }
+                Ok(Outlet::Cloudflare {
+                    session,
+                    publication,
+                })
+            }
+        }
+    }
+}
+
+impl Outlet {
+    async fn open_group(&self, group: u64) -> Result<Group, moqom_client::Error> {
+        match self {
+            Self::Moqom { session, alias, .. } => session
+                .open_group(*alias, group, Metadata::Present)
+                .await
+                .map(Group::Moqom),
+            Self::Cloudflare { publication, .. } => publication
+                .open_group(group, Metadata::Present)
+                .await
+                .map(Group::Cloudflare),
+        }
+    }
+
+    /// Withdraw the track and close the session.
+    async fn end(self) {
+        match self {
+            Self::Moqom { session, .. } => drop(session),
+            Self::Cloudflare {
+                session,
+                publication,
+            } => {
+                if let Err(e) = publication.finish().await {
+                    eprintln!("ending the track on Cloudflare: {e}");
+                }
+                session.close();
+            }
+        }
+    }
+}
+
+impl Group {
+    async fn write(&mut self, object: &OutgoingObject<'_>) -> Result<u64, moqom_client::Error> {
+        match self {
+            Self::Moqom(group) => group.write(object).await,
+            Self::Cloudflare(group) => group.write(object).await,
+        }
+    }
+
+    fn finish(self) -> Result<(), moqom_client::Error> {
+        match self {
+            Self::Moqom(group) => group.finish(),
+            Self::Cloudflare(group) => group.finish(),
+        }
+    }
+}
+
+/// Connect the publisher and offer its track to the relay.
+async fn offer(
+    common: &Common,
+    mint: &Mint,
+    publisher: &Identity,
+    track: &FullTrackName,
+    addr: SocketAddr,
+    server_name: &str,
+) -> Fallible<Offered> {
+    if let Some(token) = cloudflare_token(common, CF_PUBLISH_TOKEN) {
+        let connect = || async {
+            cloudflare::Session::connect_to(
+                addr,
+                server_name,
+                if common.insecure {
+                    moqom_client::tls::insecure()
+                } else {
+                    moqom_client::tls::native()
+                },
+                &token,
+            )
+            .await
+            .map_err(|e| format!("connecting the publisher to Cloudflare: {e}"))
+        };
+        // Cloudflare refuses a PUBLISH nobody has subscribed to yet, so the
+        // publisher waits for the first subscriber the way a MOQOM one does.
+        let deadline = Instant::now() + CF_PUBLISH_PATIENCE;
+        let mut session = connect().await?;
+        loop {
+            match session
+                .publish(track.clone(), moqom_client::TrackAlias::from(CF_ALIAS))
+                .await
+            {
+                Ok(publication) => {
+                    return Ok(Offered::Cloudflare {
+                        session,
+                        publication,
+                    });
+                }
+                Err(moqom_client::Error::Refused { ref reason, .. })
+                    if reason == CF_UNINTERESTED && Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(CF_RETRY_SUBSCRIBE).await;
+                }
+                Err(moqom_client::Error::RequestIdsExhausted) if Instant::now() < deadline => {
+                    session.close();
+                    session = connect().await?;
+                }
+                Err(e) => return Err(format!("publishing the track: {e}").into()),
+            }
+        }
+    }
+    let token = mint.token(publisher, 0b11, TOKEN_SECONDS)?;
+    let mut session = connect(addr, server_name, common.insecure, &token, &publisher.key).await?;
+    let announcement = session
+        .announce(track.namespace().clone())
+        .await
+        .map_err(|e| format!("announcing the track: {e}"))?;
+    Ok(Offered::Moqom {
+        session,
+        announcement,
+    })
+}
+
+/// The Cloudflare token in `variable`, when this run drives Cloudflare.
+///
+/// Checked up front by [`check_target`], so a missing one is a bug here.
+fn cloudflare_token(common: &Common, variable: &str) -> Option<String> {
+    common.cloudflare.then(|| {
+        std::env::var(variable).unwrap_or_else(|_| panic!("{variable} was checked at startup"))
+    })
+}
+
+/// Refuse a combination of flags and environment that cannot run.
+fn check_target(common: &Common, needs: &[&str]) -> Fallible<()> {
+    if !common.cloudflare {
+        return Ok(());
+    }
+    if common.metrics.is_some() {
+        return Err("--metrics reads a MOQOM relay's counters; Cloudflare has none".into());
+    }
+    for variable in needs {
+        if std::env::var(variable).map_or(true, |token| token.is_empty()) {
+            return Err(format!(
+                "--cloudflare needs {variable}: a token from the Cloudflare relay"
+            )
+            .into());
+        }
+    }
+    Ok(())
 }
 
 /// What the publisher managed to send.
@@ -816,6 +1154,9 @@ struct Tally {
     latencies: Vec<Duration>,
     /// Why this subscriber stopped early, if it did.
     fault: Option<String>,
+    /// When the first and the latest object arrived.
+    first: Option<Instant>,
+    last: Option<Instant>,
 }
 
 /// What a subscriber did not get, read out of the numbering.
@@ -835,6 +1176,9 @@ impl Losses {
 
 impl Tally {
     fn record(&mut self, object: &Object) {
+        let now = Instant::now();
+        self.first.get_or_insert(now);
+        self.last = Some(now);
         self.objects = self.objects.saturating_add(1);
         self.bytes = self.bytes.saturating_add(object.payload.len() as u64);
         *self.per_group.entry(object.group.get()).or_default() += 1;
@@ -886,32 +1230,15 @@ async fn watch_track(
 ) -> Tally {
     let mut tally = Tally::default();
 
-    let session = connect(
-        watching.addr,
-        &watching.server_name,
-        watching.insecure,
-        &watching.token,
-        &watching.who.key,
-    )
-    .await;
-    let mut session = match session {
-        Ok(session) => session,
+    tokio::time::sleep(watching.delay).await;
+    let mut feed = match open_feed(&watching).await {
+        Ok(feed) => feed,
         Err(e) => {
             let _ = ready.send(Err(e.to_string())).await;
             tally.fault = Some(e.to_string());
             return tally;
         }
     };
-
-    let mut subscription =
-        match subscribe_when_published(&mut session, &watching.track, watching.wait).await {
-            Ok(subscription) => subscription,
-            Err(e) => {
-                let _ = ready.send(Err(e.to_string())).await;
-                tally.fault = Some(e.to_string());
-                return tally;
-            }
-        };
     if ready.send(Ok(())).await.is_err() {
         return tally;
     }
@@ -922,21 +1249,16 @@ async fn watch_track(
         tokio::select! {
             _ = listening.changed() => break,
             _ = renew.tick() => {
-                let renewed = match watching.mint.token(&watching.who, 0, TOKEN_SECONDS) {
-                    Ok(token) => subscription
-                        .renew(&Credentials::proven(token.as_bytes(), &watching.who.key))
-                        .await
-                        .map_err(|e| e.to_string()),
-                    Err(e) => Err(e.to_string()),
-                };
-                if let Err(e) = renewed {
+                if let Err(e) = feed.renew(&watching.admission).await {
                     tally.fault = Some(format!("renewing the token: {e}"));
                     break;
                 }
             }
-                next = subscription.next_object() => match next {
+            next = feed.next_object() => match next {
                 Ok(Some(object)) => {
-                    tally.record(&object);
+                    if watching.counting.load(Ordering::Relaxed) {
+                        tally.record(&object);
+                    }
                     watching.progress.fetch_add(1, Ordering::Relaxed);
                 }
                 // The session ended, which at this point means the publisher
@@ -953,13 +1275,82 @@ async fn watch_track(
     // Whatever has already arrived is part of what the relay delivered, so it is
     // collected rather than dropped on the floor. Stopping the loop above the
     // instant the run ends would count objects sitting in this subscriber's own
-    // buffer as objects that never came, which reads as loss and is not.
-    while let Ok(Ok(Some(object))) =
-        tokio::time::timeout(LAST_GASP, subscription.next_object()).await
-    {
+    // buffer as objects that never came, which reads as loss and is not. The
+    // window is fixed, because a publisher still sending would refill it forever.
+    let until = tokio::time::Instant::now() + LAST_GASP;
+    while let Ok(Ok(Some(object))) = tokio::time::timeout_at(until, feed.next_object()).await {
         tally.record(&object);
     }
     tally
+}
+
+/// Connect one subscriber and subscribe it, on whichever relay the run drives.
+async fn open_feed(watching: &Watching) -> Result<Feed, moqom_client::Error> {
+    match &watching.admission {
+        Admission::Moqom { token, who, .. } => {
+            let mut session = connect(
+                watching.addr,
+                &watching.server_name,
+                watching.insecure,
+                token,
+                &who.key,
+            )
+            .await?;
+            let subscription =
+                subscribe_when_published(&mut session, &watching.track, watching.wait).await?;
+            Ok(Feed::Moqom {
+                _session: session,
+                subscription,
+            })
+        }
+        Admission::Cloudflare(token) => {
+            let connect = || {
+                cloudflare::Session::connect_to(
+                    watching.addr,
+                    &watching.server_name,
+                    if watching.insecure {
+                        moqom_client::tls::insecure()
+                    } else {
+                        moqom_client::tls::native()
+                    },
+                    token,
+                )
+            };
+            let deadline = Instant::now() + watching.wait;
+            let mut session = loop {
+                match connect().await {
+                    Ok(session) => break session,
+                    Err(_) if Instant::now() < deadline => {
+                        CF_SETUP_RETRIES.fetch_add(1, Ordering::Relaxed);
+                        tokio::time::sleep(CF_RETRY_SETUP).await;
+                    }
+                    Err(e) => return Err(e),
+                }
+            };
+            let subscription = loop {
+                match session.subscribe(watching.track.clone(), None).await {
+                    Ok(subscription) => break subscription,
+                    Err(moqom_client::Error::Refused { code, .. })
+                        if (code == DOES_NOT_EXIST || code == CLOUDFLARE_NO_TRACK)
+                            && Instant::now() < deadline =>
+                    {
+                        tokio::time::sleep(CF_RETRY_SUBSCRIBE).await;
+                    }
+                    // Every refused SUBSCRIBE spends a Request ID, and Cloudflare
+                    // never raises the limit, so a long wait needs a new session.
+                    Err(moqom_client::Error::RequestIdsExhausted) if Instant::now() < deadline => {
+                        session.close();
+                        session = connect().await?;
+                    }
+                    Err(e) => return Err(e),
+                }
+            };
+            Ok(Feed::Cloudflare {
+                _session: session,
+                subscription,
+            })
+        }
+    }
 }
 
 /// Subscribe, retrying while the relay says the track is not published here.
@@ -997,12 +1388,7 @@ async fn subscribe_when_published(
 /// those are decided per frame and everything about pacing, timing and accounting
 /// is shared -- which is what makes a before-and-after pair of runs comparable
 /// when one of them used a file.
-async fn publish(
-    session: &Session,
-    alias: moqom_client::TrackAlias,
-    shape: &Shape,
-    film: Option<&Film>,
-) -> Fallible<Sent> {
+async fn publish(outlet: &Outlet, shape: &Shape, film: Option<&Film>) -> Fallible<Sent> {
     let synthetic = vec![0x5a; shape.frame_bytes];
     let interval = Duration::from_secs_f64(1.0 / shape.fps.max(0.001));
     let mut ticker = tokio::time::interval(interval);
@@ -1023,7 +1409,7 @@ async fn publish(
     let mut group = 0_u64;
     let mut within = shape.frames_per_group;
     let mut frame = 0_usize;
-    let mut writer: Option<moqom_client::GroupWriter> = None;
+    let mut writer: Option<Group> = None;
     match film {
         Some(film) => eprintln!(
             "publishing for {}s from {} frames in {} group(s), {:.2} Mbit/s at {} fps",
@@ -1053,7 +1439,7 @@ async fn publish(
             if let Some(open) = writer.take() {
                 open.finish()?;
             }
-            writer = Some(session.open_group(alias, group, Metadata::Present).await?);
+            writer = Some(outlet.open_group(group).await?);
             group = group.saturating_add(1);
             sent.groups = sent.groups.saturating_add(1);
             within = 0;
@@ -1143,17 +1529,19 @@ async fn drain(
     tallies
 }
 
-/// Wait for every subscriber to be watching, or for them all to have answered.
+/// Wait for every subscriber to be watching, or for them all to have answered,
+/// giving up when none arrives for `patience`.
 async fn wait_for_subscribers(
     arrived: &mut mpsc::Receiver<Result<(), String>>,
     expected: usize,
+    patience: Duration,
 ) -> Fallible<usize> {
     let mut watching = 0;
     let mut refused = 0;
     let mut first_reason = None;
 
     while watching + refused < expected {
-        let next = tokio::time::timeout(READY_PATIENCE, arrived.recv())
+        let next = tokio::time::timeout(patience, arrived.recv())
             .await
             .map_err(|_| {
                 format!("only {watching} of {expected} subscribers were watching in time")
@@ -1260,13 +1648,18 @@ async fn connect(
     token: &str,
     key: &DeviceKey,
 ) -> Result<Session, moqom_client::Error> {
-    let tls = if insecure {
-        moqom_client::tls::insecure()
-    } else {
-        moqom_client::tls::native()
-    };
     let credentials = Credentials::proven(token.as_bytes(), key);
-    Session::connect(addr, server_name, tls, Some(&credentials)).await
+    Session::connect(
+        addr,
+        server_name,
+        if insecure {
+            moqom_client::tls::insecure()
+        } else {
+            moqom_client::tls::native()
+        },
+        Some(&credentials),
+    )
+    .await
 }
 
 /// `HOST:PORT` as the name to verify and the address to reach.
@@ -1306,17 +1699,7 @@ fn report(
     let least = tallies.iter().map(|t| t.objects).min().unwrap_or(0);
     let most = tallies.iter().map(|t| t.objects).max().unwrap_or(0);
 
-    // The publisher's own elapsed time when there is one, and the nominal run
-    // length otherwise. A subscriber host has no view of when the publisher
-    // started, so its rates are over the window it was asked to watch.
-    let seconds = about
-        .sent
-        .map_or_else(
-            || Duration::from_secs(about.shape.seconds),
-            |sent| sent.elapsed,
-        )
-        .as_secs_f64()
-        .max(f64::EPSILON);
+    let seconds = window(about, tallies);
 
     let mut latencies: Vec<Duration> = tallies.iter().flat_map(|t| t.latencies.clone()).collect();
     latencies.sort_unstable();
@@ -1364,6 +1747,10 @@ fn report(
         (bytes as f64 * 8.0) / seconds / 1_000_000.0,
     );
 
+    let retried = CF_SETUP_RETRIES.load(Ordering::Relaxed);
+    if retried > 0 {
+        println!("setup        {retried} session setup(s) refused by the relay and retried");
+    }
     for fault in faulted.iter().take(3) {
         println!("fault        {fault}");
     }
@@ -1388,7 +1775,7 @@ fn report(
     if let (Some(before), Some(after)) = (before, after) {
         findings.extend(what_the_relay_says(about, before, after));
     } else {
-        println!("relay        not scraped; pass --metrics to check what it decided");
+        println!("relay        not scraped; only --metrics on a MOQOM relay shows what it decided");
     }
 
     println!();
@@ -1409,6 +1796,29 @@ fn report(
         println!("PROBLEM      {finding}");
     }
     false
+}
+
+/// The seconds a report's rates are over.
+///
+/// The publisher's own elapsed time when there is one. A watch-only host uses
+/// the span its objects actually arrived in: its window and the publisher's
+/// need not line up, and on Cloudflare they do not, because the publisher
+/// starts with the first subscriber.
+fn window(about: &Reporting<'_>, tallies: &[Tally]) -> f64 {
+    let span = tallies
+        .iter()
+        .filter_map(|t| t.first)
+        .min()
+        .zip(tallies.iter().filter_map(|t| t.last).max())
+        .map(|(first, last)| last.saturating_duration_since(first));
+    about
+        .sent
+        .map_or_else(
+            || span.unwrap_or(Duration::from_secs(about.shape.seconds)),
+            |sent| sent.elapsed,
+        )
+        .as_secs_f64()
+        .max(f64::EPSILON)
 }
 
 /// What a report is about, so one function serves both roles.

@@ -1,6 +1,6 @@
 //! `moqom cloudflare sub`: watch a broadcast on Cloudflare's draft-16 relay.
 //!
-//! Subscribe-only, as [`moqom_client::cloudflare`] is. The relay takes its
+//! Subscribe-only; `moqom-load --cloudflare` exercises publishing. The relay takes its
 //! token in the setup's PATH, so the token is a value rather than a file
 //! path here, and it is never printed.
 
